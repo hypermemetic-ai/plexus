@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "services/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.0.0"
+license = "MIT"
+publish = false
