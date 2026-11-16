@@ -15,7 +15,9 @@ use crate::{Channel, Server};
 
 /// A channel to the WebSocket at `url` (`ws://127.0.0.1:4455/`).
 pub async fn connect(url: &str) -> io::Result<Channel> {
-    let (socket, _) = tokio_tungstenite::connect_async(url).await.map_err(broken)?;
+    // No Nagle, as `accept`: a credit written while the last write is not
+    // yet acknowledged would otherwise wait for the delayed ack (40 ms).
+    let (socket, _) = tokio_tungstenite::connect_async_with_config(url, None, true).await.map_err(broken)?;
     Ok(channel(socket))
 }
 
