@@ -102,14 +102,24 @@ struct Queue {
     wake: Option<Waker>,
 }
 
-/// The driver's hold on an inbox. Dropped — the call ended, was dropped,
-/// or the channel closed — it closes the inbox.
-struct Slot(Arc<Inbox>);
+/// The driver's hold on an inbox, and the run of events it has read for
+/// the call and not yet handed in: handed in whole, so the reader is woken
+/// once a run, not once an item. Dropped — the call ended, was dropped, or
+/// the channel closed — it hands in what it holds and closes the inbox.
+struct Slot {
+    inbox: Arc<Inbox>,
+    run: Vec<Event>,
+}
 
 impl Slot {
-    fn put(&self, event: Event) {
-        let mut queue = lock(&self.0.0);
-        queue.events.push_back(event);
+    fn new(inbox: Arc<Inbox>) -> Slot {
+        Slot { inbox, run: Vec::new() }
+    }
+
+    fn hand_in(&mut self, close: bool) {
+        let mut queue = lock(&self.inbox.0);
+        queue.events.extend(self.run.drain(..));
+        queue.closed |= close;
         let wake = queue.wake.take();
         drop(queue);
         if let Some(wake) = wake {
@@ -120,13 +130,7 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        let mut queue = lock(&self.0.0);
-        queue.closed = true;
-        let wake = queue.wake.take();
-        drop(queue);
-        if let Some(wake) = wake {
-            wake.wake();
-        }
+        self.hand_in(true);
     }
 }
 
@@ -244,7 +248,7 @@ impl Connection {
         let inbox = Arc::new(Inbox::default());
         let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
         // Told before the open is sent, so before any answer can arrive.
-        self.shared.tell.unbounded_send(Told::Opened(id, Slot(inbox.clone()))).map_err(|_| Error::Closed)?;
+        self.shared.tell.unbounded_send(Told::Opened(id, Slot::new(inbox.clone()))).map_err(|_| Error::Closed)?;
         let call = Open { id, inbox, taken: VecDeque::new(), shared: self.shared.clone(), done: false };
         if !self.shared.send(Frame::open(CallId(id), method, params)) {
             return Err(Error::Closed);
@@ -259,13 +263,25 @@ impl Shared {
     }
 }
 
-/// Hand `event` to its call's inbox, if the call is still open.
-fn deliver(calls: &mut HashMap<u32, Slot>, call: CallId, event: Event) {
+/// Add `event` to its call's run, if the call is still open; `waiting`
+/// lists the calls with a run to hand in. An end is handed in at once.
+fn deliver(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>, call: CallId, event: Event) {
     let end = matches!(event, Event::End(_));
-    if let Some(slot) = calls.get(&call.0) {
-        slot.put(event);
-        if end {
-            calls.remove(&call.0);
+    let Some(slot) = calls.get_mut(&call.0) else { return };
+    if slot.run.is_empty() {
+        waiting.push(call.0);
+    }
+    slot.run.push(event);
+    if end {
+        calls.remove(&call.0);
+    }
+}
+
+/// Hand in every run read so far.
+fn hand_in(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>) {
+    for id in waiting.drain(..) {
+        if let Some(slot) = calls.get_mut(&id) {
+            slot.hand_in(false);
         }
     }
 }
@@ -281,8 +297,18 @@ async fn drive(
     let mut calls = HashMap::new();
     let ended = {
         let read = async {
-            let mut run = 0;
-            while let Some(bytes) = receive.next().await {
+            let (mut run, mut waiting) = (0, Vec::new());
+            loop {
+                // What was read is handed in before the driver waits, and
+                // before it steps aside.
+                let next = match receive.next().now_or_never() {
+                    Some(next) => next,
+                    None => {
+                        hand_in(&mut calls, &mut waiting);
+                        receive.next().await
+                    }
+                };
+                let Some(bytes) = next else { break };
                 // Step aside now and then while frames keep coming: the
                 // write half sends the credit the reader has granted, and
                 // the reader runs, so the far end is not held up until all
@@ -290,6 +316,7 @@ async fn drive(
                 run += 1;
                 if run == RUN {
                     run = 0;
+                    hand_in(&mut calls, &mut waiting);
                     crate::yield_now().await;
                 }
                 let frame = Frame::decode(&bytes?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -308,8 +335,8 @@ async fn drive(
                             let _ = said.send(hello.interface);
                         }
                     }
-                    Body::Item(raw) => deliver(&mut calls, frame.call, Event::Item(raw)),
-                    Body::End(end) => deliver(&mut calls, frame.call, Event::End(end)),
+                    Body::Item(raw) => deliver(&mut calls, &mut waiting, frame.call, Event::Item(raw)),
+                    Body::End(end) => deliver(&mut calls, &mut waiting, frame.call, Event::End(end)),
                     _ => {}
                 }
             }
