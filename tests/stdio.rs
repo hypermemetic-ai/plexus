@@ -1,4 +1,4 @@
-//! channels › Any channel › two processes: the kiln binary as a child,
+//! channels › Any channel › two processes: the test-kiln binary as a child,
 //! called over its stdin and stdout.
 
 mod common;
@@ -8,7 +8,7 @@ use tokio::process::Command;
 
 #[tokio::test]
 async fn a_child_process_answers_as_in_memory() {
-    let (mut child, channel) = plexus::stdio::child(Command::new(env!("CARGO_BIN_EXE_kiln")).kill_on_drop(true)).unwrap();
+    let (mut child, channel) = plexus::stdio::child(Command::new(env!("CARGO_BIN_EXE_test-kiln")).kill_on_drop(true)).unwrap();
     let (conn, driving) = Connection::new(channel, Some(common::activation::HASH));
     tokio::spawn(driving);
     common::all(&conn).await;

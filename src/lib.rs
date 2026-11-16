@@ -6,7 +6,8 @@
 //! `tokio` feature the stdio of a process ([`stdio`]) and a WebSocket
 //! ([`ws`]). Frames are plexus-proto's.
 //!
-//! A [`Server`] serves methods untyped: a name, a JSON body in, items out.
+//! A [`Server`] serves methods untyped: a name, a JSON body in, items out;
+//! it may hold a child across a channel ([`Server::mount`], [`Remote`]).
 //! `#[activation]`, in a native build, writes the typed side onto it: each
 //! module gets `serve(activation, server, at)`, and its activation type
 //! [`Serve`], so that one line of `main` is a process ([`main`]).
@@ -32,6 +33,7 @@
 
 mod channel;
 mod connection;
+mod remote;
 #[cfg(not(target_arch = "wasm32"))]
 mod served;
 mod server;
@@ -41,7 +43,8 @@ pub mod stdio;
 pub mod ws;
 
 pub use channel::{Channel, pair};
-pub use connection::{Connection, Error, Items, TOP_UP, WINDOW};
+pub use connection::{Connection, Error, Items, Passed, TOP_UP, WINDOW};
+pub use remote::Remote;
 pub use plexus_macros::activation;
 pub use plexus_proto::{Failure, Raw};
 pub use server::{Server, fail, raw};
@@ -74,8 +77,17 @@ impl<'de> serde::Deserialize<'de> for Json {
 pub trait Serve: Send + Sized + 'static {
     /// Where it is served unless told otherwise: its own name.
     const NAME: &'static str;
-    /// Register every method on `server` under `at`, with its IR and hash.
+    /// Register every method on `server` under `at`, with its IR and hash,
+    /// and every child under `<at>.<child>`; say its hash at hello.
     fn serve(self, server: &mut Server, at: &str);
+    /// The same without the hello, for an activation that lives inside
+    /// another `P` on `P`'s thread: `get` finds it there. What `serve` and a
+    /// parent's `held` call.
+    #[doc(hidden)]
+    fn held<P, G>(&self, local: &served::Local<P>, get: G, server: &mut Server, at: &str)
+    where
+        P: Send + 'static,
+        G: for<'a> Fn(&'a P) -> &'a Self + Copy + Send + Sync + 'static;
 }
 
 /// Serve `activation` as this process: over stdin and stdout until stdin
@@ -84,9 +96,9 @@ pub trait Serve: Send + Sized + 'static {
 /// `ws://127.0.0.1:PORT/`).
 ///
 /// ```no_run
-/// # mod kiln { #[derive(Default)] pub struct Kiln; impl plexus::Serve for Kiln { const NAME: &'static str = "kiln"; fn serve(self, _: &mut plexus::Server, _: &str) {} } }
+/// # mod kiln { #[plexus::activation] pub mod kiln { #[derive(Default)] pub struct Kiln; impl Kiln { pub fn get(&self) -> u32 { 6 } } } }
 /// fn main() -> std::io::Result<()> {
-///     plexus::main(kiln::Kiln::default())
+///     plexus::main(kiln::kiln::Kiln::default())
 /// }
 /// ```
 #[cfg(feature = "tokio")]
@@ -119,7 +131,7 @@ pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
 #[doc(hidden)]
 #[cfg(not(target_arch = "wasm32"))]
 pub mod __private {
-    pub use crate::served::{B64, Local, feed, failed, params};
+    pub use crate::served::{B64, Later, Local, feed, failed, params};
     pub use futures;
     pub use plexus_proto::bytes;
     pub use serde;
@@ -190,10 +202,46 @@ pub fn yield_now() -> impl Future<Output = ()> {
 }
 
 /// Any activation at all: what a parent holds when it does not know, when it
-/// is compiled, what it will be given. Called by name, with JSON.
-pub trait Activation {
-    /// What it is: its IR, as JSON.
-    fn ir(&self) -> Json;
-    /// A method by name.
-    fn call(&self, method: &str, params: Json) -> Result<Json, Json>;
+/// is compiled, what it will be given (`Box<dyn Activation>`), or knows only
+/// the interface of (`Box<dyn Glazes>`, `trait Glazes: Activation`). Every
+/// call under the place it is held at is passed to it by name, with JSON,
+/// paced as its caller paces it. A [`Remote`] is one: an activation across
+/// a channel, in another process or on another machine.
+pub trait Activation: Send + Sync + 'static {
+    /// Pass a call on: `method` is named below where it is held (`recipes`,
+    /// `_ir`, `shelf.get`).
+    fn pass(&self, method: &str, params: Option<Raw>) -> Passed;
+    /// Every place it serves, with its hash, named under `at`, where it is
+    /// held: what `_tree` lists for it.
+    fn tree(&self, at: &str) -> futures::future::BoxFuture<'static, Result<Vec<Place>, Failure>>;
+}
+
+/// A place something is served at, and its interface hash: one entry of
+/// `_tree`. The hash is `None` when it is not known (a child that cannot
+/// be reached now); a bare name, as plexus-rt's server answers, reads as a
+/// place with none.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Place {
+    pub place: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for Place {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Place, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Name(String),
+            Place {
+                place: String,
+                #[serde(default)]
+                hash: Option<String>,
+            },
+        }
+        Ok(match Either::deserialize(d)? {
+            Either::Name(place) => Place { place, hash: None },
+            Either::Place { place, hash } => Place { place, hash },
+        })
+    }
 }

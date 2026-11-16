@@ -162,7 +162,7 @@ async fn a_caller_of_another_interface_is_refused_at_hello() {
 #[tokio::test]
 async fn describe_answers_ir_hash_and_tree() {
     let conn = connect(kiln().0, None);
-    assert_eq!(parse(&conn.call("_tree", ()).await.unwrap()), json!(["kiln"]));
+    assert_eq!(parse(&conn.call("_tree", ()).await.unwrap()), json!([{ "place": "kiln", "hash": HASH }]));
     assert_eq!(parse(&conn.call("kiln._hash", ()).await.unwrap()), json!(HASH));
     assert_eq!(conn.call("kiln._ir", ()).await.unwrap().get(), IR);
 }

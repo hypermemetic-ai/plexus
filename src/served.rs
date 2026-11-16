@@ -45,12 +45,18 @@ impl<A> Clone for Local<A> {
     }
 }
 
-impl<A: Send + 'static> Local<A> {
+/// The thread a [`Local`] made by [`Local::later`] sends to, before it is
+/// started: what is sent waits until then.
+pub struct Later<A> {
+    taken: mpsc::UnboundedReceiver<Job<A>>,
+}
+
+impl<A: Send + 'static> Later<A> {
     /// Move `activation` to a thread of its own. Started inside a tokio
     /// runtime, the thread enters it, so a method may use tokio's timers and
     /// sockets.
-    pub fn start(activation: A) -> Local<A> {
-        let (jobs, mut taken) = mpsc::unbounded::<Job<A>>();
+    pub fn start(self, activation: A) {
+        let mut taken = self.taken;
         #[cfg(feature = "tokio")]
         let runtime = tokio::runtime::Handle::try_current().ok();
         std::thread::Builder::new()
@@ -68,7 +74,23 @@ impl<A: Send + 'static> Local<A> {
                 });
             })
             .expect("a thread for the activation");
-        Local { jobs }
+    }
+}
+
+impl<A: Send + 'static> Local<A> {
+    /// Move `activation` to a thread of its own ([`Later::start`]).
+    pub fn start(activation: A) -> Local<A> {
+        let (local, later) = Local::later();
+        later.start(activation);
+        local
+    }
+
+    /// A handle to a thread not started yet, so that methods can be
+    /// registered while the activation is still at hand: a parent's
+    /// children are found on it before it moves.
+    pub fn later() -> (Local<A>, Later<A>) {
+        let (jobs, taken) = mpsc::unbounded::<Job<A>>();
+        (Local { jobs }, Later { taken })
     }
 
     /// One answer: `run` is called on the activation's thread with what

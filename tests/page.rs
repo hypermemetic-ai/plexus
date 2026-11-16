@@ -1,5 +1,5 @@
 //! channels › Any channel › the page's runtime: plexus-rt, in Node, calls
-//! the kiln binary over a WebSocket (`tests/page.test.mts`).
+//! the test-kiln binary over a WebSocket (`tests/page.test.mts`).
 //!
 //! It needs Node 22 or later (a global WebSocket), `../plexus-rt`, and the
 //! codec's wasm, which `../plexus-rt/scripts/codec.sh` builds (or
@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 
 use libtest_mimic::{Arguments, Trial};
 
-#[path = "../src/bin/kiln/activation.rs"]
+#[path = "../src/bin/test-kiln/activation.rs"]
 #[allow(dead_code)]
 mod activation;
 
@@ -72,7 +72,7 @@ impl Drop for Killed {
 
 fn run(wasm: &Path) -> Result<(), String> {
     let mut kiln = Killed(
-        Command::new(env!("CARGO_BIN_EXE_kiln"))
+        Command::new(env!("CARGO_BIN_EXE_test-kiln"))
             .args(["--ws", "127.0.0.1:0"])
             .stdout(Stdio::piped())
             .spawn()

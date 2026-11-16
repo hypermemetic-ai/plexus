@@ -18,7 +18,7 @@ fn main() -> std::io::Result<()> {
                 println!("ws://{bound}/");
                 std::future::pending().await
             }
-            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: kiln [--ws ADDR]")),
+            _ => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "usage: test-kiln [--ws ADDR]")),
         }
     })
 }

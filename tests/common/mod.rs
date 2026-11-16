@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-#[path = "../../src/bin/kiln/activation.rs"]
+#[path = "../../src/bin/test-kiln/activation.rs"]
 pub mod activation;
 
 use std::time::Duration;

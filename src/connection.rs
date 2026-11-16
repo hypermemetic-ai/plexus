@@ -177,6 +177,19 @@ impl Connection {
         Ok(Items { call, taken: 0 })
     }
 
+    /// A call passed on from another caller, as a parent passes a call to a
+    /// child it holds: opened with credit for one item, as the open it
+    /// passes on carried, and granted more only as that caller grants it
+    /// ([`Passed::grant`]), so it runs no further ahead than the first
+    /// caller allows. Dropped before its end, it cancels. With the
+    /// connection closed it fails `unavailable`.
+    pub fn pass(&self, method: &str, params: Option<Raw>) -> Passed {
+        match self.open(method, params) {
+            Ok(call) => Passed(Ok(call)),
+            Err(_) => Passed::failed(unavailable()),
+        }
+    }
+
     fn open(&self, method: &str, params: Option<Raw>) -> Result<Open, Error> {
         let (tx, inbox) = mpsc::unbounded();
         let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
@@ -302,6 +315,55 @@ impl Stream for Items {
             }
         })
     }
+}
+
+/// A call passed on ([`Connection::pass`]): its items, then its end.
+pub struct Passed(Result<Open, Option<Failure>>);
+
+impl Passed {
+    /// A call that fails at once, with `failure`.
+    pub fn failed(failure: Failure) -> Passed {
+        Passed(Err(Some(failure)))
+    }
+
+    /// Say it may write `n` more items.
+    pub fn grant(&self, n: u32) {
+        if let Ok(call) = &self.0 {
+            call.grant(n);
+        }
+    }
+}
+
+impl Stream for Passed {
+    type Item = Result<Raw, Failure>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let call = match &mut self.0 {
+            Err(failure) => return Poll::Ready(failure.take().map(Err)),
+            Ok(call) if call.done => return Poll::Ready(None),
+            Ok(call) => call,
+        };
+        let event = match call.inbox.poll_next_unpin(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(event) => event,
+        };
+        Poll::Ready(match event {
+            Some(Event::Item(raw)) => Some(Ok(raw)),
+            Some(Event::End(end)) => {
+                call.done = true;
+                end.err().map(Err)
+            }
+            None => {
+                call.done = true;
+                Some(Err(unavailable()))
+            }
+        })
+    }
+}
+
+/// What a call passed on fails with when the connection it went over is gone.
+fn unavailable() -> Failure {
+    Failure { code: "unavailable".into(), message: "the connection to it has closed".into(), data: None }
 }
 
 fn encode(params: &impl Serialize) -> Result<Option<Raw>, Error> {

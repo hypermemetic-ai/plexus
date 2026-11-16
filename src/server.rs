@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
 
 use futures::channel::mpsc;
-use futures::future::{AbortHandle, Abortable, BoxFuture, FutureExt};
+use futures::future::{self, AbortHandle, Abortable, BoxFuture, Either, FutureExt};
 use futures::stream::{BoxStream, FuturesUnordered, StreamExt};
 use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Open, Raw};
 use serde::Serialize;
 
 use crate::channel::{Channel, pump};
-use crate::lock;
+use crate::{Activation, Place, lock};
 
 type One = Arc<dyn Fn(Raw) -> BoxFuture<'static, Result<Raw, Failure>> + Send + Sync>;
 type Many = Arc<dyn Fn(Raw) -> BoxStream<'static, Result<Raw, Failure>> + Send + Sync>;
@@ -22,6 +22,17 @@ type Many = Arc<dyn Fn(Raw) -> BoxStream<'static, Result<Raw, Failure>> + Send +
 enum Handler {
     One(One),
     Many(Many),
+    /// A call under a child held across a channel: the child, and the
+    /// method's name below it.
+    Pass(Arc<dyn Activation>, String),
+}
+
+/// A place in `_tree`: described here, or a child mounted here, whose
+/// places are asked of it.
+#[derive(Clone)]
+enum Entry {
+    Described(Place),
+    Mounted(String, Arc<dyn Activation>),
 }
 
 /// Methods by name, served on as many channels as are handed to
@@ -29,8 +40,8 @@ enum Handler {
 #[derive(Default)]
 pub struct Server {
     methods: HashMap<String, Handler>,
-    /// Every place `describe` named, for `_tree`.
-    mounts: Vec<String>,
+    /// Every place described or mounted, in order, for `_tree`.
+    places: Vec<Entry>,
     interface: Option<String>,
 }
 
@@ -64,26 +75,46 @@ impl Server {
     }
 
     /// Say what is served at `at`: `<at>._ir` answers `ir` and `<at>._hash`
-    /// its `hash`, and `_tree` lists every place described.
+    /// its `hash`, and `_tree` lists every place, with its hash.
     pub fn describe(&mut self, at: &str, ir: &str) -> Result<(), serde_json::Error> {
         #[derive(serde::Deserialize)]
         struct Hashed {
             hash: String,
         }
-        let hash = raw(&serde_json::from_str::<Hashed>(ir)?.hash).expect("a string is JSON");
+        let said = serde_json::from_str::<Hashed>(ir)?.hash;
+        let hash = raw(&said).expect("a string is JSON");
         let ir = serde_json::value::RawValue::from_string(ir.to_owned())?;
-        self.mounts.push(at.to_owned());
+        self.places.push(Entry::Described(Place { place: at.to_owned(), hash: Some(said) }));
         self.method(&format!("{at}._ir"), move |_| std::future::ready(Ok(ir.clone())));
         self.method(&format!("{at}._hash"), move |_| std::future::ready(Ok(hash.clone())));
         Ok(())
     }
 
+    /// Hold `child` at `at`: every call under `<at>.`, its `_ir` and `_hash`
+    /// too, is passed to it, unless a method of that name is registered
+    /// here; `_tree` lists its places, asked of it each time. Its credit and
+    /// cancel are passed on as the caller sends them.
+    pub fn mount(&mut self, at: &str, child: Box<dyn Activation>) {
+        self.places.push(Entry::Mounted(at.to_owned(), Arc::from(child)));
+    }
+
     fn find(&self, name: &str) -> Option<Handler> {
         if name == "_tree" {
-            let tree = raw(&self.mounts).expect("names are JSON");
-            return Some(Handler::One(Arc::new(move |_| std::future::ready(Ok(tree.clone())).boxed())));
+            let places = self.places.clone();
+            return Some(Handler::One(Arc::new(move |_| tree(places.clone()).boxed())));
         }
-        self.methods.get(name).cloned()
+        if let Some(own) = self.methods.get(name) {
+            return Some(own.clone());
+        }
+        // The child mounted deepest that the name is under.
+        self.places
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Mounted(at, child) => Some((at.len(), name.strip_prefix(at.as_str())?.strip_prefix('.')?, child)),
+                Entry::Described(_) => None,
+            })
+            .max_by_key(|(len, ..)| *len)
+            .map(|(_, rest, child)| Handler::Pass(child.clone(), rest.to_owned()))
     }
 
     /// Serve one channel until it closes. Every call runs at once with the
@@ -183,7 +214,8 @@ async fn run(
         plexus_proto::write(&mut bytes, call, kind, 0, body, Numbering::Counted);
         let _ = out.unbounded_send(bytes);
     };
-    let params = open.params.unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
+    let given = open.params;
+    let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
     let ended: Result<(), Failure> = match server.find(&open.method) {
         None => Err(failure("not-found", &format!("no method {}", open.method))),
         Some(Handler::One(f)) => match caught(f(params)).await.and_then(|answer| answer) {
@@ -202,6 +234,25 @@ async fn run(
                 match caught(items.next()).await {
                     Ok(Some(Ok(item))) => send(Kind::Item, item.get().as_bytes()),
                     Ok(Some(Err(f))) | Err(f) => break Err(f),
+                    Ok(None) => break Ok(()),
+                }
+            }
+        }
+        Some(Handler::Pass(child, rest)) => {
+            // The open carried credit for one item; the open passed on
+            // carries it on, and every credit after it is passed on as it
+            // arrives. Nothing is held here beyond what the caller allowed.
+            take(&credit).await;
+            let mut passed = child.pass(&rest, given);
+            loop {
+                let next = match future::select(more(&credit), passed.next()).await {
+                    Either::Left((n, _)) => Err(n),
+                    Either::Right((item, _)) => Ok(item),
+                };
+                match next {
+                    Err(n) => passed.grant(n),
+                    Ok(Some(Ok(item))) => send(Kind::Item, item.get().as_bytes()),
+                    Ok(Some(Err(f))) => break Err(f),
                     Ok(None) => break Ok(()),
                 }
             }
@@ -225,6 +276,35 @@ fn take(credit: &Mutex<Credit>) -> impl Future<Output = ()> + '_ {
         credit.wake = Some(cx.waker().clone());
         Poll::Pending
     })
+}
+
+/// All the credit there is, waiting for some if there is none.
+fn more(credit: &Mutex<Credit>) -> impl Future<Output = u32> + Unpin + '_ {
+    futures::future::poll_fn(move |cx| {
+        let mut credit = lock(credit);
+        if credit.left > 0 {
+            return Poll::Ready(std::mem::take(&mut credit.left));
+        }
+        credit.wake = Some(cx.waker().clone());
+        Poll::Pending
+    })
+}
+
+/// `_tree`: every place, each child's asked of it now. A child that cannot
+/// be reached is listed at its own place, its hash unknown; the rest of the
+/// tree is as ever.
+async fn tree(places: Vec<Entry>) -> Result<Raw, Failure> {
+    let mut out = Vec::new();
+    for entry in places {
+        match entry {
+            Entry::Described(place) => out.push(place),
+            Entry::Mounted(at, child) => match child.tree(&at).await {
+                Ok(places) => out.extend(places),
+                Err(_) => out.push(Place { place: at, hash: None }),
+            },
+        }
+    }
+    raw(&out)
 }
 
 /// A method that panics fails its call, `internal`, and nothing else.
