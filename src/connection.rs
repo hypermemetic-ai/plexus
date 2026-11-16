@@ -304,13 +304,14 @@ async fn drive(
             loop {
                 // What was read is handed in before the driver waits, and
                 // before it steps aside.
-                let next = match receive.next().now_or_never() {
-                    Some(next) => next,
-                    None => {
+                let next = future::poll_fn(|cx| {
+                    let next = receive.poll_next_unpin(cx);
+                    if next.is_pending() {
                         hand_in(&mut calls, &mut waiting);
-                        receive.next().await
                     }
-                };
+                    next
+                })
+                .await;
                 let Some(bytes) = next else { break };
                 // Step aside now and then while frames keep coming: the
                 // write half sends the credit the reader has granted, and
