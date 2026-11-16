@@ -254,6 +254,26 @@ async fn a_method_that_panics_fails_its_call_alone() {
     assert_eq!(conn.call("kiln.get", ()).await.unwrap().get(), "6");
 }
 
+/// Items in before the channel closed are read, in order, then the close.
+#[tokio::test]
+async fn items_in_before_a_close_are_read_then_closed() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    let driving = tokio::spawn(driving);
+    let mut items = conn.stream("kiln.heat", ()).unwrap();
+    assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
+    for n in 0..100 {
+        far.send.send(format!("[1,{n}]").into_bytes()).await.unwrap();
+    }
+    drop(far);
+    driving.await.unwrap().unwrap();
+    for n in 0..100 {
+        assert_eq!(items.next().await.unwrap().unwrap().get(), n.to_string());
+    }
+    assert!(matches!(items.next().await, Some(Err(Error::Closed))));
+    assert!(items.next().await.is_none());
+}
+
 #[tokio::test]
 async fn a_closed_channel_ends_every_call() {
     let (near, far) = pair();

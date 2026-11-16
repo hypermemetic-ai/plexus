@@ -1,12 +1,12 @@
 //! The caller's end: opens calls, hands their answers back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Weak};
-use std::task::{Context, Poll};
+use std::sync::{Arc, Mutex, Weak};
+use std::task::{Context, Poll, Waker};
 
 use futures::channel::{mpsc, oneshot};
 use futures::future::{self, Either, FutureExt};
@@ -15,6 +15,7 @@ use plexus_proto::{Body, CallId, Failure, Frame, Numbering, Raw};
 use serde::Serialize;
 
 use crate::channel::{Channel, pump};
+use crate::lock;
 
 /// How many items a stream's caller says it will take before it has taken
 /// any (the open carries one of them).
@@ -83,8 +84,50 @@ pub struct Connection {
 /// What the driver is told of calls, in the order it happened: it keeps the
 /// map of inboxes itself, so an item finds its call with no lock.
 enum Told {
-    Opened(u32, mpsc::UnboundedSender<Event>),
+    Opened(u32, Slot),
     Gone(u32),
+}
+
+/// A call's inbox: what the driver has handed in and the reader has not
+/// yet taken. The reader takes all of it at once, so a run of items costs
+/// it one lock.
+#[derive(Default)]
+struct Inbox(Mutex<Queue>);
+
+#[derive(Default)]
+struct Queue {
+    events: VecDeque<Event>,
+    /// Nothing more will come: the call ended, or the channel closed.
+    closed: bool,
+    wake: Option<Waker>,
+}
+
+/// The driver's hold on an inbox. Dropped — the call ended, was dropped,
+/// or the channel closed — it closes the inbox.
+struct Slot(Arc<Inbox>);
+
+impl Slot {
+    fn put(&self, event: Event) {
+        let mut queue = lock(&self.0.0);
+        queue.events.push_back(event);
+        let wake = queue.wake.take();
+        drop(queue);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut queue = lock(&self.0.0);
+        queue.closed = true;
+        let wake = queue.wake.take();
+        drop(queue);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
 }
 
 struct Shared {
@@ -143,7 +186,7 @@ impl Connection {
             loop {
                 let event = match waiting.take() {
                     Some(event) => event,
-                    None => call.inbox.next().await,
+                    None => future::poll_fn(|cx| call.poll_event(cx)).await,
                 };
                 match event {
                     Some(Event::Item(raw)) => {
@@ -153,9 +196,9 @@ impl Connection {
                             // The open was credit for one. Unless the end is
                             // here already, this may be a stream: grant the
                             // rest of the window, as `stream` does at open.
-                            match call.inbox.try_recv() {
-                                Ok(event) => waiting = Some(Some(event)),
-                                Err(_) => call.grant(WINDOW - 1),
+                            match call.try_event() {
+                                Some(event) => waiting = Some(Some(event)),
+                                None => call.grant(WINDOW - 1),
                             }
                         } else if taken.is_multiple_of(TOP_UP) {
                             call.grant(TOP_UP);
@@ -198,11 +241,11 @@ impl Connection {
     }
 
     fn open(&self, method: &str, params: Option<Raw>) -> Result<Open, Error> {
-        let (tx, inbox) = mpsc::unbounded();
+        let inbox = Arc::new(Inbox::default());
         let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
         // Told before the open is sent, so before any answer can arrive.
-        self.shared.tell.unbounded_send(Told::Opened(id, tx)).map_err(|_| Error::Closed)?;
-        let call = Open { id, inbox, shared: self.shared.clone(), done: false };
+        self.shared.tell.unbounded_send(Told::Opened(id, Slot(inbox.clone()))).map_err(|_| Error::Closed)?;
+        let call = Open { id, inbox, taken: VecDeque::new(), shared: self.shared.clone(), done: false };
         if !self.shared.send(Frame::open(CallId(id), method, params)) {
             return Err(Error::Closed);
         }
@@ -217,12 +260,13 @@ impl Shared {
 }
 
 /// Hand `event` to its call's inbox, if the call is still open.
-fn deliver(calls: &mut HashMap<u32, mpsc::UnboundedSender<Event>>, call: CallId, event: Event) {
+fn deliver(calls: &mut HashMap<u32, Slot>, call: CallId, event: Event) {
     let end = matches!(event, Event::End(_));
-    if let Some(inbox) = calls.get(&call.0)
-        && (inbox.unbounded_send(event).is_err() || end)
-    {
-        calls.remove(&call.0);
+    if let Some(slot) = calls.get(&call.0) {
+        slot.put(event);
+        if end {
+            calls.remove(&call.0);
+        }
     }
 }
 
@@ -274,12 +318,39 @@ async fn drive(
 /// A call that is open. Dropped before its end, it cancels.
 struct Open {
     id: u32,
-    inbox: mpsc::UnboundedReceiver<Event>,
+    inbox: Arc<Inbox>,
+    /// The run last taken from the inbox, not yet read.
+    taken: VecDeque<Event>,
     shared: Arc<Shared>,
     done: bool,
 }
 
 impl Open {
+    /// The next event, or `None` once the inbox is closed and empty.
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<Event>> {
+        if let Some(event) = self.taken.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+        let mut queue = lock(&self.inbox.0);
+        std::mem::swap(&mut self.taken, &mut queue.events);
+        if let Some(event) = self.taken.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+        if queue.closed {
+            return Poll::Ready(None);
+        }
+        queue.wake = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// The next event if one is in already.
+    fn try_event(&mut self) -> Option<Event> {
+        if self.taken.is_empty() {
+            std::mem::swap(&mut self.taken, &mut lock(&self.inbox.0).events);
+        }
+        self.taken.pop_front()
+    }
+
     fn grant(&self, n: u32) {
         self.shared.send(Frame { call: CallId(self.id), seq: 0, body: Body::Credit(n) });
     }
@@ -309,7 +380,7 @@ impl Stream for Items {
         if self.call.done {
             return Poll::Ready(None);
         }
-        let event = match self.call.inbox.poll_next_unpin(cx) {
+        let event = match self.call.poll_event(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(event) => event,
         };
@@ -359,7 +430,7 @@ impl Stream for Passed {
             Ok(call) if call.done => return Poll::Ready(None),
             Ok(call) => call,
         };
-        let event = match call.inbox.poll_next_unpin(cx) {
+        let event = match call.poll_event(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(event) => event,
         };
