@@ -1,0 +1,27 @@
+[package]
+name = "plexus-store-engine"
+description = "The one SQLite of a page: plexus:store/sql over rusqlite, its files the host's. Built once, to wasm, and shared by every activation that stores."
+edition = "2024"
+version = "0.0.0"
+license = "MIT"
+publish = false
+
+# Built only for wasm32 (it needs clang: SQLite's C), once, by whoever ships
+# the runtime — never by an activation's author.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rusqlite = { version = "0.43", features = ["bundled"] }
+sqlite-wasm-rs = "0.6"
+wit-bindgen = "0.63"
+
+[workspace]
+
+[profile.web]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

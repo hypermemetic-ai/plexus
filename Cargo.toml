@@ -10,9 +10,10 @@ publish = false
 # Off by default: a component (wasm32, no tokio) builds the core alone.
 # On: stdio and WebSocket channels, the test-kiln binary, and their tests.
 tokio = ["dep:tokio", "dep:tokio-util", "dep:tokio-tungstenite"]
-# An activation's own SQLite database, `Store`, through rusqlite. In a
-# component SQLite is compiled to wasm, which needs clang.
-store = ["dep:rusqlite", "dep:sqlite-wasm-rs", "dep:wit-bindgen"]
+# An activation's own SQLite database, `Store`: rusqlite in a process; in a
+# component the import plexus:store/sql, answered by the host's one SQLite
+# (engine/), so a component that stores needs no C compiler.
+store = ["dep:rusqlite", "dep:wit-bindgen"]
 
 [dependencies]
 plexus-macros = { path = "../plexus-macros" }
@@ -23,10 +24,11 @@ serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", optional = true, features = ["io-std", "io-util", "net", "process", "rt", "rt-multi-thread"] }
 tokio-util = { version = "0.7", optional = true, features = ["codec"] }
 tokio-tungstenite = { version = "0.30", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite = { version = "0.43", optional = true, features = ["bundled"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-sqlite-wasm-rs = { version = "0.6", optional = true }
 wit-bindgen = { version = "0.63", optional = true }
 
 [dev-dependencies]
@@ -59,3 +61,7 @@ required-features = ["tokio"]
 [[test]]
 name = "remote"
 required-features = ["tokio"]
+
+[[test]]
+name = "store"
+required-features = ["store"]

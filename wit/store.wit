@@ -1,0 +1,59 @@
+package plexus:store@0.0.1;
+
+/// SQLite, which the host keeps once for every activation it runs. What an
+/// activation's `plexus::Store` asks of it in a component.
+///
+/// A query answers all its rows in one call: a crossing costs per value,
+/// not per call, so pages would save no copying, only a peak; a big read
+/// pages itself with `limit`. A transaction is said in SQL (`begin`,
+/// `commit`, `rollback`) on the database's one connection.
+interface sql {
+    variant value {
+        null,
+        integer(s64),
+        real(f64),
+        text(string),
+        blob(list<u8>),
+    }
+
+    /// A query's rows, one after another, `columns` values each.
+    record rows {
+        columns: u32,
+        values: list<value>,
+    }
+
+    /// The database named `name`, with `schema` run on it when it is first
+    /// opened. The same name is the same database.
+    open: func(name: string, schema: string) -> result<u32, string>;
+    /// Run one statement; the number of rows it changed.
+    execute: func(db: u32, sql: string, params: list<value>) -> result<u64, string>;
+    /// Run one statement; every row it answers.
+    query: func(db: u32, sql: string, params: list<value>) -> result<rows, string>;
+}
+
+/// What SQLite in a component asks of its host.
+interface host {
+    /// Milliseconds since the Unix epoch.
+    now: func() -> s64;
+    /// `len` random bytes.
+    random: func(len: u32) -> list<u8>;
+    /// The host's file by this name, kept beyond the component, or
+    /// none: the file is kept in memory.
+    open: func(name: string) -> option<u32>;
+    read: func(file: u32, offset: u64, len: u32) -> list<u8>;
+    write: func(file: u32, offset: u64, data: list<u8>);
+    size: func(file: u32) -> u64;
+    truncate: func(file: u32, size: u64);
+    flush: func(file: u32);
+}
+
+/// An activation's store.
+world store {
+    import sql;
+}
+
+/// The one engine: SQLite over the host's files.
+world engine {
+    import host;
+    export sql;
+}
