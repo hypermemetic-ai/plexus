@@ -127,6 +127,20 @@ async fn written_as_made() {
     assert!(made < WINDOW, "{made} items were made before the first was written");
 }
 
+/// A pair holds what is fed until it is flushed, then gives it all, in order.
+#[tokio::test]
+async fn a_pair_gives_what_was_fed_at_the_flush() {
+    let (mut near, mut far) = pair();
+    for n in 0..3 {
+        near.send.feed(format!("[{n}]").into_bytes()).await.unwrap();
+    }
+    assert!(tokio::time::timeout(Duration::from_millis(20), far.receive.next()).await.is_err(), "a frame before the flush");
+    near.send.flush().await.unwrap();
+    for n in 0..3 {
+        assert_eq!(read(&mut far).await, format!("[{n}]"));
+    }
+}
+
 /// What arrives for a call dropped before its end goes nowhere, and the
 /// connection's next call is answered as ever.
 #[tokio::test]
