@@ -11,6 +11,9 @@
 //! module gets `serve(activation, server, at)`, and its activation type
 //! [`Serve`], so that one line of `main` is a process ([`main`]).
 //!
+//! With the `store` feature an activation keeps its state in its own SQLite
+//! database, a `Store`.
+//!
 //! Some signature types are shapes only: nothing fills a [`Caller`], feeds
 //! an [`Input`] or listens to a [`Progress`] yet. `#[activation(describe)]`
 //! reads them out of a signature into the IR.
@@ -37,6 +40,8 @@ mod served;
 mod server;
 #[cfg(feature = "tokio")]
 pub mod stdio;
+#[cfg(feature = "store")]
+mod store;
 #[cfg(feature = "tokio")]
 pub mod ws;
 
@@ -45,6 +50,8 @@ pub use connection::{Connection, Error, Items, TOP_UP, WINDOW};
 pub use plexus_macros::activation;
 pub use plexus_proto::{Failure, Raw};
 pub use server::{Server, fail, raw};
+#[cfg(feature = "store")]
+pub use {rusqlite, store::Store};
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -81,7 +88,8 @@ pub trait Serve: Send + Sized + 'static {
 /// Serve `activation` as this process: over stdin and stdout until stdin
 /// closes, or with `--ws ADDR` on a WebSocket, every connection sharing the
 /// one activation (the address bound is printed on stdout, one line:
-/// `ws://127.0.0.1:PORT/`).
+/// `ws://127.0.0.1:PORT/`). With `--data DIR` (feature `store`) every
+/// `Store` keeps its file in DIR.
 ///
 /// ```no_run
 /// # mod kiln { #[derive(Default)] pub struct Kiln; impl plexus::Serve for Kiln { const NAME: &'static str = "kiln"; fn serve(self, _: &mut plexus::Server, _: &str) {} } }
@@ -92,12 +100,18 @@ pub trait Serve: Send + Sized + 'static {
 #[cfg(feature = "tokio")]
 pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let ws = match args.as_slice() {
-        [] => None,
-        [flag, addr] if flag == "--ws" => Some(addr.parse::<std::net::SocketAddr>().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?),
-        _ => return Err(Error::new(ErrorKind::InvalidInput, "usage: [--ws ADDR]   (no flag: stdin and stdout)")),
-    };
+    const USAGE: &str = "usage: [--ws ADDR] [--data DIR]   (no --ws: stdin and stdout)";
+    let mut ws = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let value = args.next().ok_or_else(|| Error::new(ErrorKind::InvalidInput, USAGE))?;
+        match flag.as_str() {
+            "--ws" => ws = Some(value.parse::<std::net::SocketAddr>().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?),
+            #[cfg(feature = "store")]
+            "--data" => store::set_data(value.into()),
+            _ => return Err(Error::new(ErrorKind::InvalidInput, USAGE)),
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let _entered = runtime.enter();
     let mut server = Server::new();
