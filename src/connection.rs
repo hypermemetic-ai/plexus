@@ -19,9 +19,9 @@ use crate::lock;
 
 /// How many items a stream's caller says it will take before it has taken
 /// any (the open carries one of them).
-pub const WINDOW: u32 = 256;
+pub const WINDOW: u32 = 4096;
 /// How many items it takes before saying so again.
-pub const TOP_UP: u32 = 128;
+pub const TOP_UP: u32 = 2048;
 
 /// Why a call gave no answer.
 #[derive(Debug)]
