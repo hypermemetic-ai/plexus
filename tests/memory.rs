@@ -71,6 +71,31 @@ async fn the_caller_grants_credit_and_cancels() {
     assert_eq!(read(&mut far).await, "[2,5,null]");
 }
 
+/// What arrives for a call dropped before its end goes nowhere, and the
+/// connection's next call is answered as ever.
+#[tokio::test]
+async fn late_answers_to_a_dropped_call_go_nowhere() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    tokio::spawn(driving);
+    let mut items = conn.stream("kiln.heat", ()).unwrap();
+    assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
+    assert_eq!(read(&mut far).await, format!("[1,6,{}]", WINDOW - 1));
+    far.send.send(b"[1,0]".to_vec()).await.unwrap();
+    assert_eq!(items.next().await.unwrap().unwrap().get(), "0");
+    drop(items);
+    assert_eq!(read(&mut far).await, "[1,5,null]");
+    far.send.send(b"[1,1]".to_vec()).await.unwrap();
+    far.send.send(b"[1]".to_vec()).await.unwrap();
+    let call = conn.call("kiln.get", ());
+    let (got, ()) = futures::join!(call, async {
+        assert_eq!(read(&mut far).await, r#"[2,1,["kiln.get"]]"#);
+        far.send.send(b"[2,6]".to_vec()).await.unwrap();
+        far.send.send(b"[2]".to_vec()).await.unwrap();
+    });
+    assert_eq!(got.unwrap().get(), "6");
+}
+
 /// pace › `call` on a stream: the window granted once the first item is
 /// in, topped up as items arrive, the last item the answer.
 #[tokio::test]

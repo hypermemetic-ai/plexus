@@ -5,7 +5,7 @@ use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 
 use futures::channel::{mpsc, oneshot};
@@ -15,7 +15,6 @@ use plexus_proto::{Body, CallId, Failure, Frame, Numbering, Raw};
 use serde::Serialize;
 
 use crate::channel::{Channel, pump};
-use crate::lock;
 
 /// How many items a stream's caller says it will take before it has taken
 /// any (the open carries one of them).
@@ -81,10 +80,17 @@ pub struct Connection {
     shared: Arc<Shared>,
 }
 
+/// What the driver is told of calls, in the order it happened: it keeps the
+/// map of inboxes itself, so an item finds its call with no lock.
+enum Told {
+    Opened(u32, mpsc::UnboundedSender<Event>),
+    Gone(u32),
+}
+
 struct Shared {
     out: mpsc::UnboundedSender<Vec<u8>>,
-    /// Each open call's inbox; `None` once the channel has closed.
-    calls: Mutex<Option<HashMap<u32, mpsc::UnboundedSender<Event>>>>,
+    /// Closed once the channel has.
+    tell: mpsc::UnboundedSender<Told>,
     next: AtomicU32,
     expects: Option<String>,
     hello: future::Shared<oneshot::Receiver<String>>,
@@ -102,15 +108,16 @@ impl Connection {
     pub fn new(channel: Channel, expects: Option<&str>) -> (Connection, impl Future<Output = io::Result<()>> + Send + 'static) {
         let (out, frames) = mpsc::unbounded();
         let (said, hello) = oneshot::channel();
+        let (tell, told) = mpsc::unbounded();
         let shared = Arc::new(Shared {
             out,
-            calls: Mutex::new(Some(HashMap::new())),
+            tell,
             next: AtomicU32::new(1),
             expects: expects.map(str::to_owned),
             hello: hello.shared(),
         });
         let Channel { send, receive } = channel;
-        let drive = drive(receive, pump(send, frames), Arc::downgrade(&shared), said);
+        let drive = drive(receive, pump(send, frames), Arc::downgrade(&shared), told, said);
         (Connection { shared }, drive)
     }
 
@@ -193,7 +200,8 @@ impl Connection {
     fn open(&self, method: &str, params: Option<Raw>) -> Result<Open, Error> {
         let (tx, inbox) = mpsc::unbounded();
         let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
-        lock(&self.shared.calls).as_mut().ok_or(Error::Closed)?.insert(id, tx);
+        // Told before the open is sent, so before any answer can arrive.
+        self.shared.tell.unbounded_send(Told::Opened(id, tx)).map_err(|_| Error::Closed)?;
         let call = Open { id, inbox, shared: self.shared.clone(), done: false };
         if !self.shared.send(Frame::open(CallId(id), method, params)) {
             return Err(Error::Closed);
@@ -206,14 +214,15 @@ impl Shared {
     fn send(&self, frame: Frame) -> bool {
         self.out.unbounded_send(frame.encode(Numbering::Counted)).is_ok()
     }
+}
 
-    fn deliver(&self, call: CallId, event: Event) {
-        let mut calls = lock(&self.calls);
-        let Some(calls) = calls.as_mut() else { return };
-        let inbox = if matches!(event, Event::End(_)) { calls.remove(&call.0) } else { calls.get(&call.0).cloned() };
-        if let Some(inbox) = inbox {
-            let _ = inbox.unbounded_send(event);
-        }
+/// Hand `event` to its call's inbox, if the call is still open.
+fn deliver(calls: &mut HashMap<u32, mpsc::UnboundedSender<Event>>, call: CallId, event: Event) {
+    let end = matches!(event, Event::End(_));
+    if let Some(inbox) = calls.get(&call.0)
+        && (inbox.unbounded_send(event).is_err() || end)
+    {
+        calls.remove(&call.0);
     }
 }
 
@@ -221,22 +230,31 @@ async fn drive(
     mut receive: Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send>>,
     write: impl Future<Output = io::Result<()>>,
     shared: Weak<Shared>,
+    mut told: mpsc::UnboundedReceiver<Told>,
     said: oneshot::Sender<String>,
 ) -> io::Result<()> {
     let mut said = Some(said);
-    let held = shared.clone();
-    let read = async move {
+    let mut calls = HashMap::new();
+    let read = async {
         while let Some(bytes) = receive.next().await {
             let frame = Frame::decode(&bytes?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let Some(shared) = shared.upgrade() else { break };
+            if shared.strong_count() == 0 {
+                break;
+            }
+            while let Ok(told) = told.try_recv() {
+                match told {
+                    Told::Opened(id, inbox) => calls.insert(id, inbox),
+                    Told::Gone(id) => calls.remove(&id),
+                };
+            }
             match frame.body {
                 Body::Hello(hello) => {
                     if let Some(said) = said.take() {
                         let _ = said.send(hello.interface);
                     }
                 }
-                Body::Item(raw) => shared.deliver(frame.call, Event::Item(raw)),
-                Body::End(end) => shared.deliver(frame.call, Event::End(end)),
+                Body::Item(raw) => deliver(&mut calls, frame.call, Event::Item(raw)),
+                Body::End(end) => deliver(&mut calls, frame.call, Event::End(end)),
                 _ => {}
             }
         }
@@ -246,10 +264,10 @@ async fn drive(
     let ended = match future::select(read, write).await {
         Either::Left((r, _)) | Either::Right((r, _)) => r,
     };
-    // Every call still open learns the channel closed.
-    if let Some(shared) = held.upgrade() {
-        lock(&shared.calls).take();
-    }
+    // Every call still open learns the channel closed, and none opens after.
+    told.close();
+    drop(told);
+    drop(calls);
     ended
 }
 
@@ -272,9 +290,7 @@ impl Drop for Open {
         if self.done {
             return;
         }
-        if let Some(calls) = lock(&self.shared.calls).as_mut() {
-            calls.remove(&self.id);
-        }
+        let _ = self.shared.tell.unbounded_send(Told::Gone(self.id));
         self.shared.send(Frame { call: CallId(self.id), seq: 0, body: Body::Cancel });
     }
 }
