@@ -71,6 +71,33 @@ async fn the_caller_grants_credit_and_cancels() {
     assert_eq!(read(&mut far).await, "[2,5,null]");
 }
 
+/// streams › on the wire: the server writes exactly as many items as it
+/// was given credit for, the open's one first, then each grant's.
+#[tokio::test]
+async fn the_server_writes_no_further_than_its_credit() {
+    let mut server = Server::new();
+    server.stream("kiln.count", |_| futures::stream::iter(0..u32::MAX).map(|n| raw(&n)));
+    let (mut near, far) = pair();
+    tokio::spawn(Arc::new(server).serve(far));
+    near.send.send(br#"[1,1,["kiln.count"]]"#.to_vec()).await.unwrap();
+    assert_eq!(read(&mut near).await, "[1,0]");
+    let quiet = async |near: &mut Channel| tokio::time::timeout(Duration::from_millis(50), near.receive.next()).await.is_err();
+    assert!(quiet(&mut near).await, "an item past the open's credit");
+    for grant in [1u32, 3, 2] {
+        near.send.send(format!("[1,6,{grant}]").into_bytes()).await.unwrap();
+        for _ in 0..grant {
+            read(&mut near).await;
+        }
+        assert!(quiet(&mut near).await, "an item past a grant of {grant}");
+    }
+    near.send.send(b"[1,6,2]".to_vec()).await.unwrap();
+    near.send.send(b"[1,6,2]".to_vec()).await.unwrap();
+    for n in 7..11 {
+        assert_eq!(read(&mut near).await, format!("[1,{n}]"));
+    }
+    assert!(quiet(&mut near).await, "an item past two grants at once");
+}
+
 /// What arrives for a call dropped before its end goes nowhere, and the
 /// connection's next call is answered as ever.
 #[tokio::test]
