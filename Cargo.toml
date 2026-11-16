@@ -7,3 +7,12 @@ edition = "2024"
 version = "0.0.0"
 license = "MIT"
 publish = false
+
+# A page's build: small before fast.
+[profile.web]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
