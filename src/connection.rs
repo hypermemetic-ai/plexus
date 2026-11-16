@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 use futures::channel::{mpsc, oneshot};
 use futures::future::{self, Either, FutureExt};
 use futures::{Stream, StreamExt};
-use plexus_proto::{Body, CallId, Failure, Frame, Numbering, Raw};
+use plexus_proto::{Body, CallId, Failure, Frame, Head, Kind, Numbering, Raw};
 use serde::Serialize;
 
 use crate::channel::{Channel, pump};
@@ -71,7 +71,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 enum Event {
-    Item(Raw),
+    /// An item as it came: the frame, and where its body is in it. The
+    /// driver only reads a frame's head; the reader makes the item, so
+    /// that work is not all on the driver.
+    Item(Vec<u8>, std::ops::Range<usize>),
     End(Result<(), Failure>),
 }
 
@@ -193,8 +196,8 @@ impl Connection {
                     None => future::poll_fn(|cx| call.poll_event(cx)).await,
                 };
                 match event {
-                    Some(Event::Item(raw)) => {
-                        got = Some(raw);
+                    Some(Event::Item(bytes, body)) => {
+                        got = Some(item(&bytes, body));
                         taken += 1;
                         if taken == 1 {
                             // The open was credit for one. Unless the end is
@@ -319,7 +322,9 @@ async fn drive(
                     hand_in(&mut calls, &mut waiting);
                     crate::yield_now().await;
                 }
-                let frame = Frame::decode(&bytes?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let bytes = bytes?;
+                let bad = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+                let head = Head::read(&bytes).map_err(bad)?;
                 if shared.strong_count() == 0 {
                     break;
                 }
@@ -329,14 +334,17 @@ async fn drive(
                         Told::Gone(id) => calls.remove(&id),
                     };
                 }
-                match frame.body {
+                if head.kind == Kind::Item {
+                    deliver(&mut calls, &mut waiting, head.call, Event::Item(bytes, head.body));
+                    continue;
+                }
+                match Frame::decode(&bytes).map_err(bad)?.body {
                     Body::Hello(hello) => {
                         if let Some(said) = said.take() {
                             let _ = said.send(hello.interface);
                         }
                     }
-                    Body::Item(raw) => deliver(&mut calls, &mut waiting, frame.call, Event::Item(raw)),
-                    Body::End(end) => deliver(&mut calls, &mut waiting, frame.call, Event::End(end)),
+                    Body::End(end) => deliver(&mut calls, &mut waiting, head.call, Event::End(end)),
                     _ => {}
                 }
             }
@@ -427,7 +435,8 @@ impl Stream for Items {
             Poll::Ready(event) => event,
         };
         Poll::Ready(match event {
-            Some(Event::Item(raw)) => {
+            Some(Event::Item(bytes, body)) => {
+                let raw = item(&bytes, body);
                 self.taken += 1;
                 if self.taken.is_multiple_of(TOP_UP) {
                     self.call.grant(TOP_UP);
@@ -477,7 +486,7 @@ impl Stream for Passed {
             Poll::Ready(event) => event,
         };
         Poll::Ready(match event {
-            Some(Event::Item(raw)) => Some(Ok(raw)),
+            Some(Event::Item(bytes, body)) => Some(Ok(item(&bytes, body))),
             Some(Event::End(end)) => {
                 call.done = true;
                 end.err().map(Err)
@@ -501,6 +510,13 @@ fn encode(params: &impl Serialize) -> Result<Option<Raw>, Error> {
         "{}" | "null" => None,
         _ => Some(raw),
     })
+}
+
+/// An item's body as JSON, as `Frame::decode` makes it: `Head::read` has
+/// checked it is JSON.
+fn item(bytes: &[u8], body: std::ops::Range<usize>) -> Raw {
+    let text = std::str::from_utf8(&bytes[body]).expect("Head::read checked it");
+    serde_json::value::RawValue::from_string(text.to_owned()).expect("Head::read checked it")
 }
 
 fn null() -> Raw {
