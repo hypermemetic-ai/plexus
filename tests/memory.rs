@@ -254,6 +254,27 @@ async fn a_method_that_panics_fails_its_call_alone() {
     assert_eq!(conn.call("kiln.get", ()).await.unwrap().get(), "6");
 }
 
+/// The driver steps aside while frames keep coming: the reader's credit
+/// goes out though the far end never stops writing (one thread, so a
+/// driver that never stepped aside would hold it for good).
+#[tokio::test(flavor = "current_thread")]
+async fn credit_goes_out_while_frames_keep_coming() {
+    let (out, mut sent) = futures::channel::mpsc::unbounded::<Vec<u8>>();
+    let out = out.sink_map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+    let endless = futures::stream::repeat_with(|| Ok(b"[1,7]".to_vec()));
+    let (conn, driving) = Connection::new(Channel::new(out, endless), None);
+    let mut items = conn.stream("kiln.heat", ()).unwrap();
+    tokio::spawn(driving);
+    for _ in 0..TOP_UP {
+        assert_eq!(items.next().await.unwrap().unwrap().get(), "7");
+    }
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        frames.push(String::from_utf8(sent.next().await.unwrap()).unwrap());
+    }
+    assert_eq!(frames, [r#"[1,1,["kiln.heat"]]"#.to_owned(), format!("[1,6,{}]", WINDOW - 1), format!("[1,6,{TOP_UP}]")]);
+}
+
 /// Items in before the channel closed are read, in order, then the close.
 #[tokio::test]
 async fn items_in_before_a_close_are_read_then_closed() {

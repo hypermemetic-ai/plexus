@@ -279,34 +279,46 @@ async fn drive(
 ) -> io::Result<()> {
     let mut said = Some(said);
     let mut calls = HashMap::new();
-    let read = async {
-        while let Some(bytes) = receive.next().await {
-            let frame = Frame::decode(&bytes?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            if shared.strong_count() == 0 {
-                break;
-            }
-            while let Ok(told) = told.try_recv() {
-                match told {
-                    Told::Opened(id, inbox) => calls.insert(id, inbox),
-                    Told::Gone(id) => calls.remove(&id),
-                };
-            }
-            match frame.body {
-                Body::Hello(hello) => {
-                    if let Some(said) = said.take() {
-                        let _ = said.send(hello.interface);
-                    }
+    let ended = {
+        let read = async {
+            let mut run = 0;
+            while let Some(bytes) = receive.next().await {
+                // Step aside now and then while frames keep coming: the
+                // write half sends the credit the reader has granted, and
+                // the reader runs, so the far end is not held up until all
+                // of it is read.
+                run += 1;
+                if run == RUN {
+                    run = 0;
+                    crate::yield_now().await;
                 }
-                Body::Item(raw) => deliver(&mut calls, frame.call, Event::Item(raw)),
-                Body::End(end) => deliver(&mut calls, frame.call, Event::End(end)),
-                _ => {}
+                let frame = Frame::decode(&bytes?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                if shared.strong_count() == 0 {
+                    break;
+                }
+                while let Ok(told) = told.try_recv() {
+                    match told {
+                        Told::Opened(id, inbox) => calls.insert(id, inbox),
+                        Told::Gone(id) => calls.remove(&id),
+                    };
+                }
+                match frame.body {
+                    Body::Hello(hello) => {
+                        if let Some(said) = said.take() {
+                            let _ = said.send(hello.interface);
+                        }
+                    }
+                    Body::Item(raw) => deliver(&mut calls, frame.call, Event::Item(raw)),
+                    Body::End(end) => deliver(&mut calls, frame.call, Event::End(end)),
+                    _ => {}
+                }
             }
+            Ok(())
+        };
+        futures::pin_mut!(read, write);
+        match future::select(read, write).await {
+            Either::Left((r, _)) | Either::Right((r, _)) => r,
         }
-        Ok(())
-    };
-    futures::pin_mut!(read, write);
-    let ended = match future::select(read, write).await {
-        Either::Left((r, _)) | Either::Right((r, _)) => r,
     };
     // Every call still open learns the channel closed, and none opens after.
     told.close();
@@ -314,6 +326,9 @@ async fn drive(
     drop(calls);
     ended
 }
+
+/// How many frames the driver reads before it steps aside.
+const RUN: u32 = 256;
 
 /// A call that is open. Dropped before its end, it cancels.
 struct Open {
