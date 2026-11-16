@@ -1,6 +1,6 @@
 [package]
 name = "plexus"
-description = "The one crate a Plexus service depends on. Today: the attribute, and the types a method's signature names."
+description = "The one crate a Plexus activation depends on. Today: the attribute, and the types a method's signature names."
 edition = "2024"
 version = "0.0.0"
 license = "MIT"

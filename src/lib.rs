@@ -1,11 +1,11 @@
-//! The one crate a Plexus service depends on.
+//! The one crate a Plexus activation depends on.
 //!
-//! Today it holds `#[plexus::service]` and the types a method's signature
+//! Today it holds `#[plexus::activation]` and the types a method's signature
 //! names. The types are shapes only: nothing fills a [`Caller`], feeds an
-//! [`Input`] or listens to a [`Progress`] yet. `#[service(describe)]` reads
+//! [`Input`] or listens to a [`Progress`] yet. `#[activation(describe)]` reads
 //! them out of a signature into the IR.
 
-pub use plexus_macros::service;
+pub use plexus_macros::activation;
 
 /// Raw octets.
 pub type Bytes = Vec<u8>;
@@ -78,9 +78,9 @@ pub fn yield_now() -> impl Future<Output = ()> {
     Once(false)
 }
 
-/// Any service at all: what a parent holds when it does not know, when it
+/// Any activation at all: what a parent holds when it does not know, when it
 /// is compiled, what it will be given. Called by name, with JSON.
-pub trait Service {
+pub trait Activation {
     /// What it is: its IR, as JSON.
     fn ir(&self) -> Json;
     /// A method by name.
