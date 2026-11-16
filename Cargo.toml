@@ -1,10 +1,49 @@
 [package]
 name = "plexus"
-description = "The one crate a Plexus activation depends on. Today: the attribute, and the types a method's signature names."
+description = "The one crate a Plexus activation depends on: the attribute, the types a method's signature names, and the runtime that serves and calls over any channel."
 edition = "2024"
 version = "0.0.0"
 license = "MIT"
 publish = false
 
+[features]
+# Off by default: a component (wasm32, no tokio) builds the core alone.
+# On: stdio and WebSocket channels, the kiln binary, and their tests.
+tokio = ["dep:tokio", "dep:tokio-util", "dep:tokio-tungstenite"]
+
 [dependencies]
 plexus-macros = { path = "../plexus-macros" }
+plexus-proto = { path = "../plexus-proto" }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+serde = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+tokio = { version = "1", optional = true, features = ["io-std", "io-util", "net", "process", "rt"] }
+tokio-util = { version = "0.7", optional = true, features = ["codec"] }
+tokio-tungstenite = { version = "0.30", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process", "io-util", "net"] }
+libtest-mimic = "0.8"
+
+[[bin]]
+name = "kiln"
+path = "src/bin/kiln/main.rs"
+required-features = ["tokio"]
+
+[[test]]
+name = "stdio"
+required-features = ["tokio"]
+
+[[test]]
+name = "websocket"
+required-features = ["tokio"]
+
+[[test]]
+name = "page"
+harness = false
+required-features = ["tokio"]
+
+[[bench]]
+name = "pace"
+harness = false
+required-features = ["tokio"]

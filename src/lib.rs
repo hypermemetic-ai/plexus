@@ -1,11 +1,48 @@
 //! The one crate a Plexus activation depends on.
 //!
-//! Today it holds `#[plexus::activation]` and the types a method's signature
-//! names. The types are shapes only: nothing fills a [`Caller`], feeds an
+//! It holds `#[plexus::activation]`, the types a method's signature names,
+//! and the runtime: a [`Connection`] that calls and a [`Server`] that
+//! answers, over any [`Channel`] — a [`pair`] in memory, and with the
+//! `tokio` feature the stdio of a process ([`stdio`]) and a WebSocket
+//! ([`ws`]). Frames are plexus-proto's.
+//!
+//! Methods are served untyped here: a name, a JSON body in, items out.
+//! The signature types are shapes only: nothing fills a [`Caller`], feeds an
 //! [`Input`] or listens to a [`Progress`] yet. `#[activation(describe)]` reads
 //! them out of a signature into the IR.
+//!
+//! ```
+//! use plexus::{Connection, Server, pair, raw};
+//! use std::sync::Arc;
+//!
+//! # #[tokio::main(flavor = "current_thread")] async fn main() {
+//! let mut server = Server::new();
+//! server.method("kiln.get", |_| async { raw(&6) });
+//! let (near, far) = pair();
+//! tokio::spawn(Arc::new(server).serve(far)); // any executor
+//! let (conn, driving) = Connection::new(near, None);
+//! tokio::spawn(driving);
+//! assert_eq!(conn.call("kiln.get", ()).await.unwrap().get(), "6");
+//! # }
+//! ```
 
+mod channel;
+mod connection;
+mod server;
+#[cfg(feature = "tokio")]
+pub mod stdio;
+#[cfg(feature = "tokio")]
+pub mod ws;
+
+pub use channel::{Channel, pair};
+pub use connection::{Connection, Error, Items, TOP_UP, WINDOW};
 pub use plexus_macros::activation;
+pub use plexus_proto::{Failure, Raw};
+pub use server::{Server, fail, raw};
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Raw octets.
 pub type Bytes = Vec<u8>;
