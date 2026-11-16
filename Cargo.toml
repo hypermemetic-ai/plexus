@@ -14,10 +14,10 @@ tokio = ["dep:tokio", "dep:tokio-util", "dep:tokio-tungstenite"]
 [dependencies]
 plexus-macros = { path = "../plexus-macros" }
 plexus-proto = { path = "../plexus-proto" }
-futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-serde = "1"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await", "executor"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-tokio = { version = "1", optional = true, features = ["io-std", "io-util", "net", "process", "rt"] }
+tokio = { version = "1", optional = true, features = ["io-std", "io-util", "net", "process", "rt", "rt-multi-thread"] }
 tokio-util = { version = "0.7", optional = true, features = ["codec"] }
 tokio-tungstenite = { version = "0.30", optional = true }
 

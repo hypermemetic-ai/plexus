@@ -6,10 +6,14 @@
 //! `tokio` feature the stdio of a process ([`stdio`]) and a WebSocket
 //! ([`ws`]). Frames are plexus-proto's.
 //!
-//! Methods are served untyped here: a name, a JSON body in, items out.
-//! The signature types are shapes only: nothing fills a [`Caller`], feeds an
-//! [`Input`] or listens to a [`Progress`] yet. `#[activation(describe)]` reads
-//! them out of a signature into the IR.
+//! A [`Server`] serves methods untyped: a name, a JSON body in, items out.
+//! `#[activation]`, in a native build, writes the typed side onto it: each
+//! module gets `serve(activation, server, at)`, and its activation type
+//! [`Serve`], so that one line of `main` is a process ([`main`]).
+//!
+//! Some signature types are shapes only: nothing fills a [`Caller`], feeds
+//! an [`Input`] or listens to a [`Progress`] yet. `#[activation(describe)]`
+//! reads them out of a signature into the IR.
 //!
 //! ```
 //! use plexus::{Connection, Server, pair, raw};
@@ -28,6 +32,8 @@
 
 mod channel;
 mod connection;
+#[cfg(not(target_arch = "wasm32"))]
+mod served;
 mod server;
 #[cfg(feature = "tokio")]
 pub mod stdio;
@@ -47,9 +53,77 @@ fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Raw octets.
 pub type Bytes = Vec<u8>;
 
-/// Any JSON value, kept as its text.
+/// Any JSON value, kept as its text. In a body it is the value itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Json(pub String);
+
+impl serde::Serialize for Json {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        serde_json::value::RawValue::from_string(self.0.clone()).map_err(serde::ser::Error::custom)?.serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Json {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Json, D::Error> {
+        Ok(Json(Box::<serde_json::value::RawValue>::deserialize(d)?.get().to_owned()))
+    }
+}
+
+/// An activation `#[activation]` wrote the serving side of (native builds).
+#[cfg(not(target_arch = "wasm32"))]
+pub trait Serve: Send + Sized + 'static {
+    /// Where it is served unless told otherwise: its own name.
+    const NAME: &'static str;
+    /// Register every method on `server` under `at`, with its IR and hash.
+    fn serve(self, server: &mut Server, at: &str);
+}
+
+/// Serve `activation` as this process: over stdin and stdout until stdin
+/// closes, or with `--ws ADDR` on a WebSocket, every connection sharing the
+/// one activation (the address bound is printed on stdout, one line:
+/// `ws://127.0.0.1:PORT/`).
+///
+/// ```no_run
+/// # mod kiln { #[derive(Default)] pub struct Kiln; impl plexus::Serve for Kiln { const NAME: &'static str = "kiln"; fn serve(self, _: &mut plexus::Server, _: &str) {} } }
+/// fn main() -> std::io::Result<()> {
+///     plexus::main(kiln::Kiln::default())
+/// }
+/// ```
+#[cfg(feature = "tokio")]
+pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let ws = match args.as_slice() {
+        [] => None,
+        [flag, addr] if flag == "--ws" => Some(addr.parse::<std::net::SocketAddr>().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?),
+        _ => return Err(Error::new(ErrorKind::InvalidInput, "usage: [--ws ADDR]   (no flag: stdin and stdout)")),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let _entered = runtime.enter();
+    let mut server = Server::new();
+    activation.serve(&mut server, A::NAME);
+    let server = std::sync::Arc::new(server);
+    runtime.block_on(async move {
+        match ws {
+            None => server.serve(stdio::stdio()).await,
+            Some(addr) => {
+                let bound = ws::spawn(addr, server).await?;
+                println!("ws://{bound}/");
+                std::future::pending().await
+            }
+        }
+    })
+}
+
+/// What the code `#[activation]` writes names. Not for hand-written code.
+#[doc(hidden)]
+#[cfg(not(target_arch = "wasm32"))]
+pub mod __private {
+    pub use crate::served::{B64, Local, feed, failed, params};
+    pub use futures;
+    pub use plexus_proto::bytes;
+    pub use serde;
+}
 
 /// Who is calling. A method that takes one is refused to a caller who has
 /// not signed in; `Option<&Caller>` lets anyone call and says who, if known.

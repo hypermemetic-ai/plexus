@@ -9,7 +9,7 @@ import { Codec, Connection, PlexusFailure, type Channel } from "../../plexus-rt/
 const [url, wasm, hash] = process.argv.slice(2);
 const codec = await Codec.load(readFileSync(wasm));
 const enc = new TextEncoder(), dec = new TextDecoder();
-const WINDOW = 8;
+const WINDOW = 256, TOP_UP = 128;
 
 /// A connection over a WebSocket of Node's own, as a page makes one.
 async function connect(expects = hash): Promise<{ conn: Connection; close(): void }> {
@@ -69,7 +69,7 @@ test("a stream is paced by its reader, and leaving it cancels", async () => {
     const ahead = (await heated(conn)).made - before.made - taken;
     assert.ok(ahead <= WINDOW, `the server made ${ahead} more than the reader took`);
     furthest = Math.max(furthest, ahead);
-    if (taken === 30) break;
+    if (taken === TOP_UP + 8) break;   // past the first top-up, so the window is full again
   }
   assert.equal(furthest, WINDOW, "the server never filled the window");
   // The break sent cancel: the Rust stream is dropped, and makes no more.

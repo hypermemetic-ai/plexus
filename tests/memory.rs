@@ -8,7 +8,7 @@ use std::time::Duration;
 use common::activation::{HASH, IR, kiln};
 use common::parse;
 use futures::{FutureExt, SinkExt, StreamExt};
-use plexus::{Channel, Connection, Error, Server, pair, raw};
+use plexus::{Channel, Connection, Error, Server, TOP_UP, WINDOW, pair, raw};
 use serde_json::json;
 
 fn connect(server: Server, expects: Option<&str>) -> Connection {
@@ -53,14 +53,14 @@ async fn the_caller_grants_credit_and_cancels() {
     tokio::spawn(driving);
     let mut items = conn.stream("kiln.heat", ()).unwrap();
     assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
-    assert_eq!(read(&mut far).await, "[1,6,7]");
-    for n in 0..4 {
+    assert_eq!(read(&mut far).await, format!("[1,6,{}]", WINDOW - 1));
+    for n in 0..TOP_UP {
         far.send.send(format!("[1,{n}]").into_bytes()).await.unwrap();
     }
-    for n in 0..4 {
+    for n in 0..TOP_UP {
         assert_eq!(items.next().await.unwrap().unwrap().get(), n.to_string());
     }
-    assert_eq!(read(&mut far).await, "[1,6,4]");
+    assert_eq!(read(&mut far).await, format!("[1,6,{TOP_UP}]"));
     drop(items);
     assert_eq!(read(&mut far).await, "[1,5,null]");
 
@@ -69,6 +69,46 @@ async fn the_caller_grants_credit_and_cancels() {
     assert_eq!(read(&mut far).await, r#"[2,1,["kiln.get"]]"#);
     drop(call);
     assert_eq!(read(&mut far).await, "[2,5,null]");
+}
+
+/// pace › `call` on a stream: the window granted once the first item is
+/// in, topped up as items arrive, the last item the answer.
+#[tokio::test]
+async fn a_call_on_a_stream_grants_credit_and_answers_the_last() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    tokio::spawn(driving);
+    let call = tokio::spawn(conn.call("kiln.count", ()));
+    assert_eq!(read(&mut far).await, r#"[1,1,["kiln.count"]]"#);
+    far.send.send(b"[1,0]".to_vec()).await.unwrap();
+    assert_eq!(read(&mut far).await, format!("[1,6,{}]", WINDOW - 1));
+    for n in 1..WINDOW {
+        far.send.send(format!("[1,{n}]").into_bytes()).await.unwrap();
+    }
+    assert_eq!(read(&mut far).await, format!("[1,6,{TOP_UP}]"));
+    far.send.send(b"[1]".to_vec()).await.unwrap();
+    assert_eq!(call.await.unwrap().unwrap().get(), (WINDOW - 1).to_string());
+
+    // A server's own stream, read whole by `call`.
+    let mut server = Server::new();
+    server.stream("kiln.count", |_| futures::stream::iter(0..1000u32).map(|n| raw(&n)));
+    assert_eq!(connect(server, None).call("kiln.count", ()).await.unwrap().get(), "999");
+}
+
+/// pace › a call with one answer, its end already in, grants nothing.
+#[tokio::test]
+async fn a_call_with_one_answer_grants_no_credit() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    tokio::spawn(driving);
+    let call = conn.call("kiln.get", ());
+    let (got, ()) = futures::join!(call, async {
+        assert_eq!(read(&mut far).await, r#"[1,1,["kiln.get"]]"#);
+        far.send.send(b"[1,6]".to_vec()).await.unwrap();
+        far.send.send(b"[1]".to_vec()).await.unwrap();
+    });
+    assert_eq!(got.unwrap().get(), "6");
+    assert!(tokio::time::timeout(Duration::from_millis(50), far.receive.next()).await.is_err(), "a credit frame was sent");
 }
 
 /// streams › leaving early: the cancelled method's future is dropped, not

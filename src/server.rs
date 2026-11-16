@@ -239,7 +239,7 @@ async fn caught<T>(answer: impl Future<Output = T>) -> Result<T, Failure> {
     })
 }
 
-fn failure(code: &str, message: &str) -> Failure {
+pub(crate) fn failure(code: &str, message: &str) -> Failure {
     Failure { code: code.to_owned(), message: message.to_owned(), data: None }
 }
 

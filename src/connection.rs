@@ -19,9 +19,9 @@ use crate::lock;
 
 /// How many items a stream's caller says it will take before it has taken
 /// any (the open carries one of them).
-pub const WINDOW: u32 = 8;
+pub const WINDOW: u32 = 256;
 /// How many items it takes before saying so again.
-pub const TOP_UP: u32 = 4;
+pub const TOP_UP: u32 = 128;
 
 /// Why a call gave no answer.
 #[derive(Debug)]
@@ -125,15 +125,35 @@ impl Connection {
     }
 
     /// One answer: the last item before the end (`null` if there was
-    /// none). The call is opened now; dropping the future cancels it.
+    /// none). The call is opened now; dropping the future cancels it. Called
+    /// on a stream, it reads every item, granting credit as
+    /// [`stream`](Connection::stream) does, and answers the last.
     pub fn call(&self, method: &str, params: impl Serialize) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
         let opened = encode(&params).and_then(|params| self.open(method, params));
         async move {
             let mut call = opened?;
-            let mut got = None;
+            let (mut got, mut taken, mut waiting) = (None, 0u32, None);
             loop {
-                match call.inbox.next().await {
-                    Some(Event::Item(raw)) => got = Some(raw),
+                let event = match waiting.take() {
+                    Some(event) => event,
+                    None => call.inbox.next().await,
+                };
+                match event {
+                    Some(Event::Item(raw)) => {
+                        got = Some(raw);
+                        taken += 1;
+                        if taken == 1 {
+                            // The open was credit for one. Unless the end is
+                            // here already, this may be a stream: grant the
+                            // rest of the window, as `stream` does at open.
+                            match call.inbox.try_recv() {
+                                Ok(event) => waiting = Some(Some(event)),
+                                Err(_) => call.grant(WINDOW - 1),
+                            }
+                        } else if taken.is_multiple_of(TOP_UP) {
+                            call.grant(TOP_UP);
+                        }
+                    }
                     Some(Event::End(end)) => {
                         call.done = true;
                         return end.map(|()| got.unwrap_or_else(null)).map_err(Error::Failed);
@@ -153,7 +173,7 @@ impl Connection {
     pub fn stream(&self, method: &str, params: impl Serialize) -> Result<Items, Error> {
         let call = self.open(method, encode(&params)?)?;
         // The open itself carries credit for one.
-        self.shared.send(Frame { call: CallId(call.id), seq: 0, body: Body::Credit(WINDOW - 1) });
+        call.grant(WINDOW - 1);
         Ok(Items { call, taken: 0 })
     }
 
@@ -228,6 +248,12 @@ struct Open {
     done: bool,
 }
 
+impl Open {
+    fn grant(&self, n: u32) {
+        self.shared.send(Frame { call: CallId(self.id), seq: 0, body: Body::Credit(n) });
+    }
+}
+
 impl Drop for Open {
     fn drop(&mut self) {
         if self.done {
@@ -262,7 +288,7 @@ impl Stream for Items {
             Some(Event::Item(raw)) => {
                 self.taken += 1;
                 if self.taken.is_multiple_of(TOP_UP) {
-                    self.call.shared.send(Frame { call: CallId(self.call.id), seq: 0, body: Body::Credit(TOP_UP) });
+                    self.call.grant(TOP_UP);
                 }
                 Some(Ok(raw))
             }

@@ -9,7 +9,7 @@ pub mod activation;
 use std::time::Duration;
 
 use futures::StreamExt;
-use plexus::{Connection, WINDOW};
+use plexus::{Connection, TOP_UP, WINDOW};
 use serde_json::{Value, json};
 
 pub fn parse(raw: &plexus::Raw) -> Value {
@@ -62,7 +62,8 @@ pub async fn slow_reader(conn: &Connection) {
     let (before, dropped) = heated(conn).await;
     let mut items = conn.stream("kiln.heat", ()).unwrap();
     let mut furthest = 0;
-    for taken in 1..=40u64 {
+    // Past the first top-up, so the window is full again.
+    for taken in 1..=TOP_UP as u64 + 8 {
         let item = items.next().await.unwrap().unwrap();
         assert_eq!(parse(&item), json!({ "minute": (taken - 1) * 5 }));
         // Time enough for the server to run as far ahead as it may.
