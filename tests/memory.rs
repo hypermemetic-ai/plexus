@@ -98,6 +98,35 @@ async fn the_server_writes_no_further_than_its_credit() {
     assert!(quiet(&mut near).await, "an item past two grants at once");
 }
 
+/// A stream's items are written as they are made, a run at a time, not a
+/// window's worth at once (one thread, the reader a task beside the
+/// server's, so the count is what was made before it could read).
+#[tokio::test(flavor = "current_thread")]
+async fn a_stream_is_written_as_it_is_made() {
+    tokio::spawn(written_as_made()).await.unwrap();
+}
+
+async fn written_as_made() {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    let made = Arc::new(AtomicU32::new(0));
+    let mut server = Server::new();
+    let counted = made.clone();
+    server.stream("kiln.count", move |_| {
+        let counted = counted.clone();
+        futures::stream::iter(0..u32::MAX).map(move |n| {
+            counted.fetch_add(1, Relaxed);
+            raw(&n)
+        })
+    });
+    let (mut near, far) = pair();
+    tokio::spawn(Arc::new(server).serve(far));
+    near.send.send(br#"[1,1,["kiln.count"]]"#.to_vec()).await.unwrap();
+    near.send.send(format!("[1,6,{}]", WINDOW - 1).into_bytes()).await.unwrap();
+    assert_eq!(read(&mut near).await, "[1,0]");
+    let made = made.load(Relaxed);
+    assert!(made < WINDOW, "{made} items were made before the first was written");
+}
+
 /// What arrives for a call dropped before its end goes nowhere, and the
 /// connection's next call is answered as ever.
 #[tokio::test]

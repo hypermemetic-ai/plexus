@@ -174,6 +174,9 @@ impl Server {
     }
 }
 
+/// How many items a stream writes before it steps aside.
+const RUN: u32 = 256;
+
 struct Running {
     credit: Arc<Credit>,
     abort: AbortHandle,
@@ -244,7 +247,15 @@ async fn run(
         },
         Some(Handler::Many(f)) => {
             let mut items = f(params);
+            let mut run = 0;
             loop {
+                // Step aside now and then, so what is made is written as it
+                // is made, not a window's worth at a time.
+                run += 1;
+                if run == RUN {
+                    run = 0;
+                    crate::yield_now().await;
+                }
                 // Wait for credit before asking for the next item, so the
                 // method runs no further ahead than the caller allowed.
                 take(&credit).await;
