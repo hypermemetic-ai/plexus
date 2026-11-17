@@ -78,3 +78,7 @@ required-features = ["tokio"]
 [[test]]
 name = "store"
 required-features = ["store"]
+
+[[example]]
+name = "autobahn"
+required-features = ["tokio"]

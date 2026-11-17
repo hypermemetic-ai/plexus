@@ -1,0 +1,34 @@
+[package]
+name = "plexus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+plexus = { path = "..", features = ["tokio"] }
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+futures = "0.3"
+libfuzzer-sys = "0.4"
+tokio = "1"
+
+# Its own workspace: nightly and sanitizers build it alone.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bytes"
+path = "fuzz_targets/bytes.rs"
+test = false
+doc = false
+bench = false
