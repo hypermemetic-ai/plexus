@@ -352,6 +352,36 @@ async fn a_closed_channel_ends_every_call() {
     assert!(matches!(conn.call("kiln.get", ()).await, Err(Error::Closed)));
 }
 
+/// pace › a call whose end comes right after its first item grants no
+/// credit, even where the driver steps aside between the two (every 256
+/// frames): the window is the driver's to grant, once it has read all
+/// there was and no end came. One thread, so the caller runs at the step.
+#[tokio::test(flavor = "current_thread")]
+async fn a_call_whose_end_follows_a_step_aside_grants_no_credit() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    tokio::spawn(driving);
+    let call = tokio::spawn(conn.call("kiln.get", ()));
+    assert_eq!(read(&mut far).await, r#"[1,1,["kiln.get"]]"#);
+    // 254 frames for no call, then the item, the 255th, and the end, the
+    // 256th: the driver steps aside between them.
+    for _ in 0..254 {
+        far.send.feed(Bytes::from_static(b"[99,0]")).await.unwrap();
+    }
+    far.send.feed(Bytes::from_static(b"[1,6]")).await.unwrap();
+    far.send.feed(Bytes::from_static(b"[1]")).await.unwrap();
+    far.send.flush().await.unwrap();
+    assert_eq!(call.await.unwrap().unwrap().get(), "6");
+    // What the caller writes next is the next call's open, no credit before it.
+    let next = conn.call("kiln.get", ());
+    let (_, frame) = futures::join!(next.map(drop).boxed(), async {
+        let frame = read(&mut far).await;
+        far.send.send(Bytes::from_static(b"[2]")).await.unwrap();
+        frame
+    });
+    assert_eq!(frame, r#"[2,1,["kiln.get"]]"#);
+}
+
 /// A batch that holds one call's end and frames after it: each frame goes
 /// to its own call, in order, and one for a call that ended goes nowhere.
 #[tokio::test]
