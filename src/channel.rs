@@ -38,12 +38,20 @@ pub(crate) async fn pump(
     mut send: Pin<Box<dyn Sink<Vec<u8>, Error = io::Error> + Send>>,
     mut frames: mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> io::Result<()> {
+    #[cfg(feature = "trace")]
+    let mut batch = crate::trace::Batch::default();
     while let Some(frame) = frames.next().await {
+        #[cfg(feature = "trace")]
+        batch.taken(&frame);
         send.feed(frame).await?;
         while let Ok(frame) = frames.try_recv() {
+            #[cfg(feature = "trace")]
+            batch.taken(&frame);
             send.feed(frame).await?;
         }
         send.flush().await?;
+        #[cfg(feature = "trace")]
+        batch.flushed(|_| Some(crate::trace::now()), &[crate::trace::Stage::Flushed]);
     }
     send.close().await
 }

@@ -112,22 +112,56 @@ struct Queue {
 struct Slot {
     inbox: Arc<Inbox>,
     run: Vec<Event>,
+    /// Its call, and how many items it has handed in.
+    #[cfg(feature = "trace")]
+    traced: (u32, u32),
 }
 
 impl Slot {
     fn new(inbox: Arc<Inbox>) -> Slot {
-        Slot { inbox, run: Vec::new() }
+        Slot {
+            inbox,
+            run: Vec::new(),
+            #[cfg(feature = "trace")]
+            traced: (0, 0),
+        }
     }
 
     fn hand_in(&mut self, close: bool) {
+        #[cfg(feature = "trace")]
+        let keys = self.keys();
         let mut queue = lock(&self.inbox.0);
         queue.events.extend(self.run.drain(..));
         queue.closed |= close;
         let wake = queue.wake.take();
         drop(queue);
+        #[cfg(feature = "trace")]
+        let handed = crate::trace::now();
         if let Some(wake) = wake {
             wake.wake();
         }
+        #[cfg(feature = "trace")]
+        for key in keys {
+            crate::trace::stamp_at(key, crate::trace::Stage::InInbox, handed);
+            crate::trace::stamp(key, crate::trace::Stage::Woke);
+        }
+    }
+
+    /// The key of each event in the run.
+    #[cfg(feature = "trace")]
+    fn keys(&mut self) -> Vec<crate::trace::Key> {
+        if !crate::trace::on() {
+            return Vec::new();
+        }
+        let (call, n) = &mut self.traced;
+        let keys = self.run.iter().map(|event| match event {
+            Event::Item(_) => {
+                *n += 1;
+                (*call, *n)
+            }
+            Event::End(_) => (*call, crate::trace::END),
+        });
+        keys.collect()
     }
 }
 
@@ -186,7 +220,13 @@ impl Connection {
     /// on a stream, it reads every item, granting credit as
     /// [`stream`](Connection::stream) does, and answers the last.
     pub fn call(&self, method: &str, params: impl Serialize) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
+        #[cfg(feature = "trace")]
+        let called = crate::trace::now();
         let opened = encode(&params).and_then(|params| self.open(method, params));
+        #[cfg(feature = "trace")]
+        if let Ok(call) = &opened {
+            crate::trace::stamp_at((call.id, 0), crate::trace::Stage::Called, called);
+        }
         async move {
             let mut call = opened?;
             let (mut got, mut taken, mut waiting) = (None, 0u32, None);
@@ -199,6 +239,7 @@ impl Connection {
                     Some(Event::Item(received)) => {
                         got = Some(item(received));
                         taken += 1;
+                        stamp!((call.id, taken), Took);
                         if taken == 1 {
                             // The open was credit for one. Unless the end is
                             // here already, this may be a stream: grant the
@@ -213,6 +254,7 @@ impl Connection {
                     }
                     Some(Event::End(end)) => {
                         call.done = true;
+                        stamp!((call.id, 0), Returned);
                         return end.map(|()| got.unwrap_or_else(null)).map_err(Error::Failed);
                     }
                     None => {
@@ -256,6 +298,7 @@ impl Connection {
         if !self.shared.send(Frame::open(CallId(id), method, params)) {
             return Err(Error::Closed);
         }
+        stamp!((id, 0), OpenQueued);
         Ok(call)
     }
 }
@@ -271,6 +314,10 @@ impl Shared {
 fn deliver(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>, call: CallId, event: Event) {
     let end = matches!(event, Event::End(_));
     let Some(slot) = calls.get_mut(&call.0) else { return };
+    #[cfg(feature = "trace")]
+    {
+        slot.traced.0 = call.0;
+    }
     if slot.run.is_empty() {
         waiting.push(call.0);
     }
@@ -301,6 +348,8 @@ async fn drive(
     let ended = {
         let read = async {
             let (mut run, mut waiting) = (0, Vec::new());
+            #[cfg(feature = "trace")]
+            let mut frames = crate::trace::Frames::default();
             loop {
                 // What was read is handed in before the driver waits, and
                 // before it steps aside.
@@ -327,6 +376,12 @@ async fn drive(
                 let bad = |e| io::Error::new(io::ErrorKind::InvalidData, e);
                 let received = Received::read(bytes).map_err(bad)?;
                 let (call, kind) = (received.head().call, received.head().kind);
+                #[cfg(feature = "trace")]
+                let key = if crate::trace::on() { frames.of(call.0, kind) } else { None };
+                #[cfg(feature = "trace")]
+                if let Some(key) = key {
+                    crate::trace::stamp(key, crate::trace::Stage::Received);
+                }
                 if shared.strong_count() == 0 {
                     break;
                 }
@@ -338,6 +393,10 @@ async fn drive(
                 }
                 if kind == Kind::Item {
                     deliver(&mut calls, &mut waiting, call, Event::Item(received));
+                    #[cfg(feature = "trace")]
+                    if let Some(key) = key {
+                        crate::trace::stamp(key, crate::trace::Stage::Delivered);
+                    }
                     continue;
                 }
                 match received.into_frame().map_err(bad)?.body {
@@ -440,6 +499,7 @@ impl Stream for Items {
             Some(Event::Item(received)) => {
                 let raw = item(received);
                 self.taken += 1;
+                stamp!((self.call.id, self.taken), Took);
                 if self.taken.is_multiple_of(TOP_UP) {
                     self.call.grant(TOP_UP);
                 }

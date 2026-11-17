@@ -158,15 +158,20 @@ impl Server {
         let calls: Arc<Mutex<HashMap<u32, Running>>> = Arc::default();
         let read = async move {
             while let Some(bytes) = receive.next().await {
+                #[cfg(feature = "trace")]
+                let read = crate::trace::now();
                 let frame = Frame::decode(&bytes?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let id = frame.call.0;
                 match frame.body {
                     Body::Open(open) => {
+                        #[cfg(feature = "trace")]
+                        crate::trace::stamp_at((id, 0), crate::trace::Stage::Read, read);
                         let credit = Arc::new(Credit { left: AtomicU32::new(1), wake: AtomicWaker::new() });
                         let (abort, registration) = AbortHandle::new_pair();
                         lock(&calls).insert(id, Running { credit: credit.clone(), abort });
                         let ran = run(server.clone(), id, open, out.clone(), credit, calls.clone());
                         let _ = start.unbounded_send(Abortable::new(ran, registration).map(|_| ()).boxed());
+                        stamp!((id, 0), Started);
                     }
                     Body::Credit(n) => {
                         if let Some(call) = lock(&calls).get(&id) {
@@ -254,12 +259,18 @@ async fn run(
     credit: Arc<Credit>,
     calls: Arc<Mutex<HashMap<u32, Running>>>,
 ) {
+    stamp!(enter (id, 0), Running);
     let call = CallId(id);
     let send = |kind: Kind, body: &[u8]| {
         let mut bytes = Vec::with_capacity(body.len() + 16);
         plexus_proto::write(&mut bytes, call, kind, 0, body, Numbering::Counted);
         let _ = out.unbounded_send(bytes);
     };
+    // Each frame of the call stamped as the server has it and queues it.
+    #[cfg(feature = "trace")]
+    let sent = crate::trace::Sent::new();
+    #[cfg(feature = "trace")]
+    let send = |kind: Kind, body: &[u8]| sent.send(&send, kind, body);
     let given = open.params;
     let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
     let ended: Result<(), Failure> = match server.find(&open.method) {
@@ -274,6 +285,8 @@ async fn run(
         Some(Handler::Many(f)) => {
             let mut items = f(params);
             let mut run = 0;
+            #[cfg(feature = "trace")]
+            let mut n = 0;
             loop {
                 // Step aside now and then, so what is made is written as it
                 // is made, not a window's worth at a time.
@@ -285,6 +298,7 @@ async fn run(
                 // Wait for credit before asking for the next item, so the
                 // method runs no further ahead than the caller allowed.
                 take(&credit).await;
+                stamp!(enter { n += 1; (id, n) }, Asked);
                 match caught(items.next()).await {
                     Ok(Some(Ok(item))) => send(Kind::Item, item.get().as_bytes()),
                     Ok(Some(Err(f))) | Err(f) => break Err(f),

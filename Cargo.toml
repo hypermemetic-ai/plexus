@@ -14,6 +14,9 @@ tokio = ["dep:tokio", "dep:tokio-util", "dep:tokio-tungstenite"]
 # component the import plexus:store/sql, answered by the host's one SQLite
 # (engine/), so a component that stores needs no C compiler.
 store = ["dep:rusqlite", "dep:wit-bindgen"]
+# A call stamped at every stage, on both ends, for `benches/trace.rs`.
+# Off: none of its code exists.
+trace = []
 
 [dependencies]
 plexus-macros = { path = "../plexus-macros" }
@@ -61,6 +64,11 @@ required-features = ["tokio"]
 name = "pace"
 harness = false
 required-features = ["tokio"]
+
+[[bench]]
+name = "trace"
+harness = false
+required-features = ["tokio", "trace"]
 
 [[test]]
 name = "remote"
