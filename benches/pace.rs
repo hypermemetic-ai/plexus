@@ -7,6 +7,11 @@
 //! the steady rate is seen and not only the first windows. Server and caller
 //! share one process and one tokio runtime of 4 workers; the caller runs in
 //! a task, as a program's would, not on the thread that called `block_on`.
+//!
+//! Each is measured twice: methods registered by hand on a `Server`
+//! (`memory`, `websocket`), and the same shapes written as an activation,
+//! `#[plexus::activation]`, served as `plexus::main` serves one, on a thread
+//! of its own (`served`, `served ws`).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -35,6 +40,47 @@ impl Serialize for Item<'_> {
         item.serialize_field("pad", self.pad)?;
         item.end()
     }
+}
+
+/// The same two methods, as an author writes them.
+#[plexus::activation]
+pub mod served {
+    use futures::{Stream, StreamExt};
+
+    /// What `tickets.health` answers.
+    pub struct Health {
+        pub r#type: String,
+        pub version: String,
+        pub unix_now: u64,
+        pub ticket_count: u32,
+    }
+
+    /// One item of `count`.
+    pub struct Counted {
+        pub n: u64,
+        pub pad: String,
+    }
+
+    #[derive(Default)]
+    pub struct Bench;
+
+    impl Bench {
+        pub fn once(&self) -> Health {
+            Health { r#type: "health".into(), version: "0.6.2".into(), unix_now: 1_793_258_669, ticket_count: 1518 }
+        }
+
+        /// `to` items, each `size` pad.
+        pub fn count(&self, to: u64, size: u32) -> impl Stream<Item = Counted> {
+            let pad = "x".repeat(size as usize);
+            futures::stream::iter(0..to).map(move |n| Counted { n, pad: pad.clone() })
+        }
+    }
+}
+
+fn served() -> Server {
+    let mut server = Server::new();
+    served::serve(served::Bench, &mut server, "bench");
+    server
 }
 
 fn bench() -> Server {
@@ -99,6 +145,14 @@ fn main() {
 
         let bound = plexus::ws::spawn("127.0.0.1:0".parse().unwrap(), server).await.unwrap();
         measure("websocket", &connect(plexus::ws::connect(&format!("ws://{bound}/")).await.unwrap())).await;
+
+        let server = Arc::new(served());
+        let (near, far) = plexus::pair();
+        tokio::spawn(server.serve(far));
+        measure("served", &connect(near)).await;
+
+        let bound = plexus::ws::spawn("127.0.0.1:0".parse().unwrap(), server).await.unwrap();
+        measure("served ws", &connect(plexus::ws::connect(&format!("ws://{bound}/")).await.unwrap())).await;
     });
     runtime.block_on(measured).unwrap();
 }
