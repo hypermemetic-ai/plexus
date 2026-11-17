@@ -10,14 +10,15 @@ use std::process::Stdio;
 use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{Child, Command};
-use tokio_util::bytes::{BufMut, BytesMut};
+use tokio_util::bytes::{BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder, FramedRead, FramedWrite};
 
 use crate::Channel;
 
 /// A channel over anything read and written as lines.
 pub fn lines(read: impl AsyncRead + Send + 'static, write: impl AsyncWrite + Send + 'static) -> Channel {
-    let receive = FramedRead::new(Box::pin(read), Lines::default()).map(|line| line.map(|l: BytesMut| l.to_vec()));
+    // A line is taken from the bytes read, not copied out of them.
+    let receive = FramedRead::new(Box::pin(read), Lines::default()).map(|line| line.map(BytesMut::freeze));
     Channel::new(FramedWrite::new(Box::pin(write), Lines::default()), receive)
 }
 
@@ -74,10 +75,10 @@ impl Decoder for Lines {
     }
 }
 
-impl Encoder<Vec<u8>> for Lines {
+impl Encoder<Bytes> for Lines {
     type Error = io::Error;
 
-    fn encode(&mut self, frame: Vec<u8>, dst: &mut BytesMut) -> io::Result<()> {
+    fn encode(&mut self, frame: Bytes, dst: &mut BytesMut) -> io::Result<()> {
         dst.reserve(frame.len() + 1);
         let start = dst.len();
         dst.put_slice(&frame);

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,7 +15,7 @@ use futures::{Stream, StreamExt};
 use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Raw, Received};
 use serde::Serialize;
 
-use crate::channel::{Channel, pump};
+use crate::channel::{Channel, Out, pump};
 use crate::lock;
 
 /// How many items a stream's caller says it will take before it has taken
@@ -112,16 +113,23 @@ struct Queue {
 struct Slot {
     inbox: Arc<Inbox>,
     run: Vec<Event>,
+    /// A `call`: its first item is credit for one, as the open was, and
+    /// it may be a stream or one answer. Once that item is in, the driver
+    /// grants the rest of the window, but only where it has read all there
+    /// was to read with no end for the call: an end right behind the item
+    /// ends the call with no credit sent for nothing. `false` once granted.
+    window: bool,
     /// Its call, and how many items it has handed in.
     #[cfg(feature = "trace")]
     traced: (u32, u32),
 }
 
 impl Slot {
-    fn new(inbox: Arc<Inbox>) -> Slot {
+    fn new(inbox: Arc<Inbox>, window: bool) -> Slot {
         Slot {
             inbox,
             run: Vec::new(),
+            window,
             #[cfg(feature = "trace")]
             traced: (0, 0),
         }
@@ -172,7 +180,7 @@ impl Drop for Slot {
 }
 
 struct Shared {
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: Out,
     /// Closed once the channel has.
     tell: mpsc::UnboundedSender<Told>,
     next: AtomicU32,
@@ -190,7 +198,7 @@ impl Connection {
     ///
     /// [`ready`]: Connection::ready
     pub fn new(channel: Channel, expects: Option<&str>) -> (Connection, impl Future<Output = io::Result<()>> + Send + 'static) {
-        let (out, frames) = mpsc::unbounded();
+        let (out, frames) = crate::channel::out();
         let (said, hello) = oneshot::channel();
         let (tell, told) = mpsc::unbounded();
         let shared = Arc::new(Shared {
@@ -218,37 +226,29 @@ impl Connection {
     /// One answer: the last item before the end (`null` if there was
     /// none). The call is opened now; dropping the future cancels it. Called
     /// on a stream, it reads every item, granting credit as
-    /// [`stream`](Connection::stream) does, and answers the last.
+    /// [`stream`](Connection::stream) does once the first is in, and answers
+    /// the last. A call whose end comes with its first item grants nothing.
     pub fn call(&self, method: &str, params: impl Serialize) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
         #[cfg(feature = "trace")]
         let called = crate::trace::now();
-        let opened = encode(&params).and_then(|params| self.open(method, params));
+        let opened = encode(&params).and_then(|params| self.open(method, params, true));
         #[cfg(feature = "trace")]
         if let Ok(call) = &opened {
             crate::trace::stamp_at((call.id, 0), crate::trace::Stage::Called, called);
         }
         async move {
             let mut call = opened?;
-            let (mut got, mut taken, mut waiting) = (None, 0u32, None);
+            let (mut got, mut taken) = (None, 0u32);
             loop {
-                let event = match waiting.take() {
-                    Some(event) => event,
-                    None => future::poll_fn(|cx| call.poll_event(cx)).await,
-                };
-                match event {
+                match future::poll_fn(|cx| call.poll_event(cx)).await {
                     Some(Event::Item(received)) => {
                         got = Some(item(received));
                         taken += 1;
                         stamp!((call.id, taken), Took);
-                        if taken == 1 {
-                            // The open was credit for one. Unless the end is
-                            // here already, this may be a stream: grant the
-                            // rest of the window, as `stream` does at open.
-                            match call.try_event() {
-                                Some(event) => waiting = Some(Some(event)),
-                                None => call.grant(WINDOW - 1),
-                            }
-                        } else if taken.is_multiple_of(TOP_UP) {
+                        // The rest of the window after the first item is the
+                        // driver's to grant (`Slot::window`); the top-ups are
+                        // the reader's, as `stream`'s.
+                        if taken.is_multiple_of(TOP_UP) {
                             call.grant(TOP_UP);
                         }
                     }
@@ -270,7 +270,7 @@ impl Connection {
     /// [`WINDOW`] items ahead of the reader and no further. Dropping the
     /// stream before its end cancels the call.
     pub fn stream(&self, method: &str, params: impl Serialize) -> Result<Items, Error> {
-        let call = self.open(method, encode(&params)?)?;
+        let call = self.open(method, encode(&params)?, false)?;
         // The open itself carries credit for one.
         call.grant(WINDOW - 1);
         Ok(Items { call, taken: 0 })
@@ -283,17 +283,19 @@ impl Connection {
     /// caller allows. Dropped before its end, it cancels. With the
     /// connection closed it fails `unavailable`.
     pub fn pass(&self, method: &str, params: Option<Raw>) -> Passed {
-        match self.open(method, params) {
+        match self.open(method, params, false) {
             Ok(call) => Passed(Ok(call)),
             Err(_) => Passed::failed(unavailable()),
         }
     }
 
-    fn open(&self, method: &str, params: Option<Raw>) -> Result<Open, Error> {
+    /// `window`: the driver grants the rest of the window once the first
+    /// item is in, unless the end is right behind it ([`Slot::window`]).
+    fn open(&self, method: &str, params: Option<Raw>, window: bool) -> Result<Open, Error> {
         let inbox = Arc::new(Inbox::default());
         let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
         // Told before the open is sent, so before any answer can arrive.
-        self.shared.tell.unbounded_send(Told::Opened(id, Slot::new(inbox.clone()))).map_err(|_| Error::Closed)?;
+        self.shared.tell.unbounded_send(Told::Opened(id, Slot::new(inbox.clone(), window))).map_err(|_| Error::Closed)?;
         let call = Open { id, inbox, taken: VecDeque::new(), shared: self.shared.clone(), done: false };
         if !self.shared.send(Frame::open(CallId(id), method, params)) {
             return Err(Error::Closed);
@@ -305,15 +307,43 @@ impl Connection {
 
 impl Shared {
     fn send(&self, frame: Frame) -> bool {
-        self.out.unbounded_send(frame.encode(Numbering::Counted)).is_ok()
+        self.out.send(|buf| frame.encode_into(Numbering::Counted, buf))
+    }
+}
+
+/// The driver's slots by call. A call's id is a number given in order, so
+/// it is hashed by one multiplication, not SipHash, which no caller can
+/// steer: the ids are this end's own.
+type Calls = HashMap<u32, Slot, BuildHasherDefault<Ids>>;
+
+#[derive(Default)]
+struct Ids(u64);
+
+impl Hasher for Ids {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u32(b as u32);
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
 }
 
 /// Add `event` to its call's run, if the call is still open; `waiting`
-/// lists the calls with a run to hand in. An end is handed in at once.
-fn deliver(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>, call: CallId, event: Event) {
+/// lists the calls with a run to hand in, `windows` the calls owed their
+/// window ([`Slot::window`]). An end is handed in at once.
+fn deliver(calls: &mut Calls, waiting: &mut Vec<u32>, windows: &mut Vec<u32>, call: CallId, event: Event) {
     let end = matches!(event, Event::End(_));
     let Some(slot) = calls.get_mut(&call.0) else { return };
+    if !end && std::mem::take(&mut slot.window) {
+        windows.push(call.0);
+    }
     #[cfg(feature = "trace")]
     {
         slot.traced.0 = call.0;
@@ -327,8 +357,21 @@ fn deliver(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>, call: CallId,
     }
 }
 
+/// Grant the rest of the window to each call in `windows` still open.
+fn grant(calls: &Calls, windows: &mut Vec<u32>, shared: &Weak<Shared>) {
+    if windows.is_empty() {
+        return;
+    }
+    let Some(shared) = shared.upgrade() else { return windows.clear() };
+    for id in windows.drain(..) {
+        if calls.contains_key(&id) {
+            shared.send(Frame { call: CallId(id), seq: 0, body: Body::Credit(WINDOW - 1) });
+        }
+    }
+}
+
 /// Hand in every run read so far.
-fn hand_in(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>) {
+fn hand_in(calls: &mut Calls, waiting: &mut Vec<u32>) {
     for id in waiting.drain(..) {
         if let Some(slot) = calls.get_mut(&id) {
             slot.hand_in(false);
@@ -337,17 +380,22 @@ fn hand_in(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>) {
 }
 
 async fn drive(
-    mut receive: Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send>>,
+    mut receive: Pin<Box<dyn Stream<Item = io::Result<bytes::Bytes>> + Send>>,
     write: impl Future<Output = io::Result<()>>,
     shared: Weak<Shared>,
     mut told: mpsc::UnboundedReceiver<Told>,
     said: oneshot::Sender<String>,
 ) -> io::Result<()> {
     let mut said = Some(said);
-    let mut calls = HashMap::new();
+    let mut calls = Calls::default();
     let ended = {
         let read = async {
             let (mut run, mut waiting) = (0, Vec::new());
+            // Calls owed their window: `young` since the driver last stepped
+            // aside, `old` since the time before. Granted once the driver has
+            // read all there is (the end, if it was behind the item, came
+            // with it), or once it has stepped aside twice since.
+            let (mut young, mut old) = (Vec::new(), Vec::new());
             #[cfg(feature = "trace")]
             let mut frames = crate::trace::Frames::default();
             loop {
@@ -357,6 +405,8 @@ async fn drive(
                     let next = receive.poll_next_unpin(cx);
                     if next.is_pending() {
                         hand_in(&mut calls, &mut waiting);
+                        grant(&calls, &mut old, &shared);
+                        grant(&calls, &mut young, &shared);
                     }
                     next
                 })
@@ -370,6 +420,8 @@ async fn drive(
                 if run == RUN {
                     run = 0;
                     hand_in(&mut calls, &mut waiting);
+                    grant(&calls, &mut old, &shared);
+                    std::mem::swap(&mut old, &mut young);
                     crate::yield_now().await;
                 }
                 let bytes = bytes?;
@@ -392,7 +444,7 @@ async fn drive(
                     };
                 }
                 if kind == Kind::Item {
-                    deliver(&mut calls, &mut waiting, call, Event::Item(received));
+                    deliver(&mut calls, &mut waiting, &mut young, call, Event::Item(received));
                     #[cfg(feature = "trace")]
                     if let Some(key) = key {
                         crate::trace::stamp(key, crate::trace::Stage::Delivered);
@@ -405,7 +457,7 @@ async fn drive(
                             let _ = said.send(hello.interface);
                         }
                     }
-                    Body::End(end) => deliver(&mut calls, &mut waiting, call, Event::End(end)),
+                    Body::End(end) => deliver(&mut calls, &mut waiting, &mut young, call, Event::End(end)),
                     _ => {}
                 }
             }
@@ -452,14 +504,6 @@ impl Open {
         }
         queue.wake = Some(cx.waker().clone());
         Poll::Pending
-    }
-
-    /// The next event if one is in already.
-    fn try_event(&mut self) -> Option<Event> {
-        if self.taken.is_empty() {
-            std::mem::swap(&mut self.taken, &mut lock(&self.inbox.0).events);
-        }
-        self.taken.pop_front()
     }
 
     fn grant(&self, n: u32) {

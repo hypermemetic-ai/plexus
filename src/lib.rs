@@ -64,6 +64,8 @@ pub mod trace;
 pub mod ws;
 
 pub use channel::{Channel, pair};
+/// The `bytes` crate, whose `Bytes` a [`Channel`] carries.
+pub use bytes;
 pub use connection::{Connection, Error, Items, Passed, TOP_UP, WINDOW};
 pub use remote::Remote;
 pub use plexus_macros::activation;

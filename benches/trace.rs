@@ -147,7 +147,7 @@ fn call_steps(served: bool, way: Way) -> Vec<Step> {
             step(WsWritten, Call, 'K', "write syscall"),
             step(WsReadEntry, Call, 'S', "loopback, the reactor wakes the server task, it reads"),
             step(WsReadReturn, Call, 'S', "read syscall"),
-            step(WsMessage, Call, 'S', "parse the WebSocket message, copy its text"),
+            step(WsMessage, Call, 'S', "parse the WebSocket message"),
             step(Read, Call, 'S', "hand the frame to the server loop"),
         ]),
     }
@@ -173,7 +173,7 @@ fn call_steps(served: bool, way: Way) -> Vec<Step> {
             step(WsWritten, Item, 'K', "write syscall"),
             step(WsReadEntry, Item, 'D', "loopback, the reactor wakes the driver task, it reads"),
             step(WsReadReturn, Item, 'D', "read syscall"),
-            step(WsMessage, Item, 'D', "parse the item message, copy its text"),
+            step(WsMessage, Item, 'D', "parse the item message"),
             step(Received, Item, 'D', "read the item head"),
         ]),
     }
@@ -216,7 +216,7 @@ fn item_steps(served: bool, way: Way) -> Vec<Step> {
             step(WsWritten, Item, 'K', "write syscall"),
             step(WsReadEntry, Item, 'D', "loopback, the reactor wakes the driver task, it reads"),
             step(WsReadReturn, Item, 'D', "read syscall"),
-            step(WsMessage, Item, 'D', "parse the message, copy its text"),
+            step(WsMessage, Item, 'D', "parse the message"),
             step(Received, Item, 'D', "read the item head"),
         ]),
     }
@@ -708,7 +708,7 @@ fn work(stamps: &Stamps, call: u32, served: bool, way: Way) -> Vec<Work> {
             row('S', "the last frame and the flush up to the write, per item", "last item taken to write entered, shared by the batch", shared(Taken, false, WsWrite, WsWritten));
             row('S', "the write syscall, per item", "write entered to returned, shared by the items it wrote", shared(WsWrite, true, WsWritten, WsWritten));
             row('D', "the read syscall, per item", "read entered to returned, shared by the items it read", shared(WsReadEntry, true, WsReadReturn, WsReadReturn));
-            row('D', "parse the message, copy its text", "one item added to the run to the next message, both from one read", within(Delivered, WsMessage, WsReadReturn));
+            row('D', "parse the message", "one item added to the run to the next message, both from one read", within(Delivered, WsMessage, WsReadReturn));
             row('D', "read the item head", "message to head read, each item", one(WsMessage, Received));
         }
     }

@@ -14,7 +14,7 @@ use futures::stream::{BoxStream, FuturesUnordered, StreamExt};
 use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Open, Raw};
 use serde::Serialize;
 
-use crate::channel::{Channel, pump};
+use crate::channel::{Channel, Out, pump};
 use crate::{Activation, Place, lock};
 
 type One = Arc<dyn Fn(Raw) -> BoxFuture<'static, Result<Raw, Failure>> + Send + Sync>;
@@ -150,9 +150,9 @@ impl Server {
     pub fn serve(self: &Arc<Self>, channel: Channel) -> impl Future<Output = io::Result<()>> + Send + 'static {
         let server = self.clone();
         let Channel { send, mut receive } = channel;
-        let (out, frames) = mpsc::unbounded::<Vec<u8>>();
+        let (out, frames) = crate::channel::out();
         if let Some(interface) = &self.interface {
-            let _ = out.unbounded_send(Frame::hello(interface, false).encode(Numbering::Counted));
+            out.send(|buf| Frame::hello(interface, false).encode_into(Numbering::Counted, buf));
         }
         let (start, started) = mpsc::unbounded::<BoxFuture<'static, ()>>();
         let calls: Arc<Mutex<HashMap<u32, Running>>> = Arc::default();
@@ -255,16 +255,14 @@ async fn run(
     server: Arc<Server>,
     id: u32,
     open: Open,
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: Out,
     credit: Arc<Credit>,
     calls: Arc<Mutex<HashMap<u32, Running>>>,
 ) {
     stamp!(enter (id, 0), Running);
     let call = CallId(id);
     let send = |kind: Kind, body: &[u8]| {
-        let mut bytes = Vec::with_capacity(body.len() + 16);
-        plexus_proto::write(&mut bytes, call, kind, 0, body, Numbering::Counted);
-        let _ = out.unbounded_send(bytes);
+        out.send(|buf| plexus_proto::write(buf, call, kind, 0, body, Numbering::Counted));
     };
     // Each frame of the call stamped as the server has it and queues it.
     #[cfg(feature = "trace")]
