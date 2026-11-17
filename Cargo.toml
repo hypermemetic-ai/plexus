@@ -21,6 +21,7 @@ trace = []
 [dependencies]
 plexus-macros = { path = "../plexus-macros" }
 plexus-proto = { path = "../plexus-proto" }
+bytes = "1"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await", "executor"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

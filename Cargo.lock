@@ -89,6 +89,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
+name = "bytestring"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca79160522b4aed4a69bab673bee78d3884d44240c78c96cb04b7557d532b4dc"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "cc"
 version = "1.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -557,6 +566,7 @@ checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 name = "plexus"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "futures",
  "libtest-mimic",
  "plexus-macros",
@@ -604,6 +614,8 @@ dependencies = [
 name = "plexus-proto"
 version = "0.0.0"
 dependencies = [
+ "bytes",
+ "bytestring",
  "serde",
  "serde_json",
 ]

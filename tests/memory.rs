@@ -8,6 +8,7 @@ use std::time::Duration;
 use common::activation::{HASH, IR, kiln};
 use common::parse;
 use futures::{FutureExt, SinkExt, StreamExt};
+use plexus::bytes::Bytes;
 use plexus::{Channel, Connection, Error, Server, TOP_UP, WINDOW, pair, raw};
 use serde_json::json;
 
@@ -21,7 +22,7 @@ fn connect(server: Server, expects: Option<&str>) -> Connection {
 
 async fn read(channel: &mut Channel) -> String {
     let bytes = tokio::time::timeout(Duration::from_secs(2), channel.receive.next()).await.expect("a frame").unwrap().unwrap();
-    String::from_utf8(bytes).unwrap()
+    String::from_utf8(bytes.to_vec()).unwrap()
 }
 
 #[tokio::test]
@@ -35,12 +36,12 @@ async fn the_server_writes_the_item_then_the_end() {
     let (mut near, far) = pair();
     tokio::spawn(Arc::new(kiln().0).serve(far));
     assert_eq!(read(&mut near).await, format!(r#"[0,0,{{"interface":"{HASH}"}}]"#));
-    near.send.send(br#"[1,1,["kiln.get"]]"#.to_vec()).await.unwrap();
+    near.send.send(br#"[1,1,["kiln.get"]]"#.to_vec().into()).await.unwrap();
     assert_eq!(read(&mut near).await, r#"[1,{"cone":6,"id":1,"state":"cold"}]"#);
     assert_eq!(read(&mut near).await, "[1]");
-    near.send.send(br#"[2,1,["kiln.fire",{"cone":11}]]"#.to_vec()).await.unwrap();
+    near.send.send(br#"[2,1,["kiln.fire",{"cone":11}]]"#.to_vec().into()).await.unwrap();
     assert_eq!(read(&mut near).await, r#"[2,4,{"code":"too-hot","message":"the kiln tops out at cone 10","data":11}]"#);
-    near.send.send(br#"[3,1,["kiln.glaze"]]"#.to_vec()).await.unwrap();
+    near.send.send(br#"[3,1,["kiln.glaze"]]"#.to_vec().into()).await.unwrap();
     assert_eq!(read(&mut near).await, r#"[3,4,{"code":"not-found","message":"no method kiln.glaze"}]"#);
 }
 
@@ -55,7 +56,7 @@ async fn the_caller_grants_credit_and_cancels() {
     assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
     assert_eq!(read(&mut far).await, format!("[1,6,{}]", WINDOW - 1));
     for n in 0..TOP_UP {
-        far.send.send(format!("[1,{n}]").into_bytes()).await.unwrap();
+        far.send.send(format!("[1,{n}]").into_bytes().into()).await.unwrap();
     }
     for n in 0..TOP_UP {
         assert_eq!(items.next().await.unwrap().unwrap().get(), n.to_string());
@@ -79,19 +80,19 @@ async fn the_server_writes_no_further_than_its_credit() {
     server.stream("kiln.count", |_| futures::stream::iter(0..u32::MAX).map(|n| raw(&n)));
     let (mut near, far) = pair();
     tokio::spawn(Arc::new(server).serve(far));
-    near.send.send(br#"[1,1,["kiln.count"]]"#.to_vec()).await.unwrap();
+    near.send.send(br#"[1,1,["kiln.count"]]"#.to_vec().into()).await.unwrap();
     assert_eq!(read(&mut near).await, "[1,0]");
     let quiet = async |near: &mut Channel| tokio::time::timeout(Duration::from_millis(50), near.receive.next()).await.is_err();
     assert!(quiet(&mut near).await, "an item past the open's credit");
     for grant in [1u32, 3, 2] {
-        near.send.send(format!("[1,6,{grant}]").into_bytes()).await.unwrap();
+        near.send.send(format!("[1,6,{grant}]").into_bytes().into()).await.unwrap();
         for _ in 0..grant {
             read(&mut near).await;
         }
         assert!(quiet(&mut near).await, "an item past a grant of {grant}");
     }
-    near.send.send(b"[1,6,2]".to_vec()).await.unwrap();
-    near.send.send(b"[1,6,2]".to_vec()).await.unwrap();
+    near.send.send(b"[1,6,2]".to_vec().into()).await.unwrap();
+    near.send.send(b"[1,6,2]".to_vec().into()).await.unwrap();
     for n in 7..11 {
         assert_eq!(read(&mut near).await, format!("[1,{n}]"));
     }
@@ -120,8 +121,8 @@ async fn written_as_made() {
     });
     let (mut near, far) = pair();
     tokio::spawn(Arc::new(server).serve(far));
-    near.send.send(br#"[1,1,["kiln.count"]]"#.to_vec()).await.unwrap();
-    near.send.send(format!("[1,6,{}]", WINDOW - 1).into_bytes()).await.unwrap();
+    near.send.send(br#"[1,1,["kiln.count"]]"#.to_vec().into()).await.unwrap();
+    near.send.send(format!("[1,6,{}]", WINDOW - 1).into_bytes().into()).await.unwrap();
     assert_eq!(read(&mut near).await, "[1,0]");
     let made = made.load(Relaxed);
     assert!(made < WINDOW, "{made} items were made before the first was written");
@@ -132,7 +133,7 @@ async fn written_as_made() {
 async fn a_pair_gives_what_was_fed_at_the_flush() {
     let (mut near, mut far) = pair();
     for n in 0..3 {
-        near.send.feed(format!("[{n}]").into_bytes()).await.unwrap();
+        near.send.feed(format!("[{n}]").into_bytes().into()).await.unwrap();
     }
     assert!(tokio::time::timeout(Duration::from_millis(20), far.receive.next()).await.is_err(), "a frame before the flush");
     near.send.flush().await.unwrap();
@@ -151,17 +152,17 @@ async fn late_answers_to_a_dropped_call_go_nowhere() {
     let mut items = conn.stream("kiln.heat", ()).unwrap();
     assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
     assert_eq!(read(&mut far).await, format!("[1,6,{}]", WINDOW - 1));
-    far.send.send(b"[1,0]".to_vec()).await.unwrap();
+    far.send.send(b"[1,0]".to_vec().into()).await.unwrap();
     assert_eq!(items.next().await.unwrap().unwrap().get(), "0");
     drop(items);
     assert_eq!(read(&mut far).await, "[1,5,null]");
-    far.send.send(b"[1,1]".to_vec()).await.unwrap();
-    far.send.send(b"[1]".to_vec()).await.unwrap();
+    far.send.send(b"[1,1]".to_vec().into()).await.unwrap();
+    far.send.send(b"[1]".to_vec().into()).await.unwrap();
     let call = conn.call("kiln.get", ());
     let (got, ()) = futures::join!(call, async {
         assert_eq!(read(&mut far).await, r#"[2,1,["kiln.get"]]"#);
-        far.send.send(b"[2,6]".to_vec()).await.unwrap();
-        far.send.send(b"[2]".to_vec()).await.unwrap();
+        far.send.send(b"[2,6]".to_vec().into()).await.unwrap();
+        far.send.send(b"[2]".to_vec().into()).await.unwrap();
     });
     assert_eq!(got.unwrap().get(), "6");
 }
@@ -175,13 +176,13 @@ async fn a_call_on_a_stream_grants_credit_and_answers_the_last() {
     tokio::spawn(driving);
     let call = tokio::spawn(conn.call("kiln.count", ()));
     assert_eq!(read(&mut far).await, r#"[1,1,["kiln.count"]]"#);
-    far.send.send(b"[1,0]".to_vec()).await.unwrap();
+    far.send.send(b"[1,0]".to_vec().into()).await.unwrap();
     assert_eq!(read(&mut far).await, format!("[1,6,{}]", WINDOW - 1));
     for n in 1..WINDOW {
-        far.send.send(format!("[1,{n}]").into_bytes()).await.unwrap();
+        far.send.send(format!("[1,{n}]").into_bytes().into()).await.unwrap();
     }
     assert_eq!(read(&mut far).await, format!("[1,6,{TOP_UP}]"));
-    far.send.send(b"[1]".to_vec()).await.unwrap();
+    far.send.send(b"[1]".to_vec().into()).await.unwrap();
     assert_eq!(call.await.unwrap().unwrap().get(), (WINDOW - 1).to_string());
 
     // A server's own stream, read whole by `call`.
@@ -199,8 +200,8 @@ async fn a_call_with_one_answer_grants_no_credit() {
     let call = conn.call("kiln.get", ());
     let (got, ()) = futures::join!(call, async {
         assert_eq!(read(&mut far).await, r#"[1,1,["kiln.get"]]"#);
-        far.send.send(b"[1,6]".to_vec()).await.unwrap();
-        far.send.send(b"[1]".to_vec()).await.unwrap();
+        far.send.send(b"[1,6]".to_vec().into()).await.unwrap();
+        far.send.send(b"[1]".to_vec().into()).await.unwrap();
     });
     assert_eq!(got.unwrap().get(), "6");
     assert!(tokio::time::timeout(Duration::from_millis(50), far.receive.next()).await.is_err(), "a credit frame was sent");
@@ -238,9 +239,9 @@ async fn a_cancel_drops_what_the_method_holds() {
     };
     let (mut near, far) = pair();
     tokio::spawn(Arc::new(server).serve(far));
-    near.send.send(br#"[1,1,["kiln.wait"]]"#.to_vec()).await.unwrap();
+    near.send.send(br#"[1,1,["kiln.wait"]]"#.to_vec().into()).await.unwrap();
     until("running").await;
-    near.send.send(b"[1,5,null]".to_vec()).await.unwrap();
+    near.send.send(b"[1,5,null]".to_vec().into()).await.unwrap();
     until("dropped").await;
     assert!(tokio::time::timeout(Duration::from_millis(50), near.receive.next()).await.is_err(), "a cancelled call was answered");
 }
@@ -302,9 +303,9 @@ async fn a_method_that_panics_fails_its_call_alone() {
 /// driver that never stepped aside would hold it for good).
 #[tokio::test(flavor = "current_thread")]
 async fn credit_goes_out_while_frames_keep_coming() {
-    let (out, mut sent) = futures::channel::mpsc::unbounded::<Vec<u8>>();
+    let (out, mut sent) = futures::channel::mpsc::unbounded::<Bytes>();
     let out = out.sink_map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe));
-    let endless = futures::stream::repeat_with(|| Ok(b"[1,7]".to_vec()));
+    let endless = futures::stream::repeat_with(|| Ok(Bytes::from_static(b"[1,7]")));
     let (conn, driving) = Connection::new(Channel::new(out, endless), None);
     let mut items = conn.stream("kiln.heat", ()).unwrap();
     tokio::spawn(driving);
@@ -313,7 +314,7 @@ async fn credit_goes_out_while_frames_keep_coming() {
     }
     let mut frames = Vec::new();
     for _ in 0..3 {
-        frames.push(String::from_utf8(sent.next().await.unwrap()).unwrap());
+        frames.push(String::from_utf8(sent.next().await.unwrap().to_vec()).unwrap());
     }
     assert_eq!(frames, [r#"[1,1,["kiln.heat"]]"#.to_owned(), format!("[1,6,{}]", WINDOW - 1), format!("[1,6,{TOP_UP}]")]);
 }
@@ -327,7 +328,7 @@ async fn items_in_before_a_close_are_read_then_closed() {
     let mut items = conn.stream("kiln.heat", ()).unwrap();
     assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
     for n in 0..100 {
-        far.send.send(format!("[1,{n}]").into_bytes()).await.unwrap();
+        far.send.send(format!("[1,{n}]").into_bytes().into()).await.unwrap();
     }
     drop(far);
     driving.await.unwrap().unwrap();
@@ -349,4 +350,51 @@ async fn a_closed_channel_ends_every_call() {
     assert!(matches!(call.await, Err(Error::Closed)));
     assert!(matches!(items.next().await, Some(Err(Error::Closed))));
     assert!(matches!(conn.call("kiln.get", ()).await, Err(Error::Closed)));
+}
+
+/// A batch that holds one call's end and frames after it: each frame goes
+/// to its own call, in order, and one for a call that ended goes nowhere.
+#[tokio::test]
+async fn a_batch_holding_an_end_and_frames_after_it() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    tokio::spawn(driving);
+    let one = tokio::spawn(conn.call("kiln.get", ()));
+    assert_eq!(read(&mut far).await, r#"[1,1,["kiln.get"]]"#);
+    let mut items = conn.stream("kiln.heat", ()).unwrap();
+    assert_eq!(read(&mut far).await, r#"[2,1,["kiln.heat"]]"#);
+    assert_eq!(read(&mut far).await, format!("[2,6,{}]", WINDOW - 1));
+    for frame in ["[2,0]", "[1,6]", "[1]", "[1,7]", "[2,1]", "[2,2]", "[2]"] {
+        far.send.feed(Bytes::from_static(frame.as_bytes())).await.unwrap();
+    }
+    far.send.flush().await.unwrap();
+    assert_eq!(one.await.unwrap().unwrap().get(), "6");
+    let mut got = Vec::new();
+    while let Some(item) = items.next().await {
+        got.push(item.unwrap().get().to_owned());
+    }
+    assert_eq!(got, ["0", "1", "2"]);
+}
+
+/// A channel closing in the middle of a batch: every frame of the batch is
+/// read, in order, then every call still open learns it closed.
+#[tokio::test]
+async fn a_channel_closing_mid_batch() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    let driving = tokio::spawn(driving);
+    let mut items = conn.stream("kiln.heat", ()).unwrap();
+    let call = conn.call("kiln.get", ());
+    assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
+    for n in 0..1000 {
+        far.send.feed(format!("[1,{n}]").into_bytes().into()).await.unwrap();
+    }
+    far.send.close().await.unwrap();
+    drop(far);
+    driving.await.unwrap().unwrap();
+    for n in 0..1000 {
+        assert_eq!(items.next().await.unwrap().unwrap().get(), n.to_string());
+    }
+    assert!(matches!(items.next().await, Some(Err(Error::Closed))));
+    assert!(matches!(call.await, Err(Error::Closed)));
 }

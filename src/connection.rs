@@ -14,7 +14,7 @@ use futures::{Stream, StreamExt};
 use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Raw, Received};
 use serde::Serialize;
 
-use crate::channel::{Channel, pump};
+use crate::channel::{Channel, Out, pump};
 use crate::lock;
 
 /// How many items a stream's caller says it will take before it has taken
@@ -172,7 +172,7 @@ impl Drop for Slot {
 }
 
 struct Shared {
-    out: mpsc::UnboundedSender<Vec<u8>>,
+    out: Out,
     /// Closed once the channel has.
     tell: mpsc::UnboundedSender<Told>,
     next: AtomicU32,
@@ -190,7 +190,7 @@ impl Connection {
     ///
     /// [`ready`]: Connection::ready
     pub fn new(channel: Channel, expects: Option<&str>) -> (Connection, impl Future<Output = io::Result<()>> + Send + 'static) {
-        let (out, frames) = mpsc::unbounded();
+        let (out, frames) = crate::channel::out();
         let (said, hello) = oneshot::channel();
         let (tell, told) = mpsc::unbounded();
         let shared = Arc::new(Shared {
@@ -305,7 +305,7 @@ impl Connection {
 
 impl Shared {
     fn send(&self, frame: Frame) -> bool {
-        self.out.unbounded_send(frame.encode(Numbering::Counted)).is_ok()
+        self.out.send(|buf| frame.encode_into(Numbering::Counted, buf))
     }
 }
 
@@ -337,7 +337,7 @@ fn hand_in(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>) {
 }
 
 async fn drive(
-    mut receive: Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send>>,
+    mut receive: Pin<Box<dyn Stream<Item = io::Result<bytes::Bytes>> + Send>>,
     write: impl Future<Output = io::Result<()>>,
     shared: Weak<Shared>,
     mut told: mpsc::UnboundedReceiver<Told>,

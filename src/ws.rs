@@ -9,7 +9,9 @@ use futures::{SinkExt, StreamExt, future};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::{self, Message};
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data as OpData, OpCode};
+use tokio_tungstenite::tungstenite::{self, Bytes, Message};
 
 use crate::{Channel, Server};
 
@@ -67,13 +69,14 @@ pub async fn spawn(addr: SocketAddr, server: Arc<Server>) -> io::Result<SocketAd
 
 fn channel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(socket: WebSocketStream<S>) -> Channel {
     let (send, receive) = socket.split();
-    let send = send.sink_map_err(broken).with(|frame: Vec<u8>| {
-        future::ready(String::from_utf8(frame).map(|text| Message::Text(text.into())).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)))
-    });
+    // A frame is written as a text message as it is: the runtime wrote it as
+    // UTF-8, and the reader checks it, so it is not checked here again.
+    let send = send.sink_map_err(broken).with(|frame: Bytes| future::ready(Ok(Message::Frame(Frame::message(frame, OpCode::Data(OpData::Text), true)))));
     let receive = receive.filter_map(|message| {
         future::ready(match message {
-            Ok(Message::Text(text)) => Some(Ok(text.as_bytes().to_vec())),
-            Ok(Message::Binary(bytes)) => Some(Ok(bytes.to_vec())),
+            // The message's own bytes, where the socket read them: not copied.
+            Ok(Message::Text(text)) => Some(Ok(Bytes::from(text))),
+            Ok(Message::Binary(bytes)) => Some(Ok(bytes)),
             Ok(_) => None,
             Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => None,
             Err(e) => Some(Err(broken(e))),
@@ -99,6 +102,7 @@ mod traced {
     use std::task::{Context, Poll};
 
     use futures::{Sink, StreamExt};
+    use tokio_tungstenite::tungstenite::Bytes;
     use tokio_tungstenite::WebSocketStream;
     use tokio_tungstenite::tungstenite::handshake::client::Response;
 
@@ -139,19 +143,19 @@ mod traced {
     /// The sending half: a frame's write to the socket is stamped once the
     /// flush that writes it is done.
     struct Written {
-        send: Pin<Box<dyn Sink<Vec<u8>, Error = io::Error> + Send>>,
+        send: Pin<Box<dyn Sink<Bytes, Error = io::Error> + Send>>,
         clock: Arc<Clock>,
         batch: Batch,
     }
 
-    impl Sink<Vec<u8>> for Written {
+    impl Sink<Bytes> for Written {
         type Error = io::Error;
 
         fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             self.send.as_mut().poll_ready(cx)
         }
 
-        fn start_send(mut self: Pin<&mut Self>, frame: Vec<u8>) -> io::Result<()> {
+        fn start_send(mut self: Pin<&mut Self>, frame: Bytes) -> io::Result<()> {
             // Keyed again here, not stamped: the pump stamped it taken.
             self.batch.keep(&frame);
             self.send.as_mut().start_send(frame)
