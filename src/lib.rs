@@ -43,7 +43,7 @@ mod server;
 #[cfg(feature = "tokio")]
 pub mod stdio;
 #[cfg(feature = "store")]
-mod store;
+pub mod store;
 #[cfg(feature = "tokio")]
 pub mod ws;
 
@@ -54,7 +54,7 @@ pub use plexus_macros::activation;
 pub use plexus_proto::{Failure, Raw};
 pub use server::{Server, fail, raw};
 #[cfg(feature = "store")]
-pub use {rusqlite, store::Store};
+pub use store::Store;
 
 fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
