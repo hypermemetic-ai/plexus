@@ -1,4 +1,5 @@
-//! A store in a process: rusqlite, its file under `--data DIR`.
+//! A store in a process: rusqlite, its file under `--data DIR`, in the
+//! directory of the place its activation is served at.
 
 use rusqlite::types::{self, ToSqlOutput};
 use rusqlite::{Connection, ToSql, params_from_iter};
@@ -42,15 +43,17 @@ fn value(v: types::ValueRef) -> ValueRef {
 pub(super) struct Db(Connection);
 
 impl Db {
-    pub(super) fn open(name: &str, schema: &str) -> Result<Db> {
-        let dir = DATA.get().cloned().or_else(|| std::env::var_os("PLEXUS_DATA").filter(|d| !d.is_empty()).map(Into::into));
+    pub(super) fn open(place: Option<&str>, name: &str, schema: &str) -> Result<Db> {
+        let dir = DATA.get().cloned().or_else(|| std::env::var_os("PLEXUS_DATA").filter(|d| !d.is_empty()).map(std::path::PathBuf::from));
         let db = match dir {
             Some(dir) => {
+                let dir = place.map_or(dir.clone(), |p| dir.join(p));
                 std::fs::create_dir_all(&dir).map_err(|e| Error(format!("{}: {e}", dir.display())))?;
                 Connection::open(dir.join(format!("{name}.db")))
             }
             None => {
-                eprintln!("plexus: the store {name:?} is in memory and goes when the process ends (no --data DIR, no PLEXUS_DATA)");
+                let of = place.map(|p| format!(" of {p}")).unwrap_or_default();
+                eprintln!("plexus: the store {name:?}{of} is in memory and goes when the process ends (no --data DIR, no PLEXUS_DATA)");
                 Connection::open_in_memory()
             }
         }

@@ -11,7 +11,8 @@ package plexus:store@0.0.1;
 /// SQL (`begin`, `commit`, `rollback`) on the database's one connection.
 interface sql {
     /// The database named `name`, with `schema` run on it when it is first
-    /// opened. The same name is the same database.
+    /// opened. The host scopes the name by the activation it serves: the
+    /// same name from another activation is another database.
     open: func(name: string, schema: string) -> result<u32, string>;
     /// Run one statement; the number of rows it changed.
     execute: func(db: u32, sql: string, params: list<u8>) -> result<u64, string>;
