@@ -68,7 +68,16 @@ pub async fn slow_reader(conn: &Connection) {
         assert_eq!(parse(&item), json!({ "minute": (taken - 1) * 5 }));
         // Time enough for the server to run as far ahead as it may.
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let ahead = heated(conn).await.0 - before - taken;
+        let mut ahead = heated(conn).await.0 - before - taken;
+        // At the top-up half a window is made again: on a busy machine,
+        // more than one pause's worth. The bound below is checked as ever.
+        for _ in 0..2000 {
+            if taken != TOP_UP as u64 || ahead >= WINDOW as u64 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            ahead = heated(conn).await.0 - before - taken;
+        }
         assert!(ahead <= WINDOW as u64, "the server made {ahead} more than the caller took");
         furthest = furthest.max(ahead);
     }
