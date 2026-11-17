@@ -85,7 +85,7 @@ impl Server {
         }
         let said = serde_json::from_str::<Hashed>(ir)?.hash;
         let hash = raw(&said).expect("a string is JSON");
-        let ir = serde_json::value::RawValue::from_string(ir.to_owned())?;
+        let ir = Raw::parse(ir).map_err(serde::de::Error::custom)?;
         self.places.push(Entry::Described(Place { place: at.to_owned(), hash: Some(said) }));
         self.method(&format!("{at}._ir"), move |_| std::future::ready(Ok(ir.clone())));
         self.method(&format!("{at}._hash"), move |_| std::future::ready(Ok(hash.clone())));
@@ -338,11 +338,11 @@ pub(crate) fn failure(code: &str, message: &str) -> Failure {
 
 /// A value as JSON: what a method answers.
 pub fn raw<T: Serialize + ?Sized>(value: &T) -> Result<Raw, Failure> {
-    serde_json::value::to_raw_value(value).map_err(|e| failure("internal", &e.to_string()))
+    Raw::of(value).map_err(|e| failure("internal", &e.to_string()))
 }
 
 /// A method's failure: a code a program matches on, a sentence for a
 /// person, and data.
 pub fn fail(code: &str, message: &str, data: impl Serialize) -> Failure {
-    Failure { data: serde_json::value::to_raw_value(&data).ok(), ..failure(code, message) }
+    Failure { data: Raw::of(&data).ok(), ..failure(code, message) }
 }

@@ -219,7 +219,7 @@ impl Params<'_> {
 
 /// `invalid-params`, its data the parameter's name.
 fn invalid(name: &str, message: &str) -> Failure {
-    let data = (!name.is_empty()).then(|| serde_json::value::to_raw_value(name).expect("a string is JSON"));
+    let data = (!name.is_empty()).then(|| Raw::of(name).expect("a string is JSON"));
     Failure { data, ..failure("invalid-params", message) }
 }
 
@@ -235,10 +235,10 @@ pub fn failed<E: Serialize>(error: &E, cases: &[(&str, &str, &str)]) -> Failure 
     let (wire, data) = match value {
         serde_json::Value::String(s) if !cases.is_empty() => (s, None),
         serde_json::Value::Object(o) if o.len() == 1 && !cases.is_empty() => o.into_iter().next().map(|(k, v)| (k, Some(v))).expect("one key"),
-        other => return Failure { data: serde_json::value::to_raw_value(&other).ok(), ..failure("failed", "") },
+        other => return Failure { data: Raw::of(&other).ok(), ..failure("failed", "") },
     };
     let (code, message) = cases.iter().find(|(w, ..)| *w == wire).map(|(_, n, d)| (*n, *d)).unwrap_or((&wire, ""));
-    Failure { data: data.and_then(|d| serde_json::value::to_raw_value(&d).ok()), ..failure(code, message) }
+    Failure { data: data.and_then(|d| Raw::of(&d).ok()), ..failure(code, message) }
 }
 
 /// Bytes as a parameter, an answer or an item: base64, as in a record.
