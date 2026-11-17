@@ -17,6 +17,9 @@
 use std::cell::OnceCell;
 use std::fmt;
 
+mod packed;
+pub use packed::ValueRef;
+
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
@@ -29,7 +32,7 @@ mod wasm;
 #[cfg(target_arch = "wasm32")]
 use wasm as db;
 
-/// A value SQLite keeps: a parameter, or a column of a row.
+/// A value SQLite keeps, as a statement's parameter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -37,6 +40,18 @@ pub enum Value {
     Real(f64),
     Text(String),
     Blob(Vec<u8>),
+}
+
+impl Value {
+    pub fn as_ref(&self) -> ValueRef<'_> {
+        match self {
+            Value::Null => ValueRef::Null,
+            Value::Integer(i) => ValueRef::Integer(*i),
+            Value::Real(r) => ValueRef::Real(*r),
+            Value::Text(t) => ValueRef::Text(t.as_bytes()),
+            Value::Blob(b) => ValueRef::Blob(b),
+        }
+    }
 }
 
 /// What SQLite refused, or a column that is not the type asked for.
@@ -53,30 +68,31 @@ impl std::error::Error for Error {}
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// One row of a query, its columns by position.
-pub struct Row<'a>(&'a [Value]);
+/// One row of a query, its columns by position, borrowed from where they
+/// lie.
+pub struct Row<'a>(&'a [ValueRef<'a>]);
 
 impl Row<'_> {
     pub fn get<T: FromValue>(&self, column: usize) -> Result<T> {
         let v = self.0.get(column).ok_or_else(|| Error(format!("no column {column}")))?;
-        T::from_value(v).map_err(|e| Error(format!("column {column}: {e}")))
+        T::from_value(*v).map_err(|e| Error(format!("column {column}: {e}")))
     }
 }
 
 /// A Rust value read out of a column.
 pub trait FromValue: Sized {
-    fn from_value(v: &Value) -> Result<Self>;
+    fn from_value(v: ValueRef) -> Result<Self>;
 }
 
 // Says the value's kind, not the value: formatting a float would put
 // Rust's float printing into every component that stores.
-fn wrong(v: &Value, want: &str) -> Error {
+fn wrong(v: ValueRef, want: &str) -> Error {
     let kind = match v {
-        Value::Null => "null",
-        Value::Integer(_) => "an integer",
-        Value::Real(_) => "a real",
-        Value::Text(_) => "text",
-        Value::Blob(_) => "a blob",
+        ValueRef::Null => "null",
+        ValueRef::Integer(_) => "an integer",
+        ValueRef::Real(_) => "a real",
+        ValueRef::Text(_) => "text",
+        ValueRef::Blob(_) => "a blob",
     };
     Error(format!("{kind} is not {want}"))
 }
@@ -89,9 +105,9 @@ macro_rules! integers {
             }
         }
         impl FromValue for $t {
-            fn from_value(v: &Value) -> Result<$t> {
+            fn from_value(v: ValueRef) -> Result<$t> {
                 match v {
-                    Value::Integer(n) => <$t>::try_from(*n).map_err(|_| wrong(v, stringify!($t))),
+                    ValueRef::Integer(n) => <$t>::try_from(n).map_err(|_| wrong(v, stringify!($t))),
                     _ => Err(wrong(v, stringify!($t))),
                 }
             }
@@ -106,7 +122,7 @@ impl From<bool> for Value {
     }
 }
 impl FromValue for bool {
-    fn from_value(v: &Value) -> Result<bool> {
+    fn from_value(v: ValueRef) -> Result<bool> {
         i64::from_value(v).map(|n| n != 0)
     }
 }
@@ -121,16 +137,16 @@ impl From<f32> for Value {
     }
 }
 impl FromValue for f64 {
-    fn from_value(v: &Value) -> Result<f64> {
+    fn from_value(v: ValueRef) -> Result<f64> {
         match v {
-            Value::Real(r) => Ok(*r),
-            Value::Integer(n) => Ok(*n as f64),
+            ValueRef::Real(r) => Ok(r),
+            ValueRef::Integer(n) => Ok(n as f64),
             _ => Err(wrong(v, "a number")),
         }
     }
 }
 impl FromValue for f32 {
-    fn from_value(v: &Value) -> Result<f32> {
+    fn from_value(v: ValueRef) -> Result<f32> {
         f64::from_value(v).map(|r| r as f32)
     }
 }
@@ -145,9 +161,9 @@ impl From<&str> for Value {
     }
 }
 impl FromValue for String {
-    fn from_value(v: &Value) -> Result<String> {
+    fn from_value(v: ValueRef) -> Result<String> {
         match v {
-            Value::Text(t) => Ok(t.clone()),
+            ValueRef::Text(t) => String::from_utf8(t.to_vec()).map_err(|_| Error("text that is not UTF-8".into())),
             _ => Err(wrong(v, "text")),
         }
     }
@@ -158,9 +174,9 @@ impl From<Vec<u8>> for Value {
     }
 }
 impl FromValue for Vec<u8> {
-    fn from_value(v: &Value) -> Result<Vec<u8>> {
+    fn from_value(v: ValueRef) -> Result<Vec<u8>> {
         match v {
-            Value::Blob(b) => Ok(b.clone()),
+            ValueRef::Blob(b) => Ok(b.to_vec()),
             _ => Err(wrong(v, "a blob")),
         }
     }
@@ -171,9 +187,9 @@ impl<T: Into<Value>> From<Option<T>> for Value {
     }
 }
 impl<T: FromValue> FromValue for Option<T> {
-    fn from_value(v: &Value) -> Result<Option<T>> {
+    fn from_value(v: ValueRef) -> Result<Option<T>> {
         match v {
-            Value::Null => Ok(None),
+            ValueRef::Null => Ok(None),
             v => T::from_value(v).map(Some),
         }
     }

@@ -5,14 +5,18 @@
 
 use std::cell::RefCell;
 
-use rusqlite::types::{ToSqlOutput, ValueRef};
+use rusqlite::types::{self, ToSqlOutput};
 use rusqlite::{Connection, ToSql, params_from_iter};
 
 mod vfs;
+#[path = "../../src/store/packed.rs"]
+mod packed;
+
+use packed::ValueRef;
 
 wit_bindgen::generate!({ path: "../wit", world: "engine" });
 
-use exports::plexus::store::sql::{Guest, Rows, Value};
+use exports::plexus::store::sql::Guest;
 
 thread_local!(static DBS: RefCell<Vec<(String, Connection)>> = const { RefCell::new(Vec::new()) });
 
@@ -23,26 +27,24 @@ fn with<T>(db: u32, f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Resul
     })
 }
 
-impl ToSql for Value {
+impl ToSql for ValueRef<'_> {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(match self {
-            Value::Null => ValueRef::Null,
-            Value::Integer(i) => ValueRef::Integer(*i),
-            Value::Real(r) => ValueRef::Real(*r),
-            Value::Text(t) => ValueRef::Text(t.as_bytes()),
-            Value::Blob(b) => ValueRef::Blob(b),
+        Ok(ToSqlOutput::Borrowed(match *self {
+            ValueRef::Null => types::ValueRef::Null,
+            ValueRef::Integer(i) => types::ValueRef::Integer(i),
+            ValueRef::Real(r) => types::ValueRef::Real(r),
+            ValueRef::Text(t) => types::ValueRef::Text(t),
+            ValueRef::Blob(b) => types::ValueRef::Blob(b),
         }))
     }
 }
 
-fn value(v: ValueRef) -> Value {
-    match v {
-        ValueRef::Null => Value::Null,
-        ValueRef::Integer(i) => Value::Integer(i),
-        ValueRef::Real(r) => Value::Real(r),
-        ValueRef::Text(t) => Value::Text(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+fn unpack(mut block: &[u8]) -> Result<Vec<ValueRef<'_>>, String> {
+    let mut params = Vec::new();
+    while !block.is_empty() {
+        params.push(ValueRef::take(&mut block).map_err(|e| format!("the parameters: {e}"))?);
     }
+    Ok(params)
 }
 
 struct Engine;
@@ -63,22 +65,31 @@ impl Guest for Engine {
 
     // Statements are kept prepared by their text, so an author who runs the
     // same SQL again does not prepare it again.
-    fn execute(db: u32, sql: String, params: Vec<Value>) -> Result<u64, String> {
+    fn execute(db: u32, sql: String, params: Vec<u8>) -> Result<u64, String> {
+        let params = unpack(&params)?;
         with(db, |c| c.prepare_cached(&sql)?.execute(params_from_iter(&params)).map(|n| n as u64))
     }
 
-    fn query(db: u32, sql: String, params: Vec<Value>) -> Result<Rows, String> {
+    fn query(db: u32, sql: String, params: Vec<u8>) -> Result<Vec<u8>, String> {
+        let params = unpack(&params)?;
         with(db, |c| {
             let mut st = c.prepare_cached(&sql)?;
             let columns = st.column_count();
             let mut rows = st.query(params_from_iter(&params))?;
-            let mut values = Vec::new();
+            let mut block = (columns as u32).to_le_bytes().to_vec();
             while let Some(row) = rows.next()? {
                 for i in 0..columns {
-                    values.push(value(row.get_ref(i)?));
+                    match row.get_ref(i)? {
+                        types::ValueRef::Null => ValueRef::Null,
+                        types::ValueRef::Integer(i) => ValueRef::Integer(i),
+                        types::ValueRef::Real(r) => ValueRef::Real(r),
+                        types::ValueRef::Text(t) => ValueRef::Text(t),
+                        types::ValueRef::Blob(b) => ValueRef::Blob(b),
+                    }
+                    .put(&mut block);
                 }
             }
-            Ok(Rows { columns: columns as u32, values })
+            Ok(block)
         })
     }
 }

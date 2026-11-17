@@ -3,32 +3,20 @@ package plexus:store@0.0.1;
 /// SQLite, which the host keeps once for every activation it runs. What an
 /// activation's `plexus::Store` asks of it in a component.
 ///
-/// A query answers all its rows in one call: a crossing costs per value,
-/// not per call, so pages would save no copying, only a peak; a big read
-/// pages itself with `limit`. A transaction is said in SQL (`begin`,
-/// `commit`, `rollback`) on the database's one connection.
+/// A statement's parameters, and a query's rows, cross as one block of
+/// bytes each, packed and read in Rust on both sides (plexus's
+/// `src/store/packed.rs` says the layout): one copy each way, where a list
+/// of values would cross a value at a time. A query answers all its rows in
+/// one call; a big read pages itself with `limit`. A transaction is said in
+/// SQL (`begin`, `commit`, `rollback`) on the database's one connection.
 interface sql {
-    variant value {
-        null,
-        integer(s64),
-        real(f64),
-        text(string),
-        blob(list<u8>),
-    }
-
-    /// A query's rows, one after another, `columns` values each.
-    record rows {
-        columns: u32,
-        values: list<value>,
-    }
-
     /// The database named `name`, with `schema` run on it when it is first
     /// opened. The same name is the same database.
     open: func(name: string, schema: string) -> result<u32, string>;
     /// Run one statement; the number of rows it changed.
-    execute: func(db: u32, sql: string, params: list<value>) -> result<u64, string>;
-    /// Run one statement; every row it answers.
-    query: func(db: u32, sql: string, params: list<value>) -> result<rows, string>;
+    execute: func(db: u32, sql: string, params: list<u8>) -> result<u64, string>;
+    /// Run one statement; every row it answers, packed.
+    query: func(db: u32, sql: string, params: list<u8>) -> result<list<u8>, string>;
 }
 
 /// What SQLite in a component asks of its host.

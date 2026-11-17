@@ -1,9 +1,9 @@
 //! A store in a process: rusqlite, its file under `--data DIR`.
 
-use rusqlite::types::{ToSqlOutput, ValueRef};
+use rusqlite::types::{self, ToSqlOutput};
 use rusqlite::{Connection, ToSql, params_from_iter};
 
-use super::{Error, Result, Row, Value};
+use super::{Error, Result, Row, Value, ValueRef};
 
 static DATA: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
@@ -19,23 +19,23 @@ fn err(e: rusqlite::Error) -> Error {
 
 impl ToSql for Value {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(match self {
-            Value::Null => ValueRef::Null,
-            Value::Integer(i) => ValueRef::Integer(*i),
-            Value::Real(r) => ValueRef::Real(*r),
-            Value::Text(t) => ValueRef::Text(t.as_bytes()),
-            Value::Blob(b) => ValueRef::Blob(b),
+        Ok(ToSqlOutput::Borrowed(match self.as_ref() {
+            ValueRef::Null => types::ValueRef::Null,
+            ValueRef::Integer(i) => types::ValueRef::Integer(i),
+            ValueRef::Real(r) => types::ValueRef::Real(r),
+            ValueRef::Text(t) => types::ValueRef::Text(t),
+            ValueRef::Blob(b) => types::ValueRef::Blob(b),
         }))
     }
 }
 
-fn value(v: ValueRef) -> Value {
+fn value(v: types::ValueRef) -> ValueRef {
     match v {
-        ValueRef::Null => Value::Null,
-        ValueRef::Integer(i) => Value::Integer(i),
-        ValueRef::Real(r) => Value::Real(r),
-        ValueRef::Text(t) => Value::Text(String::from_utf8_lossy(t).into_owned()),
-        ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+        types::ValueRef::Null => ValueRef::Null,
+        types::ValueRef::Integer(i) => ValueRef::Integer(i),
+        types::ValueRef::Real(r) => ValueRef::Real(r),
+        types::ValueRef::Text(t) => ValueRef::Text(t),
+        types::ValueRef::Blob(b) => ValueRef::Blob(b),
     }
 }
 
@@ -67,12 +67,8 @@ impl Db {
         let mut st = self.0.prepare_cached(sql).map_err(err)?;
         let columns = st.column_count();
         let mut rows = st.query(params_from_iter(params)).map_err(err)?;
-        let mut values = Vec::with_capacity(columns);
         while let Some(row) = rows.next().map_err(err)? {
-            values.clear();
-            for i in 0..columns {
-                values.push(value(row.get_ref(i).map_err(err)?));
-            }
+            let values = (0..columns).map(|i| row.get_ref(i).map(value)).collect::<rusqlite::Result<Vec<_>>>().map_err(err)?;
             f(&Row(&values))?;
         }
         Ok(())
