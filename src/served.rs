@@ -8,30 +8,149 @@
 //! the calls run together as they do in a component, and the answers are
 //! handed back. The [`Server`](crate::Server) stays `Send`, served on any
 //! executor; the activation need only be `Send`.
+//!
+//! The thread runs one call at a time; another runs when it waits (an
+//! `async` method awaiting, a stream with no item ready or no credit), and
+//! a stream steps aside every [`RUN`] items. A stream's items are made only
+//! as far as the caller's credit allows, and cross to the server in runs:
+//! one wake-up for all that were made meanwhile.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 use futures::channel::{mpsc, oneshot};
-use futures::executor::LocalPool;
 use futures::future::{self, BoxFuture, Either, FutureExt, LocalBoxFuture};
-use futures::stream::{BoxStream, Stream, StreamExt};
+use futures::executor::LocalPool;
+use futures::stream::{Stream, StreamExt};
 use futures::task::LocalSpawnExt;
 use plexus_proto::{Failure, Raw};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::server::failure;
+use crate::lock;
+use crate::server::{Paced, Server, failure};
 
 type Job<A> = Box<dyn FnOnce(&Rc<A>) -> LocalBoxFuture<'static, ()> + Send>;
 
-/// One item of a stream asked for: `None` when there are no more.
-type Ask = oneshot::Sender<Option<Result<Raw, Failure>>>;
+/// How many items a stream makes before it steps aside for the other calls
+/// on its thread.
+const RUN: u32 = 256;
 
-/// The asks of one stream, in order, until its reader leaves.
-pub type Asks = mpsc::UnboundedReceiver<Ask>;
+/// One stream's way across: the items made and not yet taken, the credit
+/// given and not yet used, and who waits on which. The activation's side
+/// puts items as they are made and the server's side takes all there are at
+/// once, so a run of items costs one wake-up, not one each.
+#[derive(Default)]
+struct Hop {
+    items: VecDeque<Result<Raw, Failure>>,
+    /// No more items will be put.
+    ended: bool,
+    /// Credit given and not yet taken by the activation's side.
+    granted: u32,
+    /// The server's side is gone: the method's stream is dropped.
+    left: bool,
+    reader: Option<Waker>,
+    feeder: Option<Waker>,
+}
+
+impl Hop {
+    /// Put the last item, if there is one, and end; a no-op once ended.
+    fn end(hop: &Mutex<Hop>, last: Option<Failure>) {
+        let reader = {
+            let mut hop = lock(hop);
+            if hop.ended {
+                return;
+            }
+            hop.items.extend(last.map(Err));
+            hop.ended = true;
+            hop.reader.take()
+        };
+        if let Some(w) = reader {
+            w.wake();
+        }
+    }
+}
+
+/// The activation's side of one stream, handed to [`feed`].
+pub struct Asks(Arc<Mutex<Hop>>);
+
+/// The server's side of one stream: its items, in runs.
+pub struct Served {
+    hop: Arc<Mutex<Hop>>,
+    taken: VecDeque<Result<Raw, Failure>>,
+}
+
+impl Served {
+    fn failed(failure: Failure) -> Served {
+        let hop = Hop { items: VecDeque::from([Err(failure)]), ended: true, ..Hop::default() };
+        Served { hop: Arc::new(Mutex::new(hop)), taken: VecDeque::new() }
+    }
+}
+
+impl Stream for Served {
+    type Item = Result<Raw, Failure>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(item) = self.taken.pop_front() {
+            return Poll::Ready(Some(item));
+        }
+        let this = &mut *self;
+        let mut hop = lock(&this.hop);
+        std::mem::swap(&mut this.taken, &mut hop.items);
+        if let Some(item) = this.taken.pop_front() {
+            // Busy with a run: no wake-up is wanted until it is taken.
+            hop.reader = None;
+            return Poll::Ready(Some(item));
+        }
+        if hop.ended {
+            return Poll::Ready(None);
+        }
+        if !hop.reader.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+            hop.reader = Some(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+}
+
+impl Paced for Served {
+    fn grant(&self, n: u32) {
+        let feeder = {
+            let mut hop = lock(&self.hop);
+            hop.granted = hop.granted.saturating_add(n);
+            hop.feeder.take()
+        };
+        if let Some(w) = feeder {
+            w.wake();
+        }
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        let feeder = {
+            let mut hop = lock(&self.hop);
+            hop.left = true;
+            hop.items.clear();
+            hop.feeder.take()
+        };
+        if let Some(w) = feeder {
+            w.wake();
+        }
+    }
+}
+
+/// Register a stream an activation serves: `run` makes the server's side.
+pub fn stream<F>(server: &mut Server, name: &str, run: F)
+where
+    F: Fn(Raw) -> Served + Send + Sync + 'static,
+{
+    server.paced(name, Arc::new(move |p| Box::new(run(p)) as Box<dyn Paced>));
+}
 
 /// An activation on a thread of its own. Clones send to the same one; the
 /// thread ends when every clone is gone.
@@ -127,9 +246,11 @@ impl<A: Send + 'static> Local<A> {
         .boxed()
     }
 
-    /// Many answers, each worked out only when the server asks for it: `run`
-    /// is called on the activation's thread and hands its stream to [`feed`].
-    pub fn stream<P, F, Fut>(&self, args: Result<P, Failure>, run: F) -> BoxStream<'static, Result<Raw, Failure>>
+    /// Many answers, worked out on the activation's thread only as far as
+    /// the server's credit allows: `run` is called there and hands its
+    /// stream to [`feed`]. A panic ends the stream with an `internal`
+    /// failure; the server's side dropped drops the method's stream.
+    pub fn stream<P, F, Fut>(&self, args: Result<P, Failure>, run: F) -> Served
     where
         P: Send + 'static,
         F: FnOnce(Rc<A>, P, Asks) -> Fut + Send + 'static,
@@ -137,56 +258,115 @@ impl<A: Send + 'static> Local<A> {
     {
         let args = match args {
             Ok(args) => args,
-            Err(f) => return futures::stream::once(future::ready(Err(f))).boxed(),
+            Err(f) => return Served::failed(f),
         };
-        let (ask, asks) = mpsc::unbounded::<Ask>();
-        let job: Job<A> = Box::new(move |a| caught(run(a.clone(), args, asks)).map(|_| ()).boxed_local());
+        let hop = Arc::new(Mutex::new(Hop::default()));
+        let asks = Asks(hop.clone());
+        let job: Job<A> = Box::new(move |a| {
+            let ending = Ending(asks.0.clone());
+            caught(run(a.clone(), args, asks)).map(move |r| ending.end(r.err())).boxed_local()
+        });
         if self.jobs.unbounded_send(job).is_err() {
-            return futures::stream::once(future::ready(Err(stopped()))).boxed();
+            return Served::failed(stopped());
         }
-        // Dropping the stream drops `ask`, which ends `feed`.
-        futures::stream::unfold(Some(ask), |ask| async move {
-            let ask = ask?;
-            let (tx, rx) = oneshot::channel();
-            ask.unbounded_send(tx).ok()?;
-            match rx.await {
-                Ok(Some(item)) => Some((item, Some(ask))),
-                Ok(None) => None,
-                Err(_) => Some((Err(stopped()), None)),
-            }
-        })
-        .boxed()
+        Served { hop, taken: VecDeque::new() }
     }
 }
 
-/// Answer each ask with the next of `items`, until there are none or the
-/// reader has left.
-pub async fn feed<T>(mut asks: Asks, items: impl Stream<Item = T>, write: impl Fn(T) -> Result<Raw, Failure>) {
-    let mut items = std::pin::pin!(items);
-    while let Some(mut ask) = asks.next().await {
-        let next = match future::select(caught(items.next()), ask.cancellation()).await {
-            Either::Left((next, _)) => next,
-            Either::Right(_) => return,
-        };
-        let last = !matches!(next, Ok(Some(_)));
-        let _ = ask.send(match next {
-            Ok(Some(item)) => Some(write(item)),
-            Ok(None) => None,
-            Err(f) => Some(Err(f)),
-        });
-        if last {
-            return;
-        }
+/// Ends a stream when its job does: with the job's panic if it had one,
+/// with "stopped" if the job is dropped unfinished (its thread ending).
+struct Ending(Arc<Mutex<Hop>>);
+
+impl Ending {
+    fn end(self, panic: Option<Failure>) {
+        Hop::end(&self.0, panic);
     }
+}
+
+impl Drop for Ending {
+    fn drop(&mut self) {
+        Hop::end(&self.0, Some(stopped()));
+    }
+}
+
+/// Make the items of `items` as far as the credit given allows, and hand
+/// them across as they are made, until there are none or the server's side
+/// has left. Steps aside every [`RUN`] items, so that other calls run.
+pub async fn feed<T>(asks: Asks, items: impl Stream<Item = T>, write: impl Fn(T) -> Result<Raw, Failure>) {
+    let hop = asks.0;
+    let mut items = std::pin::pin!(items);
+    let mut credit = 0u32;
+    future::poll_fn(move |cx| {
+        let mut made = 0;
+        loop {
+            if credit == 0 || made == 0 {
+                let mut h = lock(&hop);
+                if h.left {
+                    return Poll::Ready(());
+                }
+                credit += std::mem::take(&mut h.granted);
+                if credit == 0 {
+                    h.feeder = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+            }
+            if made == RUN {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let next = match std::panic::catch_unwind(AssertUnwindSafe(|| items.as_mut().poll_next(cx))) {
+                Ok(Poll::Pending) => {
+                    // A cancel must reach the method while it waits.
+                    let mut h = lock(&hop);
+                    if h.left {
+                        return Poll::Ready(());
+                    }
+                    h.feeder = Some(cx.waker().clone());
+                    return Poll::Pending;
+                }
+                Ok(Poll::Ready(next)) => next,
+                Err(panic) => {
+                    Hop::end(&hop, Some(panicked(panic)));
+                    return Poll::Ready(());
+                }
+            };
+            let Some(item) = next else {
+                Hop::end(&hop, None);
+                return Poll::Ready(());
+            };
+            let item = match std::panic::catch_unwind(AssertUnwindSafe(|| write(item))) {
+                Ok(item) => item,
+                Err(panic) => Err(panicked(panic)),
+            };
+            if item.is_err() {
+                Hop::end(&hop, item.err());
+                return Poll::Ready(());
+            }
+            credit -= 1;
+            made += 1;
+            let reader = {
+                let mut h = lock(&hop);
+                if h.left {
+                    return Poll::Ready(());
+                }
+                h.items.push_back(item);
+                h.reader.take()
+            };
+            if let Some(w) = reader {
+                w.wake();
+            }
+        }
+    })
+    .await
 }
 
 fn caught<T>(made: impl Future<Output = T>) -> impl Future<Output = Result<T, Failure>> {
-    AssertUnwindSafe(made).catch_unwind().map(|r| {
-        r.map_err(|panic| {
-            let message = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
-            failure("internal", &message)
-        })
-    })
+    AssertUnwindSafe(made).catch_unwind().map(|r| r.map_err(panicked))
+}
+
+fn panicked(panic: Box<dyn std::any::Any + Send>) -> Failure {
+    let message = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
+    failure("internal", &message)
 }
 
 fn stopped() -> Failure {

@@ -19,11 +19,33 @@ use crate::{Activation, Place, lock};
 
 type One = Arc<dyn Fn(Raw) -> BoxFuture<'static, Result<Raw, Failure>> + Send + Sync>;
 type Many = Arc<dyn Fn(Raw) -> BoxStream<'static, Result<Raw, Failure>> + Send + Sync>;
+pub(crate) type Pacing = Arc<dyn Fn(Raw) -> Box<dyn Paced> + Send + Sync>;
+
+/// A stream that makes its items ahead of the server, as far as the credit
+/// it is granted: a call passed on, or an activation's stream on its thread.
+pub(crate) trait Paced: futures::Stream<Item = Result<Raw, Failure>> + Send + Unpin {
+    /// Say it may make `n` more items.
+    fn grant(&self, n: u32);
+}
+
+impl Paced for Box<dyn Paced> {
+    fn grant(&self, n: u32) {
+        (**self).grant(n)
+    }
+}
+
+impl Paced for crate::Passed {
+    fn grant(&self, n: u32) {
+        crate::Passed::grant(self, n)
+    }
+}
 
 #[derive(Clone)]
 enum Handler {
     One(One),
     Many(Many),
+    /// Paced by the credit granted to it: an activation's stream.
+    Paced(Pacing),
     /// A call under a child held across a channel: the child, and the
     /// method's name below it.
     Pass(Arc<dyn Activation>, String),
@@ -74,6 +96,10 @@ impl Server {
         S: futures::Stream<Item = Result<Raw, Failure>> + Send + 'static,
     {
         self.methods.insert(name.to_owned(), Handler::Many(Arc::new(move |p| run(p).boxed())));
+    }
+
+    pub(crate) fn paced(&mut self, name: &str, run: Pacing) {
+        self.methods.insert(name.to_owned(), Handler::Paced(run));
     }
 
     /// Say what is served at `at`: `<at>._ir` answers `ir` and `<at>._hash`
@@ -268,28 +294,39 @@ async fn run(
         }
         Some(Handler::Pass(child, rest)) => {
             // The open carried credit for one item; the open passed on
-            // carries it on, and every credit after it is passed on as it
-            // arrives. Nothing is held here beyond what the caller allowed.
+            // carries it on.
             take(&credit).await;
-            let mut passed = child.pass(&rest, given);
-            loop {
-                let next = match future::select(more(&credit), passed.next()).await {
-                    Either::Left((n, _)) => Err(n),
-                    Either::Right((item, _)) => Ok(item),
-                };
-                match next {
-                    Err(n) => passed.grant(n),
-                    Ok(Some(Ok(item))) => send(Kind::Item, item.get().as_bytes()),
-                    Ok(Some(Err(f))) => break Err(f),
-                    Ok(None) => break Ok(()),
-                }
-            }
+            paced(&credit, child.pass(&rest, given), send).await
         }
+        Some(Handler::Paced(f)) => paced(&credit, f(params), send).await,
     };
     lock(&calls).remove(&id);
     match ended {
         Ok(()) => send(Kind::End, b""),
         Err(f) => send(Kind::End, serde_json::to_string(&f).expect("a Failure is JSON").as_bytes()),
+    }
+}
+
+/// Every credit is passed on to `items` as it arrives, and its items are
+/// written as they come: nothing is made beyond what the caller allowed.
+async fn paced(credit: &Credit, mut items: impl Paced, send: impl Fn(Kind, &[u8])) -> Result<(), Failure> {
+    let mut run = 0;
+    loop {
+        run += 1;
+        if run == RUN {
+            run = 0;
+            crate::yield_now().await;
+        }
+        let next = match future::select(more(credit), items.next()).await {
+            Either::Left((n, _)) => Err(n),
+            Either::Right((item, _)) => Ok(item),
+        };
+        match next {
+            Err(n) => items.grant(n),
+            Ok(Some(Ok(item))) => send(Kind::Item, item.get().as_bytes()),
+            Ok(Some(Err(f))) => break Err(f),
+            Ok(None) => break Ok(()),
+        }
     }
 }
 

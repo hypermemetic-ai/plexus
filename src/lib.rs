@@ -145,7 +145,7 @@ pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
 #[doc(hidden)]
 #[cfg(not(target_arch = "wasm32"))]
 pub mod __private {
-    pub use crate::served::{B64, Later, Local, feed, failed, params};
+    pub use crate::served::{B64, Later, Local, feed, failed, params, stream};
     pub use futures;
     pub use plexus_proto::bytes;
     pub use serde;
