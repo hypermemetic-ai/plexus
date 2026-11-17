@@ -141,3 +141,75 @@ async fn a_socket_closing_mid_frame() {
     assert_eq!(failed.kind(), std::io::ErrorKind::BrokenPipe);
     assert!(channel.receive.next().await.is_none());
 }
+
+/// A peer that breaks RFC 6455 is refused: the reading fails, after the
+/// messages before it are handed on, and the close sent says why.
+#[tokio::test]
+async fn a_peer_breaking_the_protocol_is_closed_with_the_reason() {
+    use futures::StreamExt;
+    let ping = |len: usize| [&[0x89, len as u8][..], &vec![b'p'; len]].concat();
+    let close = |payload: &[u8]| [&[0x88, payload.len() as u8][..], payload].concat();
+    let cases: [(&str, Vec<u8>, u16); 17] = [
+        ("text not UTF-8", vec![0x81, 2, 0xc3, 0x28], 1007),
+        // Refused at the fragment that breaks it, before the message ends.
+        ("a fragment not UTF-8", vec![0x01, 1, b'a', 0x00, 2, 0xed, 0xa0], 1007),
+        ("a message ending inside a character", vec![0x01, 1, b'a', 0x80, 1, 0xc3], 1007),
+        ("a ping longer than 125 bytes", [&[0x89, 126, 0, 126][..], &[b'p'; 126]].concat(), 1002),
+        ("a ping in fragments", [vec![0x09, 1, b'p'], vec![0x80, 1, b'p']].concat(), 1002),
+        ("a continuation with nothing begun", vec![0x80, 1, b'a'], 1002),
+        ("a message begun inside another", vec![0x01, 1, b'a', 0x81, 1, b'b'], 1002),
+        ("a reserved data opcode", vec![0x83, 0], 1002),
+        ("a reserved control opcode", vec![0x8b, 0], 1002),
+        ("a reserved bit", vec![0xc1, 1, b'a'], 1002),
+        ("a server's frame masked", vec![0x81, 0x81, 0, 0, 0, 0, b'a'], 1002),
+        ("a close of one byte", close(&[0x03]), 1002),
+        ("a close longer than 125 bytes", [&[0x88, 126, 0, 126, 0x03, 0xe8][..], &[b'x'; 124]].concat(), 1002),
+        ("a pong longer than 125 bytes", [&[0x8a, 126, 0, 126][..], &[b'x'; 126]].concat(), 1002),
+        ("a close code no one may send", close(&1005u16.to_be_bytes()), 1002),
+        ("a close reason not UTF-8", close(&[0x03, 0xe8, 0xff]), 1007),
+        ("a frame larger than 16 MiB", vec![0x81, 127, 0, 0, 0, 0, 1, 0, 0, 1], 1009),
+    ];
+    for (name, frames, code) in cases {
+        let (tell, told) = std::sync::mpsc::channel();
+        let ping = ping(3);
+        let url = raw_server(move |mut stream, head| {
+            use std::io::{Read, Write};
+            stream.write_all(&[head, text("[1,0]"), ping, frames].concat()).unwrap();
+            // The pong, then the close: masked, its payload the code.
+            let mut pong = [0; 9];
+            stream.read_exact(&mut pong).unwrap();
+            let mut close = [0; 8];
+            stream.read_exact(&mut close).unwrap();
+            let code = u16::from_be_bytes([close[6] ^ close[2], close[7] ^ close[3]]);
+            tell.send((close[0], code)).unwrap();
+        });
+        let mut channel = plexus::ws::connect(&url).await.unwrap();
+        assert_eq!(channel.receive.next().await.unwrap().unwrap(), &b"[1,0]"[..], "{name}");
+        let failed = channel.receive.next().await.unwrap().unwrap_err();
+        assert_eq!(failed.kind(), std::io::ErrorKind::InvalidData, "{name}: {failed}");
+        let sent = tokio::task::spawn_blocking(move || told.recv().unwrap()).await.unwrap();
+        assert_eq!(sent, (0x88, code), "{name}");
+        // Nothing is sent after the close.
+        use futures::SinkExt;
+        assert!(channel.send.send(plexus::bytes::Bytes::from_static(b"[1,1]")).await.is_err(), "{name}");
+    }
+}
+
+/// A close is answered with its code, after the messages before it are
+/// handed on, and the reading ends with no error.
+#[tokio::test]
+async fn a_close_is_answered_with_its_code() {
+    use futures::StreamExt;
+    let (tell, told) = std::sync::mpsc::channel();
+    let url = raw_server(move |mut stream, head| {
+        use std::io::{Read, Write};
+        stream.write_all(&[head, text("[1,0]"), vec![0x88, 4, 0x0b, 0xb8, b'o', b'k']].concat()).unwrap();
+        let mut close = [0; 8];
+        stream.read_exact(&mut close).unwrap();
+        tell.send(u16::from_be_bytes([close[6] ^ close[2], close[7] ^ close[3]])).unwrap();
+    });
+    let mut channel = plexus::ws::connect(&url).await.unwrap();
+    assert_eq!(channel.receive.next().await.unwrap().unwrap(), &b"[1,0]"[..]);
+    assert!(channel.receive.next().await.is_none());
+    assert_eq!(tokio::task::spawn_blocking(move || told.recv().unwrap()).await.unwrap(), 3000);
+}

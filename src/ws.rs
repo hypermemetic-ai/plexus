@@ -4,9 +4,10 @@
 //! tungstenite makes the handshake and masks what a caller writes. Reading,
 //! and a server's writing, are this module's own (RFC 6455, 5): a reader
 //! takes every frame waiting in one turn, under one lock, each a slice of
-//! the bytes it was read into, with no copy and no check of its UTF-8 (the
-//! frame's reader checks that, once); a server writes every frame of a
-//! flush into one buffer, which one write puts on the socket.
+//! the bytes it was read into, with no copy; a server writes every frame of
+//! a flush into one buffer, which one write puts on the socket. A peer that
+//! breaks the protocol is closed with the reason's code. The Autobahn test
+//! suite runs against `examples/autobahn.rs`; `fuzz/` fuzzes the reader.
 
 use std::collections::VecDeque;
 use std::io::{self, Cursor, Read, Write};
@@ -90,6 +91,14 @@ pub async fn spawn(addr: SocketAddr, server: Arc<Server>) -> io::Result<SocketAd
     let bound = listener.local_addr()?;
     tokio::spawn(listen(listener, server));
     Ok(bound)
+}
+
+/// A channel over `stream` as if its handshake were done: for the fuzzer,
+/// which feeds the reader bytes with no socket.
+#[doc(hidden)]
+pub fn handshaken<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream: S, server: bool) -> Channel {
+    let role = if server { tungstenite::protocol::Role::Server } else { tungstenite::protocol::Role::Client };
+    channel(WebSocket::from_raw_socket(Io::new(stream, Arc::new(Wakers::default())), role, Some(config())), server)
 }
 
 /// Run a handshake begun by `started` to its end, waiting whenever the
@@ -216,9 +225,11 @@ const MOST_FRAME: usize = 16 << 20;
 const MOST_MESSAGE: usize = 64 << 20;
 /// How much a read asks the socket for.
 const READ: usize = 64 << 10;
-/// How many messages a reader takes in one turn at most: the socket is
-/// not read further ahead than that of what has been handed on.
+/// How many messages, and how many bytes of them, a reader takes in one
+/// turn at most: the socket is not read further ahead than that of what
+/// has been handed on.
 const TURN: usize = 256;
+const TURN_BYTES: usize = 1 << 20;
 
 /// One socket, both halves'.
 struct Socket<S> {
@@ -274,7 +285,7 @@ fn channel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut ws: WebSocket
     let (read, wakers) = (ws.get_mut().handshaken(), ws.get_ref().wakers.clone());
     let socket = Arc::new(Mutex::new(Socket { ws, server, closed: false }));
     let send = Writer { socket: socket.clone(), wakers: wakers.clone(), held: Vec::new(), closing: false };
-    Channel::new(send, Reader { socket, wakers, server, buf: read, fragments: None, read: VecDeque::new(), failed: None, ended: false })
+    Channel::new(send, Reader { socket, wakers, server, buf: read, fragments: None, read: VecDeque::new(), held: 0, failed: None, close: None, ended: false })
 }
 
 /// The reading half: every frame waiting is read in one turn, under one
@@ -285,11 +296,14 @@ struct Reader<S> {
     server: bool,
     /// Bytes read and not yet taken.
     buf: BytesMut,
-    /// The fragments of a message so far.
-    fragments: Option<BytesMut>,
+    fragments: Option<Fragments>,
     read: VecDeque<Bytes>,
+    /// The bytes of the messages in `read`.
+    held: usize,
     /// What ended the reading, once the frames read before it are handed on.
     failed: Option<io::Error>,
+    /// The close to send then, if one is.
+    close: Option<Bytes>,
     ended: bool,
 }
 
@@ -303,30 +317,55 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Stream for Reader<S> {
             let socket = this.socket.clone();
             let mut socket = lock(&socket);
             if let Err(e) = this.turn(&mut socket) {
+                // A peer that broke the protocol is told why, with the
+                // close's code (RFC 6455, 7.1.7).
+                if let Some(&Refused(code, _)) = e.get_ref().and_then(|e| e.downcast_ref()) {
+                    this.close = Some(Bytes::copy_from_slice(&code.to_be_bytes()));
+                }
                 (this.ended, this.failed) = (true, Some(e));
             }
-            // An answer to a ping or a close goes now if the socket takes
-            // it, else with the next flush or turn.
-            if !socket.io().out.is_empty()
-                && let Poll::Ready(Err(e)) = socket.poll_flush()
-                && this.failed.is_none()
-            {
-                (this.ended, this.failed) = (true, Some(e));
-            }
+            this.flush(&mut socket);
         }
         match this.read.pop_front() {
-            Some(frame) => Poll::Ready(Some(Ok(frame))),
-            None if this.ended => Poll::Ready(this.failed.take().map(Err)),
+            Some(frame) => {
+                this.held -= frame.len();
+                Poll::Ready(Some(Ok(frame)))
+            }
+            None if this.ended => {
+                // The close goes once every message before it is handed on,
+                // so that what is sent back to those may still go.
+                if let Some(close) = this.close.take() {
+                    let socket = this.socket.clone();
+                    let mut socket = lock(&socket);
+                    if !socket.closed {
+                        socket.closed = true;
+                        let _ = socket.queue(OpCode::Control(Control::Close), close);
+                    }
+                    this.flush(&mut socket);
+                }
+                Poll::Ready(this.failed.take().map(Err))
+            }
             None => Poll::Pending,
         }
     }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Reader<S> {
+    /// An answer to a ping or a close goes now if the socket takes it, else
+    /// with the next flush or turn.
+    fn flush(&mut self, socket: &mut Socket<S>) {
+        if !socket.io().out.is_empty()
+            && let Poll::Ready(Err(e)) = socket.poll_flush()
+            && self.failed.is_none()
+        {
+            (self.ended, self.failed) = (true, Some(e));
+        }
+    }
+
     /// Take the frames read, reading more while the socket has some, until
     /// a turn's worth are taken or the reading ends.
     fn turn(&mut self, socket: &mut Socket<S>) -> io::Result<()> {
-        while self.read.len() < TURN && !self.ended {
+        while self.read.len() < TURN && self.held < TURN_BYTES && !self.ended {
             if !self.frame(socket)? && !self.fill(socket)? {
                 break;
             }
@@ -356,19 +395,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Reader<S> {
     /// Take one frame from what was read: `false` if it is not all there.
     fn frame(&mut self, socket: &mut Socket<S>) -> io::Result<bool> {
         let mut cursor = Cursor::new(&self.buf[..]);
-        let Some((header, len)) = FrameHeader::parse(&mut cursor).map_err(broken)? else { return Ok(false) };
+        // tungstenite refuses only an opcode of no known kind.
+        let Some((header, len)) = FrameHeader::parse(&mut cursor).map_err(|_| refused(PROTOCOL, "a frame of no known kind"))? else { return Ok(false) };
         let at = cursor.position() as usize;
-        let len = usize::try_from(len).ok().filter(|&len| len <= MOST_FRAME).ok_or_else(|| refused("a frame larger than 16 MiB"))?;
-        if self.buf.len() < at + len {
-            self.buf.reserve(at + len - self.buf.len());
-            return Ok(false);
-        }
+        // The header is checked before its payload is waited for.
         if header.rsv1 || header.rsv2 || header.rsv3 {
-            return Err(refused("a frame with a reserved bit set"));
+            return Err(refused(PROTOCOL, "a frame with a reserved bit set"));
         }
         // A caller masks every frame it sends, a server none (RFC 6455, 5.1).
         if header.mask.is_some() != self.server {
-            return Err(refused(if self.server { "a caller's frame not masked" } else { "a server's frame masked" }));
+            return Err(refused(PROTOCOL, if self.server { "a caller's frame not masked" } else { "a server's frame masked" }));
+        }
+        if matches!(header.opcode, OpCode::Control(_)) && (!header.is_final || len > 125) {
+            return Err(refused(PROTOCOL, "a control frame fragmented or longer than 125 bytes"));
+        }
+        let len = usize::try_from(len).ok().filter(|&len| len <= MOST_FRAME).ok_or_else(|| refused(TOO_BIG, "a frame larger than 16 MiB"))?;
+        if self.buf.len() < at + len {
+            self.buf.reserve(at + len - self.buf.len());
+            return Ok(false);
         }
         self.buf.advance(at);
         let mut payload = self.buf.split_to(len);
@@ -378,18 +422,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Reader<S> {
         let payload = payload.freeze();
         match header.opcode {
             OpCode::Data(data) => self.data(data, header.is_final, payload)?,
-            OpCode::Control(_) if !header.is_final || len > 125 => return Err(refused("a control frame fragmented or longer than 125 bytes")),
             OpCode::Control(Control::Ping) if !socket.closed => socket.queue(OpCode::Control(Control::Pong), payload)?,
             OpCode::Control(Control::Ping | Control::Pong) => {}
             OpCode::Control(Control::Close) => {
-                // Answered with its code, once; what came before it is read.
-                if !socket.closed {
-                    socket.closed = true;
-                    socket.queue(OpCode::Control(Control::Close), payload.slice(..len.min(2)))?;
-                }
+                close(&payload)?;
+                // Answered with its code; what came before it is read.
+                self.close = Some(payload.slice(..len.min(2)));
                 self.ended = true;
             }
-            OpCode::Control(Control::Reserved(_)) => return Err(refused("a control frame of no known kind")),
+            OpCode::Control(Control::Reserved(_)) => return Err(refused(PROTOCOL, "a control frame of no known kind")),
         }
         Ok(true)
     }
@@ -397,23 +438,73 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Reader<S> {
     /// A data frame: a whole message, or a fragment of one.
     fn data(&mut self, data: Data, last: bool, payload: Bytes) -> io::Result<()> {
         match (data, &mut self.fragments) {
-            (Data::Text | Data::Binary, None) if last => self.read.push_back(payload),
-            (Data::Text | Data::Binary, None) => self.fragments = Some(BytesMut::from(&payload[..])),
-            (Data::Continue, Some(fragments)) => {
-                if fragments.len() + payload.len() > MOST_MESSAGE {
-                    return Err(refused("a message larger than 64 MiB"));
+            (Data::Text | Data::Binary, None) => {
+                let (text, mut checked) = (data == Data::Text, 0);
+                if text {
+                    utf8(&payload, &mut checked, last)?;
                 }
-                fragments.extend_from_slice(&payload);
                 if last {
-                    let message = self.fragments.take().expect("fragments").freeze();
-                    self.read.push_back(message);
+                    self.hand_on(payload);
+                } else {
+                    self.fragments = Some(Fragments { bytes: BytesMut::from(&payload[..]), text, checked });
                 }
             }
-            (Data::Reserved(_), _) => return Err(refused("a data frame of no known kind")),
-            _ => return Err(refused("a fragment out of place")),
+            (Data::Continue, Some(fragments)) => {
+                if fragments.bytes.len() + payload.len() > MOST_MESSAGE {
+                    return Err(refused(TOO_BIG, "a message larger than 64 MiB"));
+                }
+                fragments.bytes.extend_from_slice(&payload);
+                if fragments.text {
+                    utf8(&fragments.bytes, &mut fragments.checked, last)?;
+                }
+                if last {
+                    let message = self.fragments.take().expect("fragments").bytes.freeze();
+                    self.hand_on(message);
+                }
+            }
+            (Data::Reserved(_), _) => return Err(refused(PROTOCOL, "a data frame of no known kind")),
+            _ => return Err(refused(PROTOCOL, "a fragment out of place")),
         }
         Ok(())
     }
+
+    fn hand_on(&mut self, message: Bytes) {
+        self.held += message.len();
+        self.read.push_back(message);
+    }
+}
+
+/// The fragments of a message so far.
+struct Fragments {
+    bytes: BytesMut,
+    text: bool,
+    /// How much of `bytes` is known to be UTF-8.
+    checked: usize,
+}
+
+/// A text message is UTF-8: what is past `checked` of it is checked as its
+/// fragments come, so that one broken is refused at once (RFC 6455, 8.1).
+/// Only the last fragment may not end a character.
+fn utf8(text: &[u8], checked: &mut usize, last: bool) -> io::Result<()> {
+    match std::str::from_utf8(&text[*checked..]) {
+        Ok(_) => *checked = text.len(),
+        Err(e) if e.error_len().is_none() && !last => *checked += e.valid_up_to(),
+        Err(_) => return Err(refused(NOT_UTF8, "text that is not UTF-8")),
+    }
+    Ok(())
+}
+
+/// A close frame's payload: none, or a code an endpoint may send and a
+/// reason in UTF-8 (RFC 6455, 5.5.1 and 7.4).
+fn close(payload: &[u8]) -> io::Result<()> {
+    let [a, b, reason @ ..] = payload else {
+        return if payload.is_empty() { Ok(()) } else { Err(refused(PROTOCOL, "a close frame of one byte")) };
+    };
+    if !matches!(u16::from_be_bytes([*a, *b]), 1000..=1003 | 1007..=1014 | 3000..=4999) {
+        return Err(refused(PROTOCOL, "a close code no endpoint may send"));
+    }
+    std::str::from_utf8(reason).map_err(|_| refused(NOT_UTF8, "a close reason that is not UTF-8"))?;
+    Ok(())
 }
 
 /// A frame from a caller, as it was before its mask (RFC 6455, 5.3).
@@ -429,8 +520,26 @@ fn unmask(payload: &mut [u8], mask: [u8; 4]) {
     }
 }
 
-fn refused(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("WebSocket: {what}"))
+/// The close codes a refusal sends (RFC 6455, 7.4.1).
+const PROTOCOL: u16 = 1002;
+const NOT_UTF8: u16 = 1007;
+const TOO_BIG: u16 = 1009;
+
+/// What the peer sent that breaks the protocol, and the close code it is
+/// answered with.
+#[derive(Debug)]
+struct Refused(u16, &'static str);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "WebSocket: {}", self.1)
+    }
+}
+
+impl std::error::Error for Refused {}
+
+fn refused(code: u16, what: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, Refused(code, what))
 }
 
 /// The writing half: frames are held until a flush, then queued in one
