@@ -3,11 +3,13 @@
 use std::collections::HashMap;
 use std::io;
 use std::panic::AssertUnwindSafe;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Poll, Waker};
+use std::task::{Context, Poll};
 
 use futures::channel::mpsc;
 use futures::future::{self, AbortHandle, Abortable, BoxFuture, Either, FutureExt};
+use futures::task::AtomicWaker;
 use futures::stream::{BoxStream, FuturesUnordered, StreamExt};
 use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Open, Raw};
 use serde::Serialize;
@@ -134,7 +136,7 @@ impl Server {
                 let id = frame.call.0;
                 match frame.body {
                     Body::Open(open) => {
-                        let credit = Arc::new(Mutex::new(Credit { left: 1, wake: None }));
+                        let credit = Arc::new(Credit { left: AtomicU32::new(1), wake: AtomicWaker::new() });
                         let (abort, registration) = AbortHandle::new_pair();
                         lock(&calls).insert(id, Running { credit: credit.clone(), abort });
                         let ran = run(server.clone(), id, open, out.clone(), credit, calls.clone());
@@ -142,11 +144,8 @@ impl Server {
                     }
                     Body::Credit(n) => {
                         if let Some(call) = lock(&calls).get(&id) {
-                            let mut credit = lock(&call.credit);
-                            credit.left = credit.left.saturating_add(n);
-                            if let Some(wake) = credit.wake.take() {
-                                wake.wake();
-                            }
+                            let _ = call.credit.left.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| Some(left.saturating_add(n)));
+                            call.credit.wake.wake();
                         }
                     }
                     // Dropped at once: the method's future and stream with it.
@@ -175,15 +174,36 @@ impl Server {
     }
 }
 
+/// How many items a stream writes before it steps aside.
+const RUN: u32 = 256;
+
 struct Running {
-    credit: Arc<Mutex<Credit>>,
+    credit: Arc<Credit>,
     abort: AbortHandle,
 }
 
 /// How many items a stream may still write, and who waits to write one.
+/// Atomic, so an item takes its credit with no lock.
 struct Credit {
-    left: u32,
-    wake: Option<Waker>,
+    left: AtomicU32,
+    wake: AtomicWaker,
+}
+
+impl Credit {
+    /// Up to `most` of the credit there is, or `Pending` with the waker kept
+    /// if there is none.
+    fn poll_take(&self, cx: &mut Context<'_>, most: u32) -> Poll<u32> {
+        let take = || self.left.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| (left > 0).then(|| left - left.min(most)));
+        if let Ok(left) = take() {
+            return Poll::Ready(left.min(most));
+        }
+        self.wake.register(cx.waker());
+        // Granted between the first look and the waker kept.
+        match take() {
+            Ok(left) => Poll::Ready(left.min(most)),
+            Err(_) => Poll::Pending,
+        }
+    }
 }
 
 /// Run every call handed in, together, until no more can be.
@@ -205,7 +225,7 @@ async fn run(
     id: u32,
     open: Open,
     out: mpsc::UnboundedSender<Vec<u8>>,
-    credit: Arc<Mutex<Credit>>,
+    credit: Arc<Credit>,
     calls: Arc<Mutex<HashMap<u32, Running>>>,
 ) {
     let call = CallId(id);
@@ -227,7 +247,15 @@ async fn run(
         },
         Some(Handler::Many(f)) => {
             let mut items = f(params);
+            let mut run = 0;
             loop {
+                // Step aside now and then, so what is made is written as it
+                // is made, not a window's worth at a time.
+                run += 1;
+                if run == RUN {
+                    run = 0;
+                    crate::yield_now().await;
+                }
                 // Wait for credit before asking for the next item, so the
                 // method runs no further ahead than the caller allowed.
                 take(&credit).await;
@@ -266,28 +294,13 @@ async fn run(
 }
 
 /// Take one item's credit, waiting for it if there is none.
-fn take(credit: &Mutex<Credit>) -> impl Future<Output = ()> + '_ {
-    futures::future::poll_fn(move |cx| {
-        let mut credit = lock(credit);
-        if credit.left > 0 {
-            credit.left -= 1;
-            return Poll::Ready(());
-        }
-        credit.wake = Some(cx.waker().clone());
-        Poll::Pending
-    })
+fn take(credit: &Credit) -> impl Future<Output = ()> + '_ {
+    futures::future::poll_fn(move |cx| credit.poll_take(cx, 1).map(|_| ()))
 }
 
 /// All the credit there is, waiting for some if there is none.
-fn more(credit: &Mutex<Credit>) -> impl Future<Output = u32> + Unpin + '_ {
-    futures::future::poll_fn(move |cx| {
-        let mut credit = lock(credit);
-        if credit.left > 0 {
-            return Poll::Ready(std::mem::take(&mut credit.left));
-        }
-        credit.wake = Some(cx.waker().clone());
-        Poll::Pending
-    })
+fn more(credit: &Credit) -> impl Future<Output = u32> + Unpin + '_ {
+    futures::future::poll_fn(move |cx| credit.poll_take(cx, u32::MAX))
 }
 
 /// `_tree`: every place, each child's asked of it now. A child that cannot

@@ -2,6 +2,7 @@
 
 use std::io;
 use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use futures::channel::mpsc;
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -23,7 +24,8 @@ impl Channel {
     }
 }
 
-/// Two ends of a channel in one process. What one sends the other receives.
+/// Two ends of a channel in one process. What one sends the other receives,
+/// once it is flushed (`send` flushes).
 pub fn pair() -> (Channel, Channel) {
     let (a_send, b_receive) = mpsc::unbounded();
     let (b_send, a_receive) = mpsc::unbounded();
@@ -46,7 +48,41 @@ pub(crate) async fn pump(
     send.close().await
 }
 
-fn end(send: mpsc::UnboundedSender<Vec<u8>>, receive: mpsc::UnboundedReceiver<Vec<u8>>) -> Channel {
-    let send = send.sink_map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe));
-    Channel::new(send, receive.map(Ok))
+fn end(send: mpsc::UnboundedSender<Vec<Vec<u8>>>, receive: mpsc::UnboundedReceiver<Vec<Vec<u8>>>) -> Channel {
+    let send = Held { send, held: Vec::new() };
+    Channel::new(send, receive.flat_map(futures::stream::iter).map(Ok))
+}
+
+/// A pair's sending end: frames are held until a flush and go over
+/// together, so the other end is woken once a flush, not once a frame.
+struct Held {
+    send: mpsc::UnboundedSender<Vec<Vec<u8>>>,
+    held: Vec<Vec<u8>>,
+}
+
+impl Sink<Vec<u8>> for Held {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, frame: Vec<u8>) -> io::Result<()> {
+        self.held.push(frame);
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.held.is_empty() {
+            let held = std::mem::take(&mut self.held);
+            self.send.unbounded_send(held).map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let flushed = self.as_mut().poll_flush(cx);
+        self.send.close_channel();
+        flushed
+    }
 }

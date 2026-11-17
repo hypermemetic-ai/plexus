@@ -71,6 +71,101 @@ async fn the_caller_grants_credit_and_cancels() {
     assert_eq!(read(&mut far).await, "[2,5,null]");
 }
 
+/// streams › on the wire: the server writes exactly as many items as it
+/// was given credit for, the open's one first, then each grant's.
+#[tokio::test]
+async fn the_server_writes_no_further_than_its_credit() {
+    let mut server = Server::new();
+    server.stream("kiln.count", |_| futures::stream::iter(0..u32::MAX).map(|n| raw(&n)));
+    let (mut near, far) = pair();
+    tokio::spawn(Arc::new(server).serve(far));
+    near.send.send(br#"[1,1,["kiln.count"]]"#.to_vec()).await.unwrap();
+    assert_eq!(read(&mut near).await, "[1,0]");
+    let quiet = async |near: &mut Channel| tokio::time::timeout(Duration::from_millis(50), near.receive.next()).await.is_err();
+    assert!(quiet(&mut near).await, "an item past the open's credit");
+    for grant in [1u32, 3, 2] {
+        near.send.send(format!("[1,6,{grant}]").into_bytes()).await.unwrap();
+        for _ in 0..grant {
+            read(&mut near).await;
+        }
+        assert!(quiet(&mut near).await, "an item past a grant of {grant}");
+    }
+    near.send.send(b"[1,6,2]".to_vec()).await.unwrap();
+    near.send.send(b"[1,6,2]".to_vec()).await.unwrap();
+    for n in 7..11 {
+        assert_eq!(read(&mut near).await, format!("[1,{n}]"));
+    }
+    assert!(quiet(&mut near).await, "an item past two grants at once");
+}
+
+/// A stream's items are written as they are made, a run at a time, not a
+/// window's worth at once (one thread, the reader a task beside the
+/// server's, so the count is what was made before it could read).
+#[tokio::test(flavor = "current_thread")]
+async fn a_stream_is_written_as_it_is_made() {
+    tokio::spawn(written_as_made()).await.unwrap();
+}
+
+async fn written_as_made() {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    let made = Arc::new(AtomicU32::new(0));
+    let mut server = Server::new();
+    let counted = made.clone();
+    server.stream("kiln.count", move |_| {
+        let counted = counted.clone();
+        futures::stream::iter(0..u32::MAX).map(move |n| {
+            counted.fetch_add(1, Relaxed);
+            raw(&n)
+        })
+    });
+    let (mut near, far) = pair();
+    tokio::spawn(Arc::new(server).serve(far));
+    near.send.send(br#"[1,1,["kiln.count"]]"#.to_vec()).await.unwrap();
+    near.send.send(format!("[1,6,{}]", WINDOW - 1).into_bytes()).await.unwrap();
+    assert_eq!(read(&mut near).await, "[1,0]");
+    let made = made.load(Relaxed);
+    assert!(made < WINDOW, "{made} items were made before the first was written");
+}
+
+/// A pair holds what is fed until it is flushed, then gives it all, in order.
+#[tokio::test]
+async fn a_pair_gives_what_was_fed_at_the_flush() {
+    let (mut near, mut far) = pair();
+    for n in 0..3 {
+        near.send.feed(format!("[{n}]").into_bytes()).await.unwrap();
+    }
+    assert!(tokio::time::timeout(Duration::from_millis(20), far.receive.next()).await.is_err(), "a frame before the flush");
+    near.send.flush().await.unwrap();
+    for n in 0..3 {
+        assert_eq!(read(&mut far).await, format!("[{n}]"));
+    }
+}
+
+/// What arrives for a call dropped before its end goes nowhere, and the
+/// connection's next call is answered as ever.
+#[tokio::test]
+async fn late_answers_to_a_dropped_call_go_nowhere() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    tokio::spawn(driving);
+    let mut items = conn.stream("kiln.heat", ()).unwrap();
+    assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
+    assert_eq!(read(&mut far).await, format!("[1,6,{}]", WINDOW - 1));
+    far.send.send(b"[1,0]".to_vec()).await.unwrap();
+    assert_eq!(items.next().await.unwrap().unwrap().get(), "0");
+    drop(items);
+    assert_eq!(read(&mut far).await, "[1,5,null]");
+    far.send.send(b"[1,1]".to_vec()).await.unwrap();
+    far.send.send(b"[1]".to_vec()).await.unwrap();
+    let call = conn.call("kiln.get", ());
+    let (got, ()) = futures::join!(call, async {
+        assert_eq!(read(&mut far).await, r#"[2,1,["kiln.get"]]"#);
+        far.send.send(b"[2,6]".to_vec()).await.unwrap();
+        far.send.send(b"[2]".to_vec()).await.unwrap();
+    });
+    assert_eq!(got.unwrap().get(), "6");
+}
+
 /// pace › `call` on a stream: the window granted once the first item is
 /// in, topped up as items arrive, the last item the answer.
 #[tokio::test]
@@ -200,6 +295,47 @@ async fn a_method_that_panics_fails_its_call_alone() {
     let e = conn.call("kiln.crack", ()).await.unwrap_err();
     assert_eq!((e.code(), e.to_string().as_str()), (Some("internal"), "internal: the shelf cracked"));
     assert_eq!(conn.call("kiln.get", ()).await.unwrap().get(), "6");
+}
+
+/// The driver steps aside while frames keep coming: the reader's credit
+/// goes out though the far end never stops writing (one thread, so a
+/// driver that never stepped aside would hold it for good).
+#[tokio::test(flavor = "current_thread")]
+async fn credit_goes_out_while_frames_keep_coming() {
+    let (out, mut sent) = futures::channel::mpsc::unbounded::<Vec<u8>>();
+    let out = out.sink_map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+    let endless = futures::stream::repeat_with(|| Ok(b"[1,7]".to_vec()));
+    let (conn, driving) = Connection::new(Channel::new(out, endless), None);
+    let mut items = conn.stream("kiln.heat", ()).unwrap();
+    tokio::spawn(driving);
+    for _ in 0..TOP_UP {
+        assert_eq!(items.next().await.unwrap().unwrap().get(), "7");
+    }
+    let mut frames = Vec::new();
+    for _ in 0..3 {
+        frames.push(String::from_utf8(sent.next().await.unwrap()).unwrap());
+    }
+    assert_eq!(frames, [r#"[1,1,["kiln.heat"]]"#.to_owned(), format!("[1,6,{}]", WINDOW - 1), format!("[1,6,{TOP_UP}]")]);
+}
+
+/// Items in before the channel closed are read, in order, then the close.
+#[tokio::test]
+async fn items_in_before_a_close_are_read_then_closed() {
+    let (near, mut far) = pair();
+    let (conn, driving) = Connection::new(near, None);
+    let driving = tokio::spawn(driving);
+    let mut items = conn.stream("kiln.heat", ()).unwrap();
+    assert_eq!(read(&mut far).await, r#"[1,1,["kiln.heat"]]"#);
+    for n in 0..100 {
+        far.send.send(format!("[1,{n}]").into_bytes()).await.unwrap();
+    }
+    drop(far);
+    driving.await.unwrap().unwrap();
+    for n in 0..100 {
+        assert_eq!(items.next().await.unwrap().unwrap().get(), n.to_string());
+    }
+    assert!(matches!(items.next().await, Some(Err(Error::Closed))));
+    assert!(items.next().await.is_none());
 }
 
 #[tokio::test]

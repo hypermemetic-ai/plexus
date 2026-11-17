@@ -1,17 +1,17 @@
 //! The caller's end: opens calls, hands their answers back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use futures::channel::{mpsc, oneshot};
 use futures::future::{self, Either, FutureExt};
 use futures::{Stream, StreamExt};
-use plexus_proto::{Body, CallId, Failure, Frame, Numbering, Raw};
+use plexus_proto::{Body, CallId, Failure, Frame, Head, Kind, Numbering, Raw};
 use serde::Serialize;
 
 use crate::channel::{Channel, pump};
@@ -19,9 +19,9 @@ use crate::lock;
 
 /// How many items a stream's caller says it will take before it has taken
 /// any (the open carries one of them).
-pub const WINDOW: u32 = 256;
+pub const WINDOW: u32 = 4096;
 /// How many items it takes before saying so again.
-pub const TOP_UP: u32 = 128;
+pub const TOP_UP: u32 = 2048;
 
 /// Why a call gave no answer.
 #[derive(Debug)]
@@ -71,7 +71,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 enum Event {
-    Item(Raw),
+    /// An item as it came: the frame, and where its body is in it. The
+    /// driver only reads a frame's head; the reader makes the item, so
+    /// that work is not all on the driver.
+    Item(Vec<u8>, std::ops::Range<usize>),
     End(Result<(), Failure>),
 }
 
@@ -81,10 +84,63 @@ pub struct Connection {
     shared: Arc<Shared>,
 }
 
+/// What the driver is told of calls, in the order it happened: it keeps the
+/// map of inboxes itself, so an item finds its call with no lock.
+enum Told {
+    Opened(u32, Slot),
+    Gone(u32),
+}
+
+/// A call's inbox: what the driver has handed in and the reader has not
+/// yet taken. The reader takes all of it at once, so a run of items costs
+/// it one lock.
+#[derive(Default)]
+struct Inbox(Mutex<Queue>);
+
+#[derive(Default)]
+struct Queue {
+    events: VecDeque<Event>,
+    /// Nothing more will come: the call ended, or the channel closed.
+    closed: bool,
+    wake: Option<Waker>,
+}
+
+/// The driver's hold on an inbox, and the run of events it has read for
+/// the call and not yet handed in: handed in whole, so the reader is woken
+/// once a run, not once an item. Dropped — the call ended, was dropped, or
+/// the channel closed — it hands in what it holds and closes the inbox.
+struct Slot {
+    inbox: Arc<Inbox>,
+    run: Vec<Event>,
+}
+
+impl Slot {
+    fn new(inbox: Arc<Inbox>) -> Slot {
+        Slot { inbox, run: Vec::new() }
+    }
+
+    fn hand_in(&mut self, close: bool) {
+        let mut queue = lock(&self.inbox.0);
+        queue.events.extend(self.run.drain(..));
+        queue.closed |= close;
+        let wake = queue.wake.take();
+        drop(queue);
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.hand_in(true);
+    }
+}
+
 struct Shared {
     out: mpsc::UnboundedSender<Vec<u8>>,
-    /// Each open call's inbox; `None` once the channel has closed.
-    calls: Mutex<Option<HashMap<u32, mpsc::UnboundedSender<Event>>>>,
+    /// Closed once the channel has.
+    tell: mpsc::UnboundedSender<Told>,
     next: AtomicU32,
     expects: Option<String>,
     hello: future::Shared<oneshot::Receiver<String>>,
@@ -102,15 +158,16 @@ impl Connection {
     pub fn new(channel: Channel, expects: Option<&str>) -> (Connection, impl Future<Output = io::Result<()>> + Send + 'static) {
         let (out, frames) = mpsc::unbounded();
         let (said, hello) = oneshot::channel();
+        let (tell, told) = mpsc::unbounded();
         let shared = Arc::new(Shared {
             out,
-            calls: Mutex::new(Some(HashMap::new())),
+            tell,
             next: AtomicU32::new(1),
             expects: expects.map(str::to_owned),
             hello: hello.shared(),
         });
         let Channel { send, receive } = channel;
-        let drive = drive(receive, pump(send, frames), Arc::downgrade(&shared), said);
+        let drive = drive(receive, pump(send, frames), Arc::downgrade(&shared), told, said);
         (Connection { shared }, drive)
     }
 
@@ -136,19 +193,19 @@ impl Connection {
             loop {
                 let event = match waiting.take() {
                     Some(event) => event,
-                    None => call.inbox.next().await,
+                    None => future::poll_fn(|cx| call.poll_event(cx)).await,
                 };
                 match event {
-                    Some(Event::Item(raw)) => {
-                        got = Some(raw);
+                    Some(Event::Item(bytes, body)) => {
+                        got = Some(item(&bytes, body));
                         taken += 1;
                         if taken == 1 {
                             // The open was credit for one. Unless the end is
                             // here already, this may be a stream: grant the
                             // rest of the window, as `stream` does at open.
-                            match call.inbox.try_recv() {
-                                Ok(event) => waiting = Some(Some(event)),
-                                Err(_) => call.grant(WINDOW - 1),
+                            match call.try_event() {
+                                Some(event) => waiting = Some(Some(event)),
+                                None => call.grant(WINDOW - 1),
                             }
                         } else if taken.is_multiple_of(TOP_UP) {
                             call.grant(TOP_UP);
@@ -191,10 +248,11 @@ impl Connection {
     }
 
     fn open(&self, method: &str, params: Option<Raw>) -> Result<Open, Error> {
-        let (tx, inbox) = mpsc::unbounded();
+        let inbox = Arc::new(Inbox::default());
         let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
-        lock(&self.shared.calls).as_mut().ok_or(Error::Closed)?.insert(id, tx);
-        let call = Open { id, inbox, shared: self.shared.clone(), done: false };
+        // Told before the open is sent, so before any answer can arrive.
+        self.shared.tell.unbounded_send(Told::Opened(id, Slot::new(inbox.clone()))).map_err(|_| Error::Closed)?;
+        let call = Open { id, inbox, taken: VecDeque::new(), shared: self.shared.clone(), done: false };
         if !self.shared.send(Frame::open(CallId(id), method, params)) {
             return Err(Error::Closed);
         }
@@ -206,13 +264,27 @@ impl Shared {
     fn send(&self, frame: Frame) -> bool {
         self.out.unbounded_send(frame.encode(Numbering::Counted)).is_ok()
     }
+}
 
-    fn deliver(&self, call: CallId, event: Event) {
-        let mut calls = lock(&self.calls);
-        let Some(calls) = calls.as_mut() else { return };
-        let inbox = if matches!(event, Event::End(_)) { calls.remove(&call.0) } else { calls.get(&call.0).cloned() };
-        if let Some(inbox) = inbox {
-            let _ = inbox.unbounded_send(event);
+/// Add `event` to its call's run, if the call is still open; `waiting`
+/// lists the calls with a run to hand in. An end is handed in at once.
+fn deliver(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>, call: CallId, event: Event) {
+    let end = matches!(event, Event::End(_));
+    let Some(slot) = calls.get_mut(&call.0) else { return };
+    if slot.run.is_empty() {
+        waiting.push(call.0);
+    }
+    slot.run.push(event);
+    if end {
+        calls.remove(&call.0);
+    }
+}
+
+/// Hand in every run read so far.
+fn hand_in(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>) {
+    for id in waiting.drain(..) {
+        if let Some(slot) = calls.get_mut(&id) {
+            slot.hand_in(false);
         }
     }
 }
@@ -221,47 +293,115 @@ async fn drive(
     mut receive: Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send>>,
     write: impl Future<Output = io::Result<()>>,
     shared: Weak<Shared>,
+    mut told: mpsc::UnboundedReceiver<Told>,
     said: oneshot::Sender<String>,
 ) -> io::Result<()> {
     let mut said = Some(said);
-    let held = shared.clone();
-    let read = async move {
-        while let Some(bytes) = receive.next().await {
-            let frame = Frame::decode(&bytes?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let Some(shared) = shared.upgrade() else { break };
-            match frame.body {
-                Body::Hello(hello) => {
-                    if let Some(said) = said.take() {
-                        let _ = said.send(hello.interface);
+    let mut calls = HashMap::new();
+    let ended = {
+        let read = async {
+            let (mut run, mut waiting) = (0, Vec::new());
+            loop {
+                // What was read is handed in before the driver waits, and
+                // before it steps aside.
+                let next = future::poll_fn(|cx| {
+                    let next = receive.poll_next_unpin(cx);
+                    if next.is_pending() {
+                        hand_in(&mut calls, &mut waiting);
                     }
+                    next
+                })
+                .await;
+                let Some(bytes) = next else { break };
+                // Step aside now and then while frames keep coming: the
+                // write half sends the credit the reader has granted, and
+                // the reader runs, so the far end is not held up until all
+                // of it is read.
+                run += 1;
+                if run == RUN {
+                    run = 0;
+                    hand_in(&mut calls, &mut waiting);
+                    crate::yield_now().await;
                 }
-                Body::Item(raw) => shared.deliver(frame.call, Event::Item(raw)),
-                Body::End(end) => shared.deliver(frame.call, Event::End(end)),
-                _ => {}
+                let bytes = bytes?;
+                let bad = |e| io::Error::new(io::ErrorKind::InvalidData, e);
+                let head = Head::read(&bytes).map_err(bad)?;
+                if shared.strong_count() == 0 {
+                    break;
+                }
+                while let Ok(told) = told.try_recv() {
+                    match told {
+                        Told::Opened(id, inbox) => calls.insert(id, inbox),
+                        Told::Gone(id) => calls.remove(&id),
+                    };
+                }
+                if head.kind == Kind::Item {
+                    deliver(&mut calls, &mut waiting, head.call, Event::Item(bytes, head.body));
+                    continue;
+                }
+                match Frame::decode(&bytes).map_err(bad)?.body {
+                    Body::Hello(hello) => {
+                        if let Some(said) = said.take() {
+                            let _ = said.send(hello.interface);
+                        }
+                    }
+                    Body::End(end) => deliver(&mut calls, &mut waiting, head.call, Event::End(end)),
+                    _ => {}
+                }
             }
+            Ok(())
+        };
+        futures::pin_mut!(read, write);
+        match future::select(read, write).await {
+            Either::Left((r, _)) | Either::Right((r, _)) => r,
         }
-        Ok(())
     };
-    futures::pin_mut!(read, write);
-    let ended = match future::select(read, write).await {
-        Either::Left((r, _)) | Either::Right((r, _)) => r,
-    };
-    // Every call still open learns the channel closed.
-    if let Some(shared) = held.upgrade() {
-        lock(&shared.calls).take();
-    }
+    // Every call still open learns the channel closed, and none opens after.
+    told.close();
+    drop(told);
+    drop(calls);
     ended
 }
+
+/// How many frames the driver reads before it steps aside.
+const RUN: u32 = 256;
 
 /// A call that is open. Dropped before its end, it cancels.
 struct Open {
     id: u32,
-    inbox: mpsc::UnboundedReceiver<Event>,
+    inbox: Arc<Inbox>,
+    /// The run last taken from the inbox, not yet read.
+    taken: VecDeque<Event>,
     shared: Arc<Shared>,
     done: bool,
 }
 
 impl Open {
+    /// The next event, or `None` once the inbox is closed and empty.
+    fn poll_event(&mut self, cx: &mut Context<'_>) -> Poll<Option<Event>> {
+        if let Some(event) = self.taken.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+        let mut queue = lock(&self.inbox.0);
+        std::mem::swap(&mut self.taken, &mut queue.events);
+        if let Some(event) = self.taken.pop_front() {
+            return Poll::Ready(Some(event));
+        }
+        if queue.closed {
+            return Poll::Ready(None);
+        }
+        queue.wake = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    /// The next event if one is in already.
+    fn try_event(&mut self) -> Option<Event> {
+        if self.taken.is_empty() {
+            std::mem::swap(&mut self.taken, &mut lock(&self.inbox.0).events);
+        }
+        self.taken.pop_front()
+    }
+
     fn grant(&self, n: u32) {
         self.shared.send(Frame { call: CallId(self.id), seq: 0, body: Body::Credit(n) });
     }
@@ -272,9 +412,7 @@ impl Drop for Open {
         if self.done {
             return;
         }
-        if let Some(calls) = lock(&self.shared.calls).as_mut() {
-            calls.remove(&self.id);
-        }
+        let _ = self.shared.tell.unbounded_send(Told::Gone(self.id));
         self.shared.send(Frame { call: CallId(self.id), seq: 0, body: Body::Cancel });
     }
 }
@@ -293,12 +431,13 @@ impl Stream for Items {
         if self.call.done {
             return Poll::Ready(None);
         }
-        let event = match self.call.inbox.poll_next_unpin(cx) {
+        let event = match self.call.poll_event(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(event) => event,
         };
         Poll::Ready(match event {
-            Some(Event::Item(raw)) => {
+            Some(Event::Item(bytes, body)) => {
+                let raw = item(&bytes, body);
                 self.taken += 1;
                 if self.taken.is_multiple_of(TOP_UP) {
                     self.call.grant(TOP_UP);
@@ -343,12 +482,12 @@ impl Stream for Passed {
             Ok(call) if call.done => return Poll::Ready(None),
             Ok(call) => call,
         };
-        let event = match call.inbox.poll_next_unpin(cx) {
+        let event = match call.poll_event(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(event) => event,
         };
         Poll::Ready(match event {
-            Some(Event::Item(raw)) => Some(Ok(raw)),
+            Some(Event::Item(bytes, body)) => Some(Ok(item(&bytes, body))),
             Some(Event::End(end)) => {
                 call.done = true;
                 end.err().map(Err)
@@ -372,6 +511,13 @@ fn encode(params: &impl Serialize) -> Result<Option<Raw>, Error> {
         "{}" | "null" => None,
         _ => Some(raw),
     })
+}
+
+/// An item's body as JSON, as `Frame::decode` makes it: `Head::read` has
+/// checked it is JSON.
+fn item(bytes: &[u8], body: std::ops::Range<usize>) -> Raw {
+    let text = std::str::from_utf8(&bytes[body]).expect("Head::read checked it");
+    serde_json::value::RawValue::from_string(text.to_owned()).expect("Head::read checked it")
 }
 
 fn null() -> Raw {
