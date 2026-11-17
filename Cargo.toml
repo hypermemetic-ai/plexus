@@ -49,6 +49,10 @@ name = "websocket"
 required-features = ["tokio"]
 
 [[test]]
+name = "store_names"
+required-features = ["store"]
+
+[[test]]
 name = "page"
 harness = false
 required-features = ["tokio"]

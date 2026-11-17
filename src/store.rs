@@ -10,9 +10,15 @@
 //! activation is made before [`main`](crate::main) has read where its bytes
 //! go.
 //!
-//! Natively the bytes go to `<DIR>/<name>.db`, DIR being `--data DIR` or
-//! the environment's `PLEXUS_DATA`; with neither, to memory, said once on
-//! stderr. In a component they go where the host keeps them.
+//! The runtime decides where a name's bytes go, by the activation it
+//! serves, so that one activation never opens another's database by naming
+//! it. Natively a store is claimed, when its activation is served, by the
+//! place it is served at (`kiln`, `studio.kiln`), and its bytes go to
+//! `<DIR>/<place>/<name>.db`, DIR being `--data DIR` or the environment's
+//! `PLEXUS_DATA`; with neither, to memory, said once on stderr. A store
+//! that is not a field of an activation itself is claimed by none and goes
+//! to `<DIR>/<name>.db`. In a component the host scopes the name by the
+//! activation its worker runs (plexus-rt's `store`).
 
 use std::cell::OnceCell;
 use std::fmt;
@@ -200,17 +206,55 @@ pub struct Store {
     name: &'static str,
     schema: &'static str,
     db: OnceCell<db::Db>,
+    /// The place of the activation it is a field of, once that is served.
+    #[cfg(not(target_arch = "wasm32"))]
+    place: OnceCell<String>,
+}
+
+/// A name a database may have: letters, digits, `_`, `-` and `.`, not
+/// first. It is a file's name, so nothing in it reaches another directory.
+fn plain(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('.') && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
 }
 
 impl Store {
-    /// The database named `name`. `schema` is run whenever it is opened, so
-    /// it says `create table if not exists`.
+    /// The database named `name`, among the activation's own: the same name
+    /// in another activation is another database. `schema` is run whenever
+    /// it is opened, so it says `create table if not exists`.
     pub fn open(name: &'static str, schema: &'static str) -> Store {
-        Store { name, schema, db: OnceCell::new() }
+        Store {
+            name,
+            schema,
+            db: OnceCell::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            place: OnceCell::new(),
+        }
+    }
+
+    /// Claimed by the activation served at `place`, whose field it is: what
+    /// `#[activation]`'s serving calls, before any method runs. The first
+    /// claim holds.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[doc(hidden)]
+    pub fn claim(&self, place: &str) {
+        let _ = self.place.set(place.to_owned());
     }
 
     fn db(&self) -> &db::Db {
-        self.db.get_or_init(|| db::Db::open(self.name, self.schema).unwrap_or_else(|e| panic!("the store {:?} does not open: {e}", self.name)))
+        self.db.get_or_init(|| {
+            let opened = if plain(self.name) { self.opened() } else { Err(Error("a name is letters, digits, `_`, `-` and `.`, not first".into())) };
+            opened.unwrap_or_else(|e| panic!("the store {:?} does not open: {e}", self.name))
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn opened(&self) -> Result<db::Db> {
+        db::Db::open(self.place.get().map(String::as_str), self.name, self.schema)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn opened(&self) -> Result<db::Db> {
+        db::Db::open(self.name, self.schema)
     }
 
     /// Run one statement; the number of rows it changed.

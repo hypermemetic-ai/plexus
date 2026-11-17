@@ -149,6 +149,25 @@ pub mod __private {
     pub use futures;
     pub use plexus_proto::bytes;
     pub use serde;
+
+    /// What serving an activation calls on each of its fields,
+    /// `(&self.field).__plexus_claim(at)`, with both traits in scope: a
+    /// `Store` is claimed by the place it is served at (this trait, taken
+    /// first by method lookup); anything else is passed by
+    /// ([`ClaimNone`], reached only through one more reference).
+    pub trait ClaimStore {
+        fn __plexus_claim(&self, at: &str);
+    }
+    #[cfg(feature = "store")]
+    impl ClaimStore for crate::Store {
+        fn __plexus_claim(&self, at: &str) {
+            self.claim(at)
+        }
+    }
+    pub trait ClaimNone {
+        fn __plexus_claim(&self, _at: &str) {}
+    }
+    impl<T: ?Sized> ClaimNone for &T {}
 }
 
 /// Who is calling. A method that takes one is refused to a caller who has

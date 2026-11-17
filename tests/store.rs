@@ -46,3 +46,13 @@ fn a_transaction_commits_or_rolls_back() {
     assert_eq!(s.query("select cone from firing", &[], |r| r.get::<i64>(0)).unwrap(), [1]);
     assert_eq!(s.query_one("select ?1", &[Value::Null], |r| r.get::<Option<i64>>(0)).unwrap(), Some(None));
 }
+
+#[test]
+fn a_name_that_reaches_another_directory_is_refused() {
+    for name in ["../kiln", "kiln/x", ".kiln", ""] {
+        let s = Store::open(name, SCHEMA);
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.execute("select 1", &[]))).unwrap_err();
+        let said = refused.downcast_ref::<String>().unwrap();
+        assert!(said.contains("a name is letters, digits"), "{name:?}: {said}");
+    }
+}
