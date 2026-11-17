@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -309,9 +310,33 @@ impl Shared {
     }
 }
 
+/// The driver's slots by call. A call's id is a number given in order, so
+/// it is hashed by one multiplication, not SipHash, which no caller can
+/// steer: the ids are this end's own.
+type Calls = HashMap<u32, Slot, BuildHasherDefault<Ids>>;
+
+#[derive(Default)]
+struct Ids(u64);
+
+impl Hasher for Ids {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u32(b as u32);
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0 ^ n as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 /// Add `event` to its call's run, if the call is still open; `waiting`
 /// lists the calls with a run to hand in. An end is handed in at once.
-fn deliver(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>, call: CallId, event: Event) {
+fn deliver(calls: &mut Calls, waiting: &mut Vec<u32>, call: CallId, event: Event) {
     let end = matches!(event, Event::End(_));
     let Some(slot) = calls.get_mut(&call.0) else { return };
     #[cfg(feature = "trace")]
@@ -328,7 +353,7 @@ fn deliver(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>, call: CallId,
 }
 
 /// Hand in every run read so far.
-fn hand_in(calls: &mut HashMap<u32, Slot>, waiting: &mut Vec<u32>) {
+fn hand_in(calls: &mut Calls, waiting: &mut Vec<u32>) {
     for id in waiting.drain(..) {
         if let Some(slot) = calls.get_mut(&id) {
             slot.hand_in(false);
@@ -344,7 +369,7 @@ async fn drive(
     said: oneshot::Sender<String>,
 ) -> io::Result<()> {
     let mut said = Some(said);
-    let mut calls = HashMap::new();
+    let mut calls = Calls::default();
     let ended = {
         let read = async {
             let (mut run, mut waiting) = (0, Vec::new());
