@@ -34,6 +34,19 @@
 //! # }
 //! ```
 
+// A stamp of `trace`, or nothing at all without the feature.
+#[cfg(feature = "trace")]
+macro_rules! stamp {
+    (enter $key:expr, $stage:ident) => { crate::trace::enter($key, crate::trace::Stage::$stage) };
+    // An activation's job, stamped as it is taken and run.
+    (within $job:ident) => { let $job = crate::trace::within($job); };
+    ($key:expr, $stage:ident) => { crate::trace::stamp($key, crate::trace::Stage::$stage) };
+}
+#[cfg(not(feature = "trace"))]
+macro_rules! stamp {
+    ($($t:tt)*) => {};
+}
+
 mod channel;
 mod connection;
 mod remote;
@@ -44,6 +57,9 @@ mod server;
 pub mod stdio;
 #[cfg(feature = "store")]
 pub mod store;
+#[cfg(feature = "trace")]
+#[doc(hidden)]
+pub mod trace;
 #[cfg(feature = "tokio")]
 pub mod ws;
 

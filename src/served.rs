@@ -234,11 +234,16 @@ impl<A: Send + 'static> Local<A> {
                     Either::Left((got, _)) => got,
                     Either::Right(_) => return,
                 };
+                stamp!(crate::trace::current(), MethodDone);
                 let _ = answer.send(got);
+                stamp!(crate::trace::current(), AnswerSent);
             }
             .boxed_local()
         });
+        stamp!(within job);
+        stamp!(crate::trace::current(), JobBoxed);
         let sent = self.jobs.unbounded_send(job);
+        stamp!(crate::trace::current(), JobSent);
         async move {
             sent.map_err(|_| stopped())?;
             answered.await.unwrap_or_else(|_| Err(stopped()))
@@ -266,6 +271,7 @@ impl<A: Send + 'static> Local<A> {
             let ending = Ending(asks.0.clone());
             caught(run(a.clone(), args, asks)).map(move |r| ending.end(r.err())).boxed_local()
         });
+        stamp!(within job);
         if self.jobs.unbounded_send(job).is_err() {
             return Served::failed(stopped());
         }
@@ -296,6 +302,8 @@ pub async fn feed<T>(asks: Asks, items: impl Stream<Item = T>, write: impl Fn(T)
     let hop = asks.0;
     let mut items = std::pin::pin!(items);
     let mut credit = 0u32;
+    #[cfg(feature = "trace")]
+    let (call, mut n) = (crate::trace::current().0, 0);
     future::poll_fn(move |cx| {
         let mut made = 0;
         loop {
@@ -314,6 +322,7 @@ pub async fn feed<T>(asks: Asks, items: impl Stream<Item = T>, write: impl Fn(T)
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
+            stamp!((call, n + 1), Asked);
             let next = match std::panic::catch_unwind(AssertUnwindSafe(|| items.as_mut().poll_next(cx))) {
                 Ok(Poll::Pending) => {
                     // A cancel must reach the method while it waits.
@@ -334,10 +343,12 @@ pub async fn feed<T>(asks: Asks, items: impl Stream<Item = T>, write: impl Fn(T)
                 Hop::end(&hop, None);
                 return Poll::Ready(());
             };
+            stamp!({ n += 1; (call, n) }, ItemMade);
             let item = match std::panic::catch_unwind(AssertUnwindSafe(|| write(item))) {
                 Ok(item) => item,
                 Err(panic) => Err(panicked(panic)),
             };
+            stamp!((call, n), ItemSerialized);
             if item.is_err() {
                 Hop::end(&hop, item.err());
                 return Poll::Ready(());
@@ -352,9 +363,11 @@ pub async fn feed<T>(asks: Asks, items: impl Stream<Item = T>, write: impl Fn(T)
                 h.items.push_back(item);
                 h.reader.take()
             };
+            stamp!((call, n), ItemPushed);
             if let Some(w) = reader {
                 w.wake();
             }
+            stamp!((call, n), ItemSent);
         }
     })
     .await
