@@ -37,6 +37,25 @@ let readings = connection.stream("studio.kiln.heat", params)?;
 
 On the server, `Listen::new(&server_identity, allowed_callers)?.accept(tcp).await?` returns the channel and the verified caller principal. The application can inspect the principal before passing the channel to `Server::serve`.
 
+## Callers and context in native activations
+
+`Listen::spawn` supplies the verified peer to each call on the connection. An application accepting its own connections can use `server.serve_as(channel, verified_caller)` after authentication. `server.serve(channel)` serves anonymous calls. A method can take `caller: &Caller` to require a caller, or `Option<&Caller>` to accept either. The client sends only the ordinary method arguments.
+
+An activation declares its opening contract with `#[plexus::activation(context = StudioCx)]`. Define the context inside the module:
+
+```rust
+#[derive(plexus::Context)]
+pub struct StudioCx {
+    #[from(caller)]
+    user: User,
+    tenant: String,
+}
+```
+
+Implement `FromCaller<Studio>` on the application's `User` to look up the verified principal in the studio's own account records. A call to `studio[tenant=acme].status` supplies the tenant. Before invoking the method, Plexus fills the context and runs the activation's optional `#[open] fn open(&self, cx: &StudioCx) -> Result<(), Denied>`. This check also covers methods that omit the context parameter. Each new call rechecks membership. A running stream keeps its opening context through completion or cancellation.
+
+The two-client example in `tests/caller_context.rs` exercises a streaming guestbook, app-owned user lookup, typed path keys and membership changes on a live connection. Run `cargo test --locked --features tls --test caller_context`. Caller propagation across remote hops and browser sign-in require their own authentication contracts.
+
 Part of Plexus, built from scratch (tracker: LAYERS-9). Its sibling crates are expected beside it: `../<crate>`.
 
 MIT.

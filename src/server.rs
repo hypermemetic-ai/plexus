@@ -15,11 +15,13 @@ use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Open, Raw};
 use serde::Serialize;
 
 use crate::channel::{Channel, Out, pump};
-use crate::{Activation, Place, lock};
+use crate::context::keyed_path;
+use crate::{Activation, CallContext, Caller, ContextKeys, Place, lock};
 
-type One = Arc<dyn Fn(Raw) -> BoxFuture<'static, Result<Raw, Failure>> + Send + Sync>;
-type Many = Arc<dyn Fn(Raw) -> BoxStream<'static, Result<Raw, Failure>> + Send + Sync>;
-pub(crate) type Pacing = Arc<dyn Fn(Raw) -> Box<dyn Paced> + Send + Sync>;
+type One = Arc<dyn Fn(Raw, CallContext) -> BoxFuture<'static, Result<Raw, Failure>> + Send + Sync>;
+type Many = Arc<dyn Fn(Raw, CallContext) -> BoxStream<'static, Result<Raw, Failure>> + Send + Sync>;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type Pacing = Arc<dyn Fn(Raw, CallContext) -> Box<dyn Paced> + Send + Sync>;
 
 /// A stream that makes its items ahead of the server, as far as the credit
 /// it is granted: a call passed on, or an activation's stream on its thread.
@@ -45,10 +47,18 @@ enum Handler {
     One(One),
     Many(Many),
     /// Paced by the credit granted to it: an activation's stream.
+    #[cfg(not(target_arch = "wasm32"))]
     Paced(Pacing),
     /// A call under a child held across a channel: the child, and the
     /// method's name below it.
     Pass(Arc<dyn Activation>, String),
+}
+
+/// Which segment of the canonical route accepts keys and what it expects.
+#[derive(Clone, Copy)]
+struct Gate {
+    segment: usize,
+    keys: &'static [&'static str],
 }
 
 /// A place in `_tree`: described here, or a child mounted here, whose
@@ -63,7 +73,7 @@ enum Entry {
 /// [`serve`](Server::serve).
 #[derive(Default)]
 pub struct Server {
-    methods: HashMap<String, Handler>,
+    methods: HashMap<String, (Handler, Option<Gate>)>,
     /// Every place described or mounted, in order, for `_tree`.
     places: Vec<Entry>,
     interface: Option<String>,
@@ -86,7 +96,27 @@ impl Server {
         F: Fn(Raw) -> A + Send + Sync + 'static,
         A: Future<Output = Result<Raw, Failure>> + Send + 'static,
     {
-        self.methods.insert(name.to_owned(), Handler::One(Arc::new(move |p| run(p).boxed())));
+        self.method_with_caller(name, move |params, _| run(params));
+    }
+
+    /// A local unary method with the connection's caller available.
+    #[doc(hidden)]
+    pub fn method_with_caller<F, A>(&mut self, name: &str, run: F)
+    where
+        F: Fn(Raw, CallContext) -> A + Send + Sync + 'static,
+        A: Future<Output = Result<Raw, Failure>> + Send + 'static,
+    {
+        self.methods.insert(name.to_owned(), (Handler::One(Arc::new(move |p, call| run(p, call).boxed())), None));
+    }
+
+    /// A local unary method that takes keys on the activation's segment.
+    #[doc(hidden)]
+    pub fn method_with_context<F, A>(&mut self, name: &str, at: &str, keys: &'static [&'static str], run: F)
+    where
+        F: Fn(Raw, CallContext) -> A + Send + Sync + 'static,
+        A: Future<Output = Result<Raw, Failure>> + Send + 'static,
+    {
+        self.gated(name, at, keys, Handler::One(Arc::new(move |p, call| run(p, call).boxed())));
     }
 
     /// A method with many answers. An `Err` ends the call with that failure.
@@ -95,11 +125,23 @@ impl Server {
         F: Fn(Raw) -> S + Send + Sync + 'static,
         S: futures::Stream<Item = Result<Raw, Failure>> + Send + 'static,
     {
-        self.methods.insert(name.to_owned(), Handler::Many(Arc::new(move |p| run(p).boxed())));
+        self.methods.insert(name.to_owned(), (Handler::Many(Arc::new(move |p, _| run(p).boxed())), None));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn paced(&mut self, name: &str, run: Pacing) {
-        self.methods.insert(name.to_owned(), Handler::Paced(run));
+        self.methods.insert(name.to_owned(), (Handler::Paced(run), None));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn paced_with_context(&mut self, name: &str, at: &str, keys: &'static [&'static str], run: Pacing) {
+        self.gated(name, at, keys, Handler::Paced(run));
+    }
+
+    fn gated(&mut self, name: &str, at: &str, keys: &'static [&'static str], handler: Handler) {
+        assert!(name.strip_prefix(at).is_some_and(|rest| rest.starts_with('.')));
+        let segment = at.bytes().filter(|&b| b == b'.').count();
+        self.methods.insert(name.to_owned(), (handler, Some(Gate { segment, keys })));
     }
 
     /// Say what is served at `at`: `<at>._ir` answers `ir` and `<at>._hash`
@@ -126,13 +168,28 @@ impl Server {
         self.places.push(Entry::Mounted(at.to_owned(), Arc::from(child)));
     }
 
-    fn find(&self, name: &str) -> Option<Handler> {
+    fn find(&self, name: &str) -> Result<(Handler, ContextKeys), Failure> {
+        let not_found = || failure("not-found", &format!("no method {name}"));
+        if name.contains(['[', ']']) {
+            let (canonical, segment, keys) = keyed_path(name)?;
+            let (handler, gate) = self.methods.get(&canonical).ok_or_else(not_found)?;
+            let gate = gate.ok_or_else(not_found)?;
+            if gate.segment != segment {
+                return Err(failure("invalid-context", "context keys belong on the activation's segment"));
+            }
+            keys.check(gate.keys)?;
+            return Ok((handler.clone(), keys));
+        }
+        let keys = ContextKeys::default();
         if name == "_tree" {
             let places = self.places.clone();
-            return Some(Handler::One(Arc::new(move |_| tree(places.clone()).boxed())));
+            return Ok((Handler::One(Arc::new(move |_, _| tree(places.clone()).boxed())), keys));
         }
-        if let Some(own) = self.methods.get(name) {
-            return Some(own.clone());
+        if let Some((own, gate)) = self.methods.get(name) {
+            if let Some(gate) = gate {
+                keys.check(gate.keys)?;
+            }
+            return Ok((own.clone(), keys));
         }
         // The child mounted deepest that the name is under.
         self.places
@@ -142,12 +199,23 @@ impl Server {
                 Entry::Described(_) => None,
             })
             .max_by_key(|(len, ..)| *len)
-            .map(|(_, rest, child)| Handler::Pass(child.clone(), rest.to_owned()))
+            .map(|(_, rest, child)| (Handler::Pass(child.clone(), rest.to_owned()), keys))
+            .ok_or_else(not_found)
     }
 
     /// Serve one channel until it closes. Every call runs at once with the
     /// others, inside this future: spawn it on any executor.
     pub fn serve(self: &Arc<Self>, channel: Channel) -> impl Future<Output = io::Result<()>> + Send + 'static {
+        self.serve_bound(channel, None)
+    }
+
+    /// Serve a channel whose caller has already been authenticated.
+    /// The caller is trusted for the lifetime of the channel.
+    pub fn serve_as(self: &Arc<Self>, channel: Channel, caller: Caller) -> impl Future<Output = io::Result<()>> + Send + 'static {
+        self.serve_bound(channel, Some(caller))
+    }
+
+    fn serve_bound(self: &Arc<Self>, channel: Channel, caller: Option<Caller>) -> impl Future<Output = io::Result<()>> + Send + 'static {
         let server = self.clone();
         let Channel { send, mut receive } = channel;
         let (out, frames) = crate::channel::out();
@@ -169,7 +237,7 @@ impl Server {
                         let credit = Arc::new(Credit { left: AtomicU32::new(1), wake: AtomicWaker::new() });
                         let (abort, registration) = AbortHandle::new_pair();
                         lock(&calls).insert(id, Running { credit: credit.clone(), abort });
-                        let ran = run(server.clone(), id, open, out.clone(), credit, calls.clone());
+                        let ran = run(server.clone(), id, open, caller.clone(), out.clone(), credit, calls.clone());
                         let _ = start.unbounded_send(Abortable::new(ran, registration).map(|_| ()).boxed());
                         stamp!((id, 0), Started);
                     }
@@ -255,6 +323,7 @@ async fn run(
     server: Arc<Server>,
     id: u32,
     open: Open,
+    caller: Option<Caller>,
     out: Out,
     credit: Arc<Credit>,
     calls: Arc<Mutex<HashMap<u32, Running>>>,
@@ -272,16 +341,16 @@ async fn run(
     let given = open.params;
     let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
     let ended: Result<(), Failure> = match server.find(&open.method) {
-        None => Err(failure("not-found", &format!("no method {}", open.method))),
-        Some(Handler::One(f)) => match caught(f(params)).await.and_then(|answer| answer) {
+        Err(f) => Err(f),
+        Ok((Handler::One(f), keys)) => match caught(f(params, CallContext::new(caller, keys))).await.and_then(|answer| answer) {
             Ok(answer) => {
                 send(Kind::Item, answer.get().as_bytes());
                 Ok(())
             }
             Err(f) => Err(f),
         },
-        Some(Handler::Many(f)) => {
-            let mut items = f(params);
+        Ok((Handler::Many(f), keys)) => {
+            let mut items = f(params, CallContext::new(caller, keys));
             let mut run = 0;
             #[cfg(feature = "trace")]
             let mut n = 0;
@@ -304,13 +373,14 @@ async fn run(
                 }
             }
         }
-        Some(Handler::Pass(child, rest)) => {
+        Ok((Handler::Pass(child, rest), _)) => {
             // The open carried credit for one item; the open passed on
             // carries it on.
             take(&credit).await;
             paced(&credit, child.pass(&rest, given), send).await
         }
-        Some(Handler::Paced(f)) => paced(&credit, f(params), send).await,
+        #[cfg(not(target_arch = "wasm32"))]
+        Ok((Handler::Paced(f), keys)) => paced(&credit, f(params, CallContext::new(caller, keys)), send).await,
     };
     lock(&calls).remove(&id);
     match ended {

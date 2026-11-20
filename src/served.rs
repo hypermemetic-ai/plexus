@@ -32,7 +32,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::lock;
+use crate::{CallContext, lock};
 use crate::server::{Paced, Server, failure};
 
 type Job<A> = Box<dyn FnOnce(&Rc<A>) -> LocalBoxFuture<'static, ()> + Send>;
@@ -149,7 +149,28 @@ pub fn stream<F>(server: &mut Server, name: &str, run: F)
 where
     F: Fn(Raw) -> Served + Send + Sync + 'static,
 {
-    server.paced(name, Arc::new(move |p| Box::new(run(p)) as Box<dyn Paced>));
+    stream_with_caller(server, name, move |params, _| run(params));
+}
+
+/// Register a local stream supplied with the connection's caller.
+pub fn stream_with_caller<F>(server: &mut Server, name: &str, run: F)
+where
+    F: Fn(Raw, CallContext) -> Served + Send + Sync + 'static,
+{
+    server.paced(name, Arc::new(move |params, call| Box::new(run(params, call))));
+}
+
+/// Register a local stream that takes keys on the activation's segment.
+pub fn stream_with_context<F>(server: &mut Server, name: &str, at: &str, keys: &'static [&'static str], run: F)
+where
+    F: Fn(Raw, CallContext) -> Served + Send + Sync + 'static,
+{
+    server.paced_with_context(name, at, keys, Arc::new(move |params, call| Box::new(run(params, call))));
+}
+
+/// End a stream whose activation refused to start it.
+pub fn fail_stream(asks: Asks, failure: Failure) {
+    Hop::end(&asks.0, Some(failure));
 }
 
 /// An activation on a thread of its own. Clones send to the same one; the
