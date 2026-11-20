@@ -278,8 +278,8 @@ impl Listen {
             while let Ok((tcp, _)) = listener.accept().await {
                 let (me, server) = (me.clone(), server.clone());
                 tokio::spawn(async move {
-                    if let Ok((channel, _caller)) = me.accept(tcp).await {
-                        let _ = server.serve(channel).await;
+                    if let Ok((channel, caller)) = me.accept(tcp).await {
+                        let _ = server.serve_as(channel, crate::Caller::new(caller)).await;
                     }
                 });
             }

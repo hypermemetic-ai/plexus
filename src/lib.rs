@@ -49,6 +49,7 @@ macro_rules! stamp {
 
 mod channel;
 mod connection;
+mod context;
 mod remote;
 #[cfg(not(target_arch = "wasm32"))]
 mod served;
@@ -69,8 +70,9 @@ pub use channel::{Channel, pair};
 /// The `bytes` crate, whose `Bytes` a [`Channel`] carries.
 pub use bytes;
 pub use connection::{Connection, Error, Items, Passed, TOP_UP, WINDOW};
+pub use context::{CallContext, Context, ContextKeys, FromCaller, require_caller};
 pub use remote::Remote;
-pub use plexus_macros::activation;
+pub use plexus_macros::{activation, Context};
 pub use plexus_proto::{Failure, Raw};
 pub use server::{Server, fail, raw};
 #[cfg(feature = "store")]
@@ -165,7 +167,7 @@ pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
 #[doc(hidden)]
 #[cfg(not(target_arch = "wasm32"))]
 pub mod __private {
-    pub use crate::served::{B64, Later, Local, feed, failed, params, stream};
+    pub use crate::served::{B64, Later, Local, feed, failed, params, stream, fail_stream, stream_with_caller, stream_with_context};
     pub use futures;
     pub use plexus_proto::bytes;
     pub use serde;
@@ -195,12 +197,12 @@ pub mod __private {
 /// It is not a parameter a caller sends.
 #[derive(Debug, Clone)]
 pub struct Caller {
-    principal: String,
+    principal: std::sync::Arc<str>,
 }
 
 impl Caller {
     pub fn new(principal: impl Into<String>) -> Caller {
-        Caller { principal: principal.into() }
+        Caller { principal: std::sync::Arc::from(principal.into()) }
     }
     /// The signed-in identity: `key:54a9…`, `user:ada@example.com`.
     pub fn principal(&self) -> &str {
