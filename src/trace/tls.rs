@@ -13,7 +13,10 @@ use rustls::crypto::cipher::{
     AeadKey, InboundOpaqueMessage, InboundPlainMessage, Iv, MessageDecrypter, MessageEncrypter,
     OutboundOpaqueMessage, OutboundPlainMessage, Tls13AeadAlgorithm, UnsupportedOperationError,
 };
-use rustls::{CipherSuiteCommon, ConnectionTrafficSecrets, ContentType, Error, SupportedCipherSuite, Tls13CipherSuite};
+use rustls::{
+    CipherSuiteCommon, ConnectionTrafficSecrets, ContentType, Error, SupportedCipherSuite,
+    Tls13CipherSuite,
+};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::{Clock, on};
@@ -21,22 +24,31 @@ use super::{Clock, on};
 pub(crate) fn tracing_provider(mut provider: CryptoProvider) -> CryptoProvider {
     // The suites require static references. Wrap ring's suite list once.
     static SUITES: OnceLock<Vec<SupportedCipherSuite>> = OnceLock::new();
-    provider.cipher_suites = SUITES.get_or_init(|| provider.cipher_suites.iter().map(|suite| match suite.tls13() {
-        Some(suite) => {
-            let wrapped: &'static Tls13CipherSuite = Box::leak(Box::new(Tls13CipherSuite {
-                common: CipherSuiteCommon {
-                    suite: suite.common.suite,
-                    hash_provider: suite.common.hash_provider,
-                    confidentiality_limit: suite.common.confidentiality_limit,
-                },
-                hkdf_provider: suite.hkdf_provider,
-                aead_alg: Box::leak(Box::new(Algorithm(suite.aead_alg))),
-                quic: suite.quic,
-            }));
-            SupportedCipherSuite::Tls13(wrapped)
-        }
-        None => *suite,
-    }).collect()).clone();
+    provider.cipher_suites = SUITES
+        .get_or_init(|| {
+            provider
+                .cipher_suites
+                .iter()
+                .map(|suite| match suite.tls13() {
+                    Some(suite) => {
+                        let wrapped: &'static Tls13CipherSuite =
+                            Box::leak(Box::new(Tls13CipherSuite {
+                                common: CipherSuiteCommon {
+                                    suite: suite.common.suite,
+                                    hash_provider: suite.common.hash_provider,
+                                    confidentiality_limit: suite.common.confidentiality_limit,
+                                },
+                                hkdf_provider: suite.hkdf_provider,
+                                aead_alg: Box::leak(Box::new(Algorithm(suite.aead_alg))),
+                                quic: suite.quic,
+                            }));
+                        SupportedCipherSuite::Tls13(wrapped)
+                    }
+                    None => *suite,
+                })
+                .collect()
+        })
+        .clone();
     provider
 }
 
@@ -55,7 +67,11 @@ impl Tls13AeadAlgorithm for Algorithm {
         self.0.key_len()
     }
 
-    fn extract_keys(&self, key: AeadKey, iv: Iv) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+    fn extract_keys(
+        &self,
+        key: AeadKey,
+        iv: Iv,
+    ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
         self.0.extract_keys(key, iv)
     }
 
@@ -67,7 +83,11 @@ impl Tls13AeadAlgorithm for Algorithm {
 struct Seal(Box<dyn MessageEncrypter>);
 
 impl MessageEncrypter for Seal {
-    fn encrypt(&mut self, msg: OutboundPlainMessage<'_>, seq: u64) -> Result<OutboundOpaqueMessage, Error> {
+    fn encrypt(
+        &mut self,
+        msg: OutboundPlainMessage<'_>,
+        seq: u64,
+    ) -> Result<OutboundOpaqueMessage, Error> {
         if msg.typ != ContentType::ApplicationData || !active() {
             return self.0.encrypt(msg, seq);
         }
@@ -88,14 +108,21 @@ impl MessageEncrypter for Seal {
 struct Open(Box<dyn MessageDecrypter>);
 
 impl MessageDecrypter for Open {
-    fn decrypt<'a>(&mut self, msg: InboundOpaqueMessage<'a>, seq: u64) -> Result<InboundPlainMessage<'a>, Error> {
+    fn decrypt<'a>(
+        &mut self,
+        msg: InboundOpaqueMessage<'a>,
+        seq: u64,
+    ) -> Result<InboundPlainMessage<'a>, Error> {
         if !active() {
             return self.0.decrypt(msg, seq);
         }
         let began = Instant::now();
         let result = self.0.decrypt(msg, seq);
         let ended = Instant::now();
-        if result.as_ref().is_ok_and(|plain| plain.typ == ContentType::ApplicationData) {
+        if result
+            .as_ref()
+            .is_ok_and(|plain| plain.typ == ContentType::ApplicationData)
+        {
             observe(RecordOp::Open, began, ended);
         }
         result
@@ -153,16 +180,28 @@ impl<S> TlsIo<S> {
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for TlsIo<S> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        with_clock(&this.clock, || Pin::new(&mut this.stream).poll_read(cx, buf))
+        with_clock(&this.clock, || {
+            Pin::new(&mut this.stream).poll_read(cx, buf)
+        })
     }
 }
 
 impl<S: AsyncWrite + Unpin> AsyncWrite for TlsIo<S> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
-        with_clock(&this.clock, || Pin::new(&mut this.stream).poll_write(cx, buf))
+        with_clock(&this.clock, || {
+            Pin::new(&mut this.stream).poll_write(cx, buf)
+        })
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

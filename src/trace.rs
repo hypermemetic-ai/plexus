@@ -5,6 +5,12 @@
 //! id and a slot: 0 for the call itself and its open, `n` for its `n`th item
 //! (from 1), [`END`] for its end. Each thread keeps its own stamps, so a
 //! stamp takes no lock another thread holds; [`stop`] gathers them.
+//!
+//! WSS record and TCP timings are for serial unary benchmarks. A connection's
+//! work is recorded on its I/O clock and charged once to the batch's call.
+//! The first keyed message receives the read work; a batch spanning several
+//! calls has no unique owner. These stamps should not be used to assign costs
+//! on a multiplexed connection.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -401,6 +407,9 @@ mod socket {
 
         #[cfg(feature = "tls")]
         pub(super) fn stamp_tls(&self, key: Option<Key>, op: RecordOp) {
+            if !self.tracing_tls() {
+                return;
+            }
             let mut times = lock(&self.times);
             fn stamp(key: Option<Key>, entries: &mut Vec<(Instant, Instant)>, began: Stage, ended: Stage) {
                 for (start, end) in entries.drain(..) {

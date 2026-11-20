@@ -37,14 +37,33 @@ pub(super) struct Measured {
     max_error: f64,
 }
 
-async fn endpoint(server: Arc<Server>, client_id: &Identity, server_id: &Identity, traced: bool) -> Connection {
+async fn endpoint(
+    server: Arc<Server>,
+    client_id: &Identity,
+    server_id: &Identity,
+    traced: bool,
+) -> Connection {
     let (listen, dial) = if traced {
-        (Listen::new(server_id, [client_id.principal()]), Dial::new(client_id, server_id.principal()))
+        (
+            Listen::new(server_id, [client_id.principal()]),
+            Dial::new(client_id, server_id.principal()),
+        )
     } else {
-        (Listen::new_untraced(server_id, [client_id.principal()]), Dial::new_untraced(client_id, server_id.principal()))
+        (
+            Listen::new_untraced(server_id, [client_id.principal()]),
+            Dial::new_untraced(client_id, server_id.principal()),
+        )
     };
-    let bound = listen.unwrap().spawn("127.0.0.1:0".parse().unwrap(), server).await.unwrap();
-    let (channel, peer) = dial.unwrap().connect(&format!("wss://{bound}/")).await.unwrap();
+    let bound = listen
+        .unwrap()
+        .spawn("127.0.0.1:0".parse().unwrap(), server)
+        .await
+        .unwrap();
+    let (channel, peer) = dial
+        .unwrap()
+        .connect(&format!("wss://{bound}/"))
+        .await
+        .unwrap();
     assert_eq!(peer, server_id.principal());
     connect(channel)
 }
@@ -70,7 +89,12 @@ pub(super) async fn run(name: &str) -> Vec<Measured> {
             outside.push(signed_us(Instant::now(), start));
         }
         let records = trace::stop();
-        result.push(measure(format!("call.{kind}.wss.{name}"), records, outside, off));
+        result.push(measure(
+            format!("call.{kind}.wss.{name}"),
+            records,
+            outside,
+            off,
+        ));
     }
     result
 }
@@ -80,11 +104,22 @@ type Slice = (Instant, Instant);
 /// For these serial calls the request and response write/read batches each
 /// have a single owner. Match every individual operation in timestamp order.
 fn intervals(records: &[Record], begins: Stage, ends: Stage, side: &str) -> Vec<Slice> {
-    let mut a: Vec<_> = records.iter().filter(|r| r.stage == begins).map(|r| r.at).collect();
-    let mut b: Vec<_> = records.iter().filter(|r| r.stage == ends).map(|r| r.at).collect();
+    let mut a: Vec<_> = records
+        .iter()
+        .filter(|r| r.stage == begins)
+        .map(|r| r.at)
+        .collect();
+    let mut b: Vec<_> = records
+        .iter()
+        .filter(|r| r.stage == ends)
+        .map(|r| r.at)
+        .collect();
     a.sort_unstable();
     b.sort_unstable();
-    assert!(!a.is_empty() && a.len() == b.len(), "{side}: missing or unpaired {begins:?}/{ends:?}");
+    assert!(
+        !a.is_empty() && a.len() == b.len(),
+        "{side}: missing or unpaired {begins:?}/{ends:?}"
+    );
     a.into_iter().zip(b).collect()
 }
 
@@ -92,8 +127,18 @@ fn intervals(records: &[Record], begins: Stage, ends: Stage, side: &str) -> Vec<
 fn wire(records: &[Record], start: Instant, end: Instant, side: &str) -> [f64; 4] {
     let seal = intervals(records, Stage::TlsSealEntry, Stage::TlsSealReturn, side);
     let open = intervals(records, Stage::TlsOpenEntry, Stage::TlsOpenReturn, side);
-    let mut tcp = intervals(records, Stage::TlsTcpWriteEntry, Stage::TlsTcpWriteReturn, side);
-    tcp.extend(intervals(records, Stage::TlsTcpReadEntry, Stage::TlsTcpReadReturn, side));
+    let mut tcp = intervals(
+        records,
+        Stage::TlsTcpWriteEntry,
+        Stage::TlsTcpWriteReturn,
+        side,
+    );
+    tcp.extend(intervals(
+        records,
+        Stage::TlsTcpReadEntry,
+        Stage::TlsTcpReadReturn,
+        side,
+    ));
 
     fn covered(slices: &mut [Slice], start: Instant, end: Instant) -> f64 {
         slices.sort_unstable();
@@ -110,24 +155,47 @@ fn wire(records: &[Record], start: Instant, end: Instant, side: &str) -> [f64; 4
         }
         total
     }
-    assert!(seal.iter().chain(&open).all(|&(a, b)| start <= a && a <= b && b <= end), "{side}: crypto operation outside transport window");
+    assert!(
+        seal.iter()
+            .chain(&open)
+            .all(|&(a, b)| start <= a && a <= b && b <= end),
+        "{side}: crypto operation outside transport window"
+    );
     let mut slices = seal;
     let sealing = covered(&mut slices, start, end);
     slices.extend(open);
     let crypto = covered(&mut slices, start, end);
     slices.extend(tcp);
     let active = covered(&mut slices, start, end);
-    [sealing, crypto - sealing, active - crypto, signed_us(end, start) - active]
+    [
+        sealing,
+        crypto - sealing,
+        active - crypto,
+        signed_us(end, start) - active,
+    ]
 }
 
-fn measure(scenario: String, records: Vec<Record>, mut traced: Vec<f64>, untraced_p50: f64) -> Measured {
+fn measure(
+    scenario: String,
+    records: Vec<Record>,
+    mut traced: Vec<f64>,
+    untraced_p50: f64,
+) -> Measured {
     let mut calls = HashMap::<u32, Vec<_>>::new();
     for record in records {
         calls.entry(record.key.0).or_default().push(record);
     }
-    let mut ids: Vec<_> = calls.iter().filter(|(_, r)| r.iter().any(|r| r.stage == Stage::Called)).map(|(&id, _)| id).collect();
+    let mut ids: Vec<_> = calls
+        .iter()
+        .filter(|(_, r)| r.iter().any(|r| r.stage == Stage::Called))
+        .map(|(&id, _)| id)
+        .collect();
     ids.sort_unstable();
-    assert_eq!(ids.len(), traced.len(), "{scenario}: incomplete call tracing");
+    assert_eq!(
+        ids.len(),
+        traced.len(),
+        "{scenario}: incomplete call tracing"
+    );
 
     let mut each: [Vec<f64>; ROWS.len()] = std::array::from_fn(|_| Vec::with_capacity(ids.len()));
     let mut accounted = Vec::with_capacity(ids.len());
@@ -135,7 +203,12 @@ fn measure(scenario: String, records: Vec<Record>, mut traced: Vec<f64>, untrace
     let mut max_error: f64 = 0.;
     for (id, &outside) in ids.into_iter().zip(&traced) {
         let call = &calls[&id];
-        let at = |slot, stage| call.iter().find(|r| r.key.1 == slot && r.stage == stage).unwrap_or_else(|| panic!("{scenario}: call {id} missing {stage:?} at slot {slot}")).at;
+        let at = |slot, stage| {
+            call.iter()
+                .find(|r| r.key.1 == slot && r.stage == stage)
+                .unwrap_or_else(|| panic!("{scenario}: call {id} missing {stage:?} at slot {slot}"))
+                .at
+        };
         let checkpoints = [
             at(0, Stage::Called),
             at(0, Stage::Taken),
@@ -144,16 +217,26 @@ fn measure(scenario: String, records: Vec<Record>, mut traced: Vec<f64>, untrace
             at(END, Stage::Received),
             at(0, Stage::Returned),
         ];
-        assert!(checkpoints.is_sorted(), "{scenario}: call {id} checkpoints out of order");
-        let (request, response): (Vec<_>, Vec<_>) = call.iter().copied().partition(|r| r.key.1 == 0);
+        assert!(
+            checkpoints.is_sorted(),
+            "{scenario}: call {id} checkpoints out of order"
+        );
+        let (request, response): (Vec<_>, Vec<_>) =
+            call.iter().copied().partition(|r| r.key.1 == 0);
         let [start, taken, read, reply, received, end] = checkpoints;
         let [rs, ro, rt, rw] = wire(&request, taken, read, "request");
         let [ss, so, st, sw] = wire(&response, reply, received, "response");
         let stage_times = [
             signed_us(taken, start),
-            rs, ro, rt, rw,
+            rs,
+            ro,
+            rt,
+            rw,
             signed_us(reply, read),
-            ss, so, st, sw,
+            ss,
+            so,
+            st,
+            sw,
             signed_us(end, received),
         ];
         let total: f64 = stage_times.iter().sum();
@@ -170,7 +253,15 @@ fn measure(scenario: String, records: Vec<Record>, mut traced: Vec<f64>, untrace
     }
     traced.sort_by(f64::total_cmp);
     accounted.sort_by(f64::total_cmp);
-    Measured { scenario, each, traced, untraced_p50, accounted, within, max_error }
+    Measured {
+        scenario,
+        each,
+        traced,
+        untraced_p50,
+        accounted,
+        within,
+        max_error,
+    }
 }
 
 impl Measured {
@@ -184,13 +275,37 @@ impl Measured {
         println!("| Stage | p50 µs | p99 µs | Mean µs |");
         println!("| --- | ---: | ---: | ---: |");
         for (stage, values) in ROWS.iter().zip(&self.each) {
-            println!("| {stage} | {:.3} | {:.3} | {:.3} |", pct(values, 50), pct(values, 99), mean(values));
+            println!(
+                "| {stage} | {:.3} | {:.3} | {:.3} |",
+                pct(values, 50),
+                pct(values, 99),
+                mean(values)
+            );
         }
-        println!("\nOutside call p50 {traced:.3} µs traced, {:.3} µs untraced ({:+.1}% measured change).", self.untraced_p50, 100. * (traced / self.untraced_p50 - 1.));
-        println!("Stage totals p50 {accounted:.3} µs, sum of stage medians {medians:.3} µs. Mean fit {:.2}%. {}/{n} same-call totals within 10%, maximum error {:.2}%.", explained * 100., self.within, self.max_error * 100.);
-        println!("Totals use disjoint wall time from each call. Overlapping wall time is credited once, in order of TLS seal, TLS open, then successful TCP polls. Each transport remainder includes WebSocket framing and parsing, rustls buffering, loopback and task scheduling. Independent stage medians need not sum to the median of the call totals.");
-        println!("The paired samples use separate warmed connections with identical methods and keys. The untraced connection uses the original ring provider and has recording disabled. The timed calls exclude setup and handshakes.");
-        assert!(self.within * 10 >= n * 9 && (0.9..=1.1).contains(&explained) && (0.9..=1.1).contains(&(accounted / traced)), "{}: WSS call totals fell outside the 10% accounting tolerance", self.scenario);
+        println!(
+            "\nOutside call p50 {traced:.3} µs traced, {:.3} µs untraced ({:+.1}% measured change).",
+            self.untraced_p50,
+            100. * (traced / self.untraced_p50 - 1.)
+        );
+        println!(
+            "Stage totals p50 {accounted:.3} µs, sum of stage medians {medians:.3} µs. Mean fit {:.2}%. {}/{n} same-call totals within 10%, maximum error {:.2}%.",
+            explained * 100.,
+            self.within,
+            self.max_error * 100.
+        );
+        println!(
+            "Totals use disjoint wall time from each call. Overlapping wall time is credited once, in order of TLS seal, TLS open, then successful TCP polls. Each transport remainder includes WebSocket framing and parsing, rustls buffering, loopback and task scheduling. Independent stage medians need not sum to the median of the call totals."
+        );
+        println!(
+            "The paired samples use separate warmed connections with identical methods and keys. The untraced connection uses the original ring provider and has recording disabled. The timed calls exclude setup and handshakes."
+        );
+        assert!(
+            self.within * 10 >= n * 9
+                && (0.9..=1.1).contains(&explained)
+                && (0.9..=1.1).contains(&(accounted / traced)),
+            "{}: WSS call totals fell outside the 10% accounting tolerance",
+            self.scenario
+        );
     }
 
     pub(super) fn json(&self, out: &mut impl Write, commit: &str, load: f64) {
@@ -205,7 +320,12 @@ impl Measured {
         }
         line("sum.same_call", "p50_us", pct(&self.accounted, 50), "us");
         line("sum.same_call", "mean_us", mean(&self.accounted), "us");
-        line("sum.same_call", "fraction_within_10_percent", self.within as f64 / self.traced.len() as f64, "ratio");
+        line(
+            "sum.same_call",
+            "fraction_within_10_percent",
+            self.within as f64 / self.traced.len() as f64,
+            "ratio",
+        );
         line("outside", "p50_us", pct(&self.traced, 50), "us");
         line("outside", "mean_us", mean(&self.traced), "us");
         line("outside.untraced", "p50_us", self.untraced_p50, "us");
