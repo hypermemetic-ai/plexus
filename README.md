@@ -9,16 +9,33 @@ The one crate a Plexus activation depends on: the attribute, the types a method'
 - `Store` (feature `store`): an activation's own SQLite database, through an API of plexus's own (`plexus::store`): `execute`, `query` and `query_one` with a row mapper, `transaction`; a parameter is a `Value` (null, integer, real, text, blob), a column a `ValueRef` borrowed from where it lies, read with `Row::get::<T>(column)`; an error is a value, `store::Error`. `Store::open("kiln", SCHEMA)` in the activation's `Default`; it is opened at its first use, its schema run then. The same source is rusqlite in a process (`src/store/native.rs`) and, in a component, the import `plexus:store/sql` (`wit/store.wit`, `src/store/wasm.rs`), a statement's parameters and a query's rows crossing as one block of bytes each (`src/store/packed.rs`, which the engine includes too): SQLite is not in the component at all (the kiln: 26 KB → 33 KB gzipped, against 434 KB with SQLite inside), and the component builds with plain cargo, no clang. The runtime decides where a name's bytes go, by the activation it serves, so an activation that names another's database gets one of its own: natively a store that is a field of an activation is claimed by the place it is served at when it is served (`#[activation]` offers each field), and its file is `<DIR>/<place>/<name>.db` (`<DIR>/kiln/kiln.db`; the kiln held by the studio: `<DIR>/studio.kiln/kiln.db`), DIR being `plexus::main`'s `--data DIR` or `PLEXUS_DATA`; with neither it is in memory, said once on stderr. A store held anywhere else than a field of the activation itself is claimed by none and is `<DIR>/<name>.db`. A name is letters, digits, `_`, `-` and `.`, not first. In a page the host scopes it the same way (`../plexus-rt`'s `store`: `<activation>/<name>.db` in the browser's file store).
 - `engine/` (its own crate, `plexus-store-engine`): the one SQLite a page holds, exporting `plexus:store/sql` — rusqlite with SQLite compiled to wasm (clang, so built in a container: `../plexus-rt/scripts/engine.sh`), statements kept prepared by their text, over a VFS that imports `plexus:store/host`: a clock, randomness, and the host's files by name — a page's worker hands it the browser's file store (OPFS), so a database outlives a reload; a name the host does not keep is kept in memory. 350 KB brotli, fetched once by a page for every activation in it.
 - `Channel`: whole frames as bytes. `pair()` in memory; with the `tokio` feature, `stdio` (a frame a line: this process, or a child) and `ws` (a text message a frame: `connect`, `accept`, `listen`, `spawn`). Without it the crate builds for a component (`wasm32-unknown-unknown`).
+- With the opt-in `tls` feature, `tls::Dial` pins the server’s Ed25519 principal and `tls::Listen` accepts the listed client principals. Each returns a `(Channel, String)` containing the peer’s verified `key:<hex>` before Plexus exchanges its hello. Feed the channel to the existing `Connection` or `Server`. Both ends need TLS 1.3 and a key.
 - Frames are plexus-proto's; the behaviour matches `../plexus-rt`, the page's runtime, which calls this server in `tests/page.rs`.
 
 ```sh
 cargo test --features tokio                     # in memory, a child over stdio, a WebSocket, a child held across a channel, and plexus-rt in Node (ignored, with why, without Node 22+)
 cargo bench --features tokio --bench pace       # call.one_item and stream.10k.64B, in memory and over a loopback WebSocket
+cargo test --locked --features tls --test tls   # mutual pins, key files and the shared kiln over WSS
+cargo bench --locked --features tls --bench pace       # compare WS and WSS calls, streams and new connections
+cargo bench --locked --features tls,trace --bench trace # trace a warm call through the record layer
 cargo build --target wasm32-unknown-unknown     # the core alone; with `store` too (the import; no clang)
 cargo test --features store --test store        # Store natively: statements, rows, errors as values, a transaction, a name refused
 cargo test --features store --test store_names  # a parent and the child it holds open the same name: each its own database
 cargo run --features tokio --bin test-kiln -- --ws 127.0.0.1:0   # the hand-registered kiln the tests call (it counts what `heat` made, which pacing is checked by)
 ```
+
+To connect a caller that already has a Synapse file key, use the server’s public principal as the pin. The same `Connection::stream` call works on the returned channel:
+
+```rust
+let me = plexus::tls::Identity::from_key_file(key_path)?;
+let dial = plexus::tls::Dial::new(&me, &server_principal)?;
+let (channel, peer) = dial.connect("wss://studio.example:4455/").await?;
+let (connection, driving) = plexus::Connection::new(channel, None);
+tokio::spawn(driving);
+let readings = connection.stream("studio.kiln.heat", params)?;
+```
+
+On the server, `Listen::new(&server_identity, allowed_callers)?.accept(tcp).await?` returns the channel and the verified caller principal. The application can inspect the principal before passing the channel to `Server::serve`.
 
 Part of Plexus, built from scratch (tracker: LAYERS-9). Its sibling crates are expected beside it: `../<crate>`.
 

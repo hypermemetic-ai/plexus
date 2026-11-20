@@ -17,6 +17,8 @@ store = ["dep:rusqlite", "dep:wit-bindgen"]
 # A call stamped at every stage, on both ends, for `benches/trace.rs`.
 # Off: none of its code exists.
 trace = []
+# WebSocket channels over mutually pinned Ed25519 TLS 1.3.
+tls = ["tokio", "dep:base64", "dep:rcgen", "dep:rustls", "dep:tokio-rustls", "dep:zeroize"]
 
 [dependencies]
 plexus-macros = { path = "../plexus-macros" }
@@ -28,6 +30,11 @@ serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", optional = true, features = ["io-std", "io-util", "net", "process", "rt", "rt-multi-thread"] }
 tokio-util = { version = "0.7", optional = true, features = ["codec", "io"] }
 tungstenite = { version = "0.30", optional = true }
+base64 = { version = "0.22", optional = true }
+rcgen = { version = "0.14", optional = true, default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+zeroize = { version = "1", optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rusqlite = { version = "0.43", optional = true, features = ["bundled"] }
@@ -51,6 +58,10 @@ required-features = ["tokio"]
 [[test]]
 name = "websocket"
 required-features = ["tokio"]
+
+[[test]]
+name = "tls"
+required-features = ["tls"]
 
 [[test]]
 name = "store_names"

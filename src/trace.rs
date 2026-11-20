@@ -5,6 +5,12 @@
 //! id and a slot: 0 for the call itself and its open, `n` for its `n`th item
 //! (from 1), [`END`] for its end. Each thread keeps its own stamps, so a
 //! stamp takes no lock another thread holds; [`stop`] gathers them.
+//!
+//! WSS record and TCP timings are for serial unary benchmarks. A connection's
+//! work is recorded on its I/O clock and charged once to the batch's call.
+//! The first keyed message receives the read work; a batch spanning several
+//! calls has no unique owner. These stamps should not be used to assign costs
+//! on a multiplexed connection.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,6 +44,22 @@ pub enum Stage {
     WsReadEntry,
     /// `read()` returned the bytes.
     WsReadReturn,
+    /// TLS 1.3 application record encryption entered.
+    TlsSealEntry,
+    /// TLS 1.3 application record encryption finished.
+    TlsSealReturn,
+    /// TLS 1.3 application record decryption entered.
+    TlsOpenEntry,
+    /// TLS 1.3 application record decryption finished.
+    TlsOpenReturn,
+    /// One TCP write poll that accepted ciphertext entered.
+    TlsTcpWriteEntry,
+    /// One TCP write poll that accepted ciphertext finished.
+    TlsTcpWriteReturn,
+    /// One TCP read poll that returned ciphertext entered.
+    TlsTcpReadEntry,
+    /// One TCP read poll that returned ciphertext finished.
+    TlsTcpReadReturn,
     /// WebSocket message read.
     WsMessage,
     /// Open read by the server loop.
@@ -303,6 +325,13 @@ impl Batch {
         Some(key)
     }
 
+    /// One call owns this write batch in the serial TLS benchmark. Stamp the
+    /// batch's record work once, even if it carried both the item and end.
+    #[cfg(feature = "tls")]
+    pub(crate) fn stamp_seals(&self, clock: &Clock) {
+        clock.stamp_tls(self.keys.first().copied().filter(|key| self.keys.iter().all(|other| key.0 == other.0)), tls::RecordOp::Seal);
+    }
+
     /// Stamp every frame taken since the last flush at `stage`, each at the
     /// time `at` says, and forget them.
     pub fn flushed(&mut self, mut at: impl FnMut(Stage) -> Option<Instant>, stages: &[Stage]) {
@@ -317,6 +346,11 @@ impl Batch {
     }
 }
 
+#[cfg(feature = "tls")]
+mod tls;
+#[cfg(feature = "tls")]
+pub(crate) use tls::{TlsIo, tracing_provider};
+
 #[cfg(feature = "tokio")]
 pub use socket::{Clock, Socket};
 
@@ -325,6 +359,8 @@ mod socket {
     use std::io;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    #[cfg(feature = "tls")]
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::task::{Context, Poll};
     use std::time::Instant;
 
@@ -332,28 +368,92 @@ mod socket {
     use tokio::net::TcpStream;
 
     use crate::lock;
+    #[cfg(feature = "tls")]
+    use super::{Key, Stage, stamp_at, tls::RecordOp};
 
     /// When a socket last read, and wrote since it was last asked.
     #[derive(Default)]
-    pub struct Clock(Mutex<Times>);
+    pub struct Clock {
+        times: Mutex<Times>,
+        #[cfg(feature = "tls")]
+        tls: AtomicBool,
+    }
 
     #[derive(Default)]
     struct Times {
         read: Option<(Instant, Instant)>,
         write_entered: Option<Instant>,
         write_returned: Option<Instant>,
+        #[cfg(feature = "tls")]
+        sealed: Vec<(Instant, Instant)>,
+        #[cfg(feature = "tls")]
+        opened: Vec<(Instant, Instant)>,
+        #[cfg(feature = "tls")]
+        writes: Vec<(Instant, Instant)>,
+        #[cfg(feature = "tls")]
+        reads: Vec<(Instant, Instant)>,
     }
 
     impl Clock {
         /// When the last read that got bytes was entered, and returned.
         pub fn read(&self) -> Option<(Instant, Instant)> {
-            lock(&self.0).read
+            lock(&self.times).read
+        }
+
+        #[cfg(feature = "tls")]
+        pub(crate) fn stamp_opens(&self, key: Option<Key>) {
+            self.stamp_tls(key, RecordOp::Open);
+        }
+
+        #[cfg(feature = "tls")]
+        pub(super) fn stamp_tls(&self, key: Option<Key>, op: RecordOp) {
+            if !self.tracing_tls() {
+                return;
+            }
+            let mut times = lock(&self.times);
+            fn stamp(key: Option<Key>, entries: &mut Vec<(Instant, Instant)>, began: Stage, ended: Stage) {
+                for (start, end) in entries.drain(..) {
+                    if let Some(key) = key {
+                        stamp_at(key, began, start);
+                        stamp_at(key, ended, end);
+                    }
+                }
+            }
+            match op {
+                RecordOp::Seal => {
+                    stamp(key, &mut times.sealed, Stage::TlsSealEntry, Stage::TlsSealReturn);
+                    stamp(key, &mut times.writes, Stage::TlsTcpWriteEntry, Stage::TlsTcpWriteReturn);
+                }
+                RecordOp::Open => {
+                    stamp(key, &mut times.opened, Stage::TlsOpenEntry, Stage::TlsOpenReturn);
+                    stamp(key, &mut times.reads, Stage::TlsTcpReadEntry, Stage::TlsTcpReadReturn);
+                }
+            }
+        }
+
+        #[cfg(feature = "tls")]
+        pub(super) fn mark_tls(&self) {
+            self.tls.store(true, Ordering::Relaxed);
+        }
+
+        #[cfg(feature = "tls")]
+        fn tracing_tls(&self) -> bool {
+            self.tls.load(Ordering::Relaxed)
+        }
+
+        #[cfg(feature = "tls")]
+        pub(super) fn record(&self, op: RecordOp, times: (Instant, Instant)) {
+            let mut clock = lock(&self.times);
+            match op {
+                RecordOp::Seal => clock.sealed.push(times),
+                RecordOp::Open => clock.opened.push(times),
+            }
         }
 
         /// When the first write since the last ask was entered, and the
         /// last returned; forgotten once asked.
         pub fn written(&self) -> (Option<Instant>, Option<Instant>) {
-            let mut t = lock(&self.0);
+            let mut t = lock(&self.times);
             (t.write_entered.take(), t.write_returned.take())
         }
     }
@@ -373,10 +473,19 @@ mod socket {
 
     impl AsyncRead for Socket {
         fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            if !super::on() {
+                return Pin::new(&mut self.stream).poll_read(cx, buf);
+            }
             let (entered, before) = (Instant::now(), buf.filled().len());
             let polled = Pin::new(&mut self.stream).poll_read(cx, buf);
             if matches!(polled, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-                lock(&self.clock.0).read = Some((entered, Instant::now()));
+                let span = (entered, Instant::now());
+                let mut times = lock(&self.clock.times);
+                times.read = Some(span);
+                #[cfg(feature = "tls")]
+                if self.clock.tracing_tls() {
+                    times.reads.push(span);
+                }
             }
             polled
         }
@@ -384,12 +493,20 @@ mod socket {
 
     impl AsyncWrite for Socket {
         fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+            if !super::on() {
+                return Pin::new(&mut self.stream).poll_write(cx, buf);
+            }
             let entered = Instant::now();
             let polled = Pin::new(&mut self.stream).poll_write(cx, buf);
             if matches!(polled, Poll::Ready(Ok(n)) if n > 0) {
-                let mut t = lock(&self.clock.0);
+                let mut t = lock(&self.clock.times);
+                let returned = Instant::now();
                 t.write_entered.get_or_insert(entered);
-                t.write_returned = Some(Instant::now());
+                t.write_returned = Some(returned);
+                #[cfg(feature = "tls")]
+                if self.clock.tracing_tls() {
+                    t.writes.push((entered, returned));
+                }
             }
             polled
         }
