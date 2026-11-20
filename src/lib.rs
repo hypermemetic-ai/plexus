@@ -15,9 +15,8 @@
 //! With the `store` feature an activation keeps its state in its own SQLite
 //! database, a `Store`.
 //!
-//! Some signature types are shapes only: nothing fills a [`Caller`], feeds
-//! an [`Input`] or listens to a [`Progress`] yet. `#[activation(describe)]`
-//! reads them out of a signature into the IR.
+//! Native methods can take a [`Caller`] supplied by the connection.
+//! `#[activation(describe)]` can also describe [`Input`] and [`Progress`].
 //!
 //! ```
 //! use plexus::{Connection, Server, pair, raw};
@@ -48,6 +47,8 @@ macro_rules! stamp {
 }
 
 mod channel;
+#[cfg(feature = "tokio")]
+mod listener;
 mod connection;
 mod context;
 mod remote;
@@ -123,7 +124,9 @@ pub trait Serve: Send + Sized + 'static {
 /// closes, or with `--ws ADDR` on a WebSocket, every connection sharing the
 /// one activation (the address bound is printed on stdout, one line:
 /// `ws://127.0.0.1:PORT/`). With `--data DIR` (feature `store`) every
-/// `Store` keeps its file in DIR.
+/// `Store` keeps its file in DIR. With the `tls` feature, use
+/// `--wss ADDR --key-file PATH --allow-key PRINCIPAL` for mutual TLS.
+/// Repeat `--allow-key` for each permitted peer.
 ///
 /// ```no_run
 /// # mod kiln { #[plexus::activation] pub mod kiln { #[derive(Default)] pub struct Kiln; impl Kiln { pub fn get(&self) -> u32 { 6 } } } }
@@ -133,34 +136,12 @@ pub trait Serve: Send + Sized + 'static {
 /// ```
 #[cfg(feature = "tokio")]
 pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
-    const USAGE: &str = "usage: [--ws ADDR] [--data DIR]   (no --ws: stdin and stdout)";
-    let mut ws = None;
-    let mut args = std::env::args().skip(1);
-    while let Some(flag) = args.next() {
-        let value = args.next().ok_or_else(|| Error::new(ErrorKind::InvalidInput, USAGE))?;
-        match flag.as_str() {
-            "--ws" => ws = Some(value.parse::<std::net::SocketAddr>().map_err(|e| Error::new(ErrorKind::InvalidInput, e))?),
-            #[cfg(feature = "store")]
-            "--data" => store::set_data(value.into()),
-            _ => return Err(Error::new(ErrorKind::InvalidInput, USAGE)),
-        }
-    }
+    let listener = listener::Listener::from_args(std::env::args().skip(1))?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let _entered = runtime.enter();
     let mut server = Server::new();
     activation.serve(&mut server, A::NAME);
-    let server = std::sync::Arc::new(server);
-    runtime.block_on(async move {
-        match ws {
-            None => server.serve(stdio::stdio()).await,
-            Some(addr) => {
-                let bound = ws::spawn(addr, server).await?;
-                println!("ws://{bound}/");
-                std::future::pending().await
-            }
-        }
-    })
+    runtime.block_on(listener.serve(std::sync::Arc::new(server)))
 }
 
 /// What the code `#[activation]` writes names. Not for hand-written code.
@@ -266,6 +247,14 @@ pub trait Activation: Send + Sync + 'static {
     /// Pass a call on: `method` is named below where it is held (`recipes`,
     /// `_ir`, `shelf.get`).
     fn pass(&self, method: &str, params: Option<Raw>) -> Passed;
+
+    /// Pass a call with a key group on the mounted activation's segment.
+    /// `keys` is the parsed wire group's original spelling, including the
+    /// brackets. The child decides whether those keys open its context.
+    fn pass_keyed(&self, _keys: &str, _method: &str, _params: Option<Raw>) -> Result<Passed, Failure> {
+        Err(server::failure("invalid-context", "the mounted activation does not accept context keys at its place"))
+    }
+
     /// Every place it serves, with its hash, named under `at`, where it is
     /// held: what `_tree` lists for it.
     fn tree(&self, at: &str) -> futures::future::BoxFuture<'static, Result<Vec<Place>, Failure>>;

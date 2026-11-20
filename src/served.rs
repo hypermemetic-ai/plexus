@@ -242,18 +242,41 @@ impl<A: Send + 'static> Local<A> {
         F: FnOnce(Rc<A>, P) -> Fut + Send + 'static,
         Fut: Future<Output = Result<Raw, Failure>> + 'static,
     {
+        self.submit(args, run)
+    }
+
+    /// Check an inbound call on the activation's thread before dispatching it
+    /// to a descendant.
+    #[doc(hidden)]
+    pub fn validate<F>(&self, call: CallContext, run: F) -> BoxFuture<'static, Result<(), Failure>>
+    where
+        F: FnOnce(Rc<A>, CallContext) -> Result<(), Failure> + Send + 'static,
+    {
+        self.submit(Ok(call), move |activation, call| async move { run(activation, call) })
+    }
+
+    fn submit<P, F, Fut, T>(&self, args: Result<P, Failure>, run: F) -> BoxFuture<'static, Result<T, Failure>>
+    where
+        P: Send + 'static,
+        F: FnOnce(Rc<A>, P) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, Failure>> + 'static,
+        T: Send + 'static,
+    {
         let args = match args {
             Ok(args) => args,
             Err(f) => return future::ready(Err(f)).boxed(),
         };
         let (answer, answered) = oneshot::channel();
         let job: Job<A> = Box::new(move |a| {
+            if answer.is_canceled() {
+                return future::ready(()).boxed_local();
+            }
             let made = caught(run(a.clone(), args)).map(|r| r.and_then(|r| r));
             async move {
                 let mut answer = answer;
-                let got = match future::select(std::pin::pin!(made), answer.cancellation()).await {
-                    Either::Left((got, _)) => got,
-                    Either::Right(_) => return,
+                let got = match future::select(answer.cancellation(), std::pin::pin!(made)).await {
+                    Either::Left(_) => return,
+                    Either::Right((got, _)) => got,
                 };
                 stamp!(crate::trace::current(), MethodDone);
                 let _ = answer.send(got);

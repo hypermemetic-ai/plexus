@@ -36,6 +36,10 @@ impl Activation for Remote {
         self.conn.pass(&format!("{}.{method}", self.at), params)
     }
 
+    fn pass_keyed(&self, keys: &str, method: &str, params: Option<Raw>) -> Result<Passed, Failure> {
+        Ok(self.conn.pass(&format!("{}{keys}.{method}", self.at), params))
+    }
+
     fn tree(&self, at: &str) -> BoxFuture<'static, Result<Vec<Place>, Failure>> {
         let (call, far, at) = (self.conn.call("_tree", ()), self.at.clone(), at.to_owned());
         async move {
@@ -91,11 +95,25 @@ mod spawned {
         /// Hold the activation served at `at` on the WebSocket at `url`. The
         /// connection runs on a thread of its own, as [`child`](Remote::child)'s.
         pub fn ws(url: &str, at: &str) -> io::Result<Remote> {
-            let (runtime, url) = (runtime()?, url.to_owned());
+            let url = url.to_owned();
+            Self::socket(at, async move { crate::ws::connect(&url).await })
+        }
+
+        /// Hold a remote over one mutually authenticated TLS connection. The dialer
+        /// supplies this service's identity and the pin the remote must prove.
+        /// Calls through this handle use that service identity for the whole hop.
+        #[cfg(feature = "tls")]
+        pub fn wss(url: &str, at: &str, dial: crate::tls::Dial) -> io::Result<Remote> {
+            let url = url.to_owned();
+            Self::socket(at, async move { dial.connect(&url).await.map(|(channel, _)| channel) })
+        }
+
+        fn socket(at: &str, connect: impl Future<Output = io::Result<crate::Channel>> + Send + 'static) -> io::Result<Remote> {
+            let runtime = runtime()?;
             let (tell, told) = std::sync::mpsc::channel();
             std::thread::Builder::new().name("plexus-remote".into()).spawn(move || {
                 runtime.block_on(async move {
-                    let channel = match crate::ws::connect(&url).await {
+                    let channel = match connect.await {
                         Ok(channel) => channel,
                         Err(e) => return drop(tell.send(Err(e))),
                     };

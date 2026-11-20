@@ -84,27 +84,30 @@ fn invalid(message: &str) -> Failure {
     failure("invalid-context", message)
 }
 
-/// Split a keyed call into its canonical name and the segment that supplies
-/// its keys. A period inside brackets belongs to the key value.
-pub(crate) fn keyed_path(mut rest: &str) -> Result<(String, usize, ContextKeys), Failure> {
-    let mut name = String::new();
-    let mut keyed = None;
-    let mut index = 0;
+pub(crate) struct KeyedPath<'a> {
+    pub(crate) name: String,
+    pub(crate) groups: HashMap<usize, ContextKeys>,
+    pub(crate) segments: Vec<&'a str>,
+}
+
+/// Split the segments and their key groups. Periods inside brackets belong
+/// to the values. Keep the original segments for forwarding to a child.
+pub(crate) fn keyed_path(mut rest: &str) -> Result<KeyedPath<'_>, Failure> {
+    let mut path = KeyedPath { name: String::new(), groups: HashMap::new(), segments: Vec::new() };
     loop {
+        let original = rest;
+        let index = path.segments.len();
         let end = rest.find(['.', '[']).unwrap_or(rest.len());
         let segment = &rest[..end];
         if !valid_name(segment) {
             return Err(invalid("invalid name in keyed method path"));
         }
         if index > 0 {
-            name.push('.');
+            path.name.push('.');
         }
-        name.push_str(segment);
+        path.name.push_str(segment);
         rest = &rest[end..];
         if let Some(keys) = rest.strip_prefix('[') {
-            if keyed.is_some() {
-                return Err(invalid("only the activation's segment accepts context keys"));
-            }
             let (keys, after) = keys.split_once(']').ok_or_else(|| invalid("missing `]` in keyed method path"))?;
             let mut values = HashMap::new();
             for key in keys.split(',') {
@@ -116,18 +119,17 @@ pub(crate) fn keyed_path(mut rest: &str) -> Result<(String, usize, ContextKeys),
                     return Err(invalid(&format!("duplicate context key `{key}`")));
                 }
             }
-            keyed = Some((index, ContextKeys(values)));
+            path.groups.insert(index, ContextKeys(values));
             rest = after;
         }
+        path.segments.push(&original[..original.len() - rest.len()]);
         if rest.is_empty() {
-            let (index, keys) = keyed.ok_or_else(|| invalid("invalid keyed method path"))?;
-            return Ok((name, index, keys));
+            return Ok(path);
         }
         rest = rest.strip_prefix('.').ok_or_else(|| invalid("expected `.` after context keys"))?;
-        index += 1;
     }
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }

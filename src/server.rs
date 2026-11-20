@@ -15,11 +15,12 @@ use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Open, Raw};
 use serde::Serialize;
 
 use crate::channel::{Channel, Out, pump};
-use crate::context::keyed_path;
+use crate::context::{keyed_path, valid_name};
 use crate::{Activation, CallContext, Caller, ContextKeys, Place, lock};
 
 type One = Arc<dyn Fn(Raw, CallContext) -> BoxFuture<'static, Result<Raw, Failure>> + Send + Sync>;
 type Many = Arc<dyn Fn(Raw, CallContext) -> BoxStream<'static, Result<Raw, Failure>> + Send + Sync>;
+type Validate = Box<dyn Fn(CallContext) -> BoxFuture<'static, Result<(), Failure>> + Send + Sync>;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) type Pacing = Arc<dyn Fn(Raw, CallContext) -> Box<dyn Paced> + Send + Sync>;
 
@@ -45,13 +46,14 @@ impl Paced for crate::Passed {
 #[derive(Clone)]
 enum Handler {
     One(One),
+    Reflect(One),
     Many(Many),
     /// Paced by the credit granted to it: an activation's stream.
     #[cfg(not(target_arch = "wasm32"))]
     Paced(Pacing),
     /// A call under a child held across a channel: the child, and the
-    /// method's name below it.
-    Pass(Arc<dyn Activation>, String),
+    /// method's name below it, with the key group at its place if present.
+    Pass(Arc<dyn Activation>, String, Option<String>),
 }
 
 /// Which segment of the canonical route accepts keys and what it expects.
@@ -59,6 +61,11 @@ enum Handler {
 struct Gate {
     segment: usize,
     keys: &'static [&'static str],
+}
+
+struct DescendantGate {
+    keys: &'static [&'static str],
+    validate: Validate,
 }
 
 /// A place in `_tree`: described here, or a child mounted here, whose
@@ -74,6 +81,7 @@ enum Entry {
 #[derive(Default)]
 pub struct Server {
     methods: HashMap<String, (Handler, Option<Gate>)>,
+    descendant_gates: HashMap<String, DescendantGate>,
     /// Every place described or mounted, in order, for `_tree`.
     places: Vec<Entry>,
     interface: Option<String>,
@@ -140,8 +148,22 @@ impl Server {
 
     fn gated(&mut self, name: &str, at: &str, keys: &'static [&'static str], handler: Handler) {
         assert!(name.strip_prefix(at).is_some_and(|rest| rest.starts_with('.')));
-        let segment = at.bytes().filter(|&b| b == b'.').count();
-        self.methods.insert(name.to_owned(), (handler, Some(Gate { segment, keys })));
+        self.methods.insert(name.to_owned(), (handler, Some(Gate { segment: segment(at), keys })));
+    }
+
+    /// Require the activation to admit calls under its place before dispatch.
+    /// Its own contextual methods open it as part of their invocation.
+    #[doc(hidden)]
+    pub fn guard_descendants<F, A>(&mut self, at: &str, keys: &'static [&'static str], run: F)
+    where
+        F: Fn(CallContext) -> A + Send + Sync + 'static,
+        A: Future<Output = Result<(), Failure>> + Send + 'static,
+    {
+        let previous = self.descendant_gates.insert(at.to_owned(), DescendantGate {
+            keys,
+            validate: Box::new(move |call| run(call).boxed()),
+        });
+        assert!(previous.is_none(), "a descendant guard is already registered at {at}");
     }
 
     /// Say what is served at `at`: `<at>._ir` answers `ir` and `<at>._hash`
@@ -155,8 +177,10 @@ impl Server {
         let hash = raw(&said).expect("a string is JSON");
         let ir = Raw::parse(ir).map_err(serde::de::Error::custom)?;
         self.places.push(Entry::Described(Place { place: at.to_owned(), hash: Some(said) }));
-        self.method(&format!("{at}._ir"), move |_| std::future::ready(Ok(ir.clone())));
-        self.method(&format!("{at}._hash"), move |_| std::future::ready(Ok(hash.clone())));
+        for (suffix, value) in [("_ir", ir), ("_hash", hash)] {
+            let reflect = Handler::Reflect(Arc::new(move |_, _| future::ready(Ok(value.clone())).boxed()));
+            self.methods.insert(format!("{at}.{suffix}"), (reflect, None));
+        }
         Ok(())
     }
 
@@ -168,39 +192,78 @@ impl Server {
         self.places.push(Entry::Mounted(at.to_owned(), Arc::from(child)));
     }
 
-    fn find(&self, name: &str) -> Result<(Handler, ContextKeys), Failure> {
-        let not_found = || failure("not-found", &format!("no method {name}"));
-        if name.contains(['[', ']']) {
-            let (canonical, segment, keys) = keyed_path(name)?;
-            let (handler, gate) = self.methods.get(&canonical).ok_or_else(not_found)?;
-            let gate = gate.ok_or_else(not_found)?;
-            if gate.segment != segment {
+    async fn find(&self, address: &str, caller: &Option<Caller>) -> Result<(Handler, ContextKeys), Failure> {
+        let not_found = || failure("not-found", &format!("no method {address}"));
+        if address == "_tree" {
+            let places = self.places.clone();
+            return Ok((Handler::One(Arc::new(move |_, _| tree(places.clone()).boxed())), ContextKeys::default()));
+        }
+        let mut keyed = address.contains(['[', ']']).then(|| keyed_path(address)).transpose()?;
+        let mut groups = keyed.as_mut().map(|path| std::mem::take(&mut path.groups)).unwrap_or_default();
+        let name = keyed.as_ref().map_or(address, |path| path.name.as_str());
+        let (mut handler, leaf, mounted) = if let Some((own, gate)) = self.methods.get(name) {
+            (own.clone(), *gate, None)
+        } else {
+            let (at, rest, child) = self.mounted(name).ok_or_else(not_found)?;
+            (Handler::Pass(child.clone(), rest.to_owned(), None), None, Some(at))
+        };
+        let reflection = matches!(handler, Handler::Reflect(_))
+            || mounted.is_some() && name.rsplit_once('.').is_some_and(|(_, suffix)| {
+                matches!(suffix, "_ir" | "_hash") && name.split('.').all(valid_name)
+            });
+        if reflection && keyed.is_none() {
+            return Ok((handler, ContextKeys::default()));
+        }
+        let mut checks = Vec::new();
+        if !self.descendant_gates.is_empty() {
+            for (segment, (end, _)) in name.match_indices('.').enumerate() {
+                // The method's own gate is part of its invocation.
+                if leaf.is_some_and(|leaf| leaf.segment == segment) {
+                    continue;
+                }
+                if let Some(guard) = self.descendant_gates.get(&name[..end]) {
+                    let keys = groups.remove(&segment).unwrap_or_default();
+                    keys.check(guard.keys)?;
+                    checks.push((&guard.validate, keys));
+                }
+            }
+        }
+        let keys = if let Some(leaf) = leaf {
+            let keys = groups.remove(&leaf.segment).unwrap_or_default();
+            keys.check(leaf.keys)?;
+            keys
+        } else {
+            ContextKeys::default()
+        };
+        if !groups.is_empty() {
+            let mount = mounted.map(segment);
+            if !mount.is_some_and(|mount| groups.keys().all(|&index| index >= mount)) {
                 return Err(failure("invalid-context", "context keys belong on the activation's segment"));
             }
-            keys.check(gate.keys)?;
-            return Ok((handler.clone(), keys));
-        }
-        let keys = ContextKeys::default();
-        if name == "_tree" {
-            let places = self.places.clone();
-            return Ok((Handler::One(Arc::new(move |_, _| tree(places.clone()).boxed())), keys));
-        }
-        if let Some((own, gate)) = self.methods.get(name) {
-            if let Some(gate) = gate {
-                keys.check(gate.keys)?;
+            if let (Handler::Pass(_, method, keys), Some(path), Some(mount)) = (&mut handler, keyed, mount) {
+                *method = path.segments[mount + 1..].join(".");
+                if groups.contains_key(&mount) {
+                    let mounted = path.segments[mount];
+                    let start = mounted.find('[').expect("a parsed key group starts with '['");
+                    *keys = Some(mounted[start..].to_owned());
+                }
             }
-            return Ok((own.clone(), keys));
         }
+        for (validate, keys) in checks {
+            caught(async { validate(CallContext::new(caller.clone(), keys)).await }).await??;
+        }
+        Ok((handler, keys))
+    }
+
+    fn mounted<'a, 'b>(&'a self, name: &'b str) -> Option<(&'a str, &'b str, &'a Arc<dyn Activation>)> {
         // The child mounted deepest that the name is under.
         self.places
             .iter()
             .filter_map(|e| match e {
-                Entry::Mounted(at, child) => Some((at.len(), name.strip_prefix(at.as_str())?.strip_prefix('.')?, child)),
+                Entry::Mounted(at, child) => Some((at.as_str(), name.strip_prefix(at.as_str())?.strip_prefix('.')?, child)),
                 Entry::Described(_) => None,
             })
-            .max_by_key(|(len, ..)| *len)
-            .map(|(_, rest, child)| (Handler::Pass(child.clone(), rest.to_owned()), keys))
-            .ok_or_else(not_found)
+            .max_by_key(|(at, ..)| at.len())
     }
 
     /// Serve one channel until it closes. Every call runs at once with the
@@ -273,6 +336,10 @@ impl Server {
     }
 }
 
+fn segment(at: &str) -> usize {
+    at.bytes().filter(|&b| b == b'.').count()
+}
+
 /// How many items a stream writes before it steps aside.
 const RUN: u32 = 256;
 
@@ -340,9 +407,9 @@ async fn run(
     let send = |kind: Kind, body: &[u8]| sent.send(&send, kind, body);
     let given = open.params;
     let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
-    let ended: Result<(), Failure> = match server.find(&open.method) {
+    let ended: Result<(), Failure> = match server.find(&open.method, &caller).await {
         Err(f) => Err(f),
-        Ok((Handler::One(f), keys)) => match caught(f(params, CallContext::new(caller, keys))).await.and_then(|answer| answer) {
+        Ok((Handler::One(f) | Handler::Reflect(f), keys)) => match caught(f(params, CallContext::new(caller, keys))).await.and_then(|answer| answer) {
             Ok(answer) => {
                 send(Kind::Item, answer.get().as_bytes());
                 Ok(())
@@ -373,11 +440,18 @@ async fn run(
                 }
             }
         }
-        Ok((Handler::Pass(child, rest), _)) => {
+        Ok((Handler::Pass(child, rest, mount_keys), _)) => {
             // The open carried credit for one item; the open passed on
             // carries it on.
             take(&credit).await;
-            paced(&credit, child.pass(&rest, given), send).await
+            let passed = match mount_keys {
+                Some(keys) => child.pass_keyed(&keys, &rest, given),
+                None => Ok(child.pass(&rest, given)),
+            };
+            match passed {
+                Ok(items) => paced(&credit, items, send).await,
+                Err(f) => Err(f),
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
         Ok((Handler::Paced(f), keys)) => paced(&credit, f(params, CallContext::new(caller, keys)), send).await,
