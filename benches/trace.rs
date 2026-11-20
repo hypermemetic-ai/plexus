@@ -1,5 +1,7 @@
 //! trace › A call's time stage by stage. `cargo bench --features tokio,trace --bench trace`
 //!
+//! Add the TLS feature to also trace serial unary calls through TLS 1.3.
+//!
 //! A call and a stream of 64-byte items, to a method registered by hand and
 //! to one served by `#[plexus::activation]`, in memory (a pair) and over a
 //! loopback WebSocket; server and caller in one process, so one clock times
@@ -12,6 +14,10 @@
 //! measured from outside with tracing on and off, and the sequence as a
 //! mermaid `sequenceDiagram`. With `PLEXUS_TRACE_JSON=FILE` every figure is
 //! appended to FILE as a JSON line.
+
+#[cfg(feature = "tls")]
+#[path = "trace/wss.rs"]
+mod wss;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -518,7 +524,7 @@ async fn stream(conn: &Connection) -> f64 {
 }
 
 /// Run every way on `runtime`, the caller in a task of its own.
-fn run(runtime: tokio::runtime::Runtime, name: &'static str) -> Vec<Measured> {
+fn run(runtime: &tokio::runtime::Runtime, name: &'static str) -> Vec<Measured> {
     let measured = runtime.spawn(async move {
         let mut out = Vec::new();
         for (kind, is_served) in [("hand", false), ("served", true)] {
@@ -610,17 +616,27 @@ fn main() {
     println!("\nA stamp costs {stamp:.1} ns, of which reading the clock is {clock:.1} ns. Stage times below include the stamps made inside them; none is subtracted.");
 
     let mut all = Vec::new();
+    #[cfg(feature = "tls")]
+    let mut tls = Vec::new();
     for (name, runtime) in [
         ("multi", tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()),
         ("one-thread", tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()),
     ] {
         println!("\n## {}", if name == "multi" { "a runtime of 4 workers" } else { "a one-thread runtime" });
         let load_now = load();
-        for m in run(runtime, name) {
+        for m in run(&runtime, name) {
             m.print(stamp);
             m.print_work(stamp);
             m.mermaid();
             all.push((m, load_now));
+        }
+        #[cfg(feature = "tls")]
+        {
+            let task = runtime.spawn(wss::run(name));
+            for m in runtime.block_on(task).unwrap() {
+                m.print();
+                tls.push((m, load_now));
+            }
         }
     }
     println!("\nthreads stamped on: {}", trace::threads().join(", "));
@@ -628,6 +644,10 @@ fn main() {
     if let Ok(path) = std::env::var("PLEXUS_TRACE_JSON") {
         let mut out = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
         for (m, load) in &all {
+            m.json(&mut out, &commit, *load);
+        }
+        #[cfg(feature = "tls")]
+        for (m, load) in &tls {
             m.json(&mut out, &commit, *load);
         }
         println!("figures appended to {path}");

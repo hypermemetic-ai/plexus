@@ -22,7 +22,7 @@ use futures::{Sink, Stream};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tungstenite::client::IntoClientRequest;
-use tungstenite::handshake::{HandshakeError, HandshakeRole};
+use tungstenite::handshake::{HandshakeError, HandshakeRole, client::Request};
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::protocol::frame::coding::{Control, Data, OpCode};
 use tungstenite::protocol::frame::{Frame, FrameHeader};
@@ -54,6 +54,13 @@ pub async fn connect(url: &str) -> io::Result<Channel> {
     stream.set_nodelay(true)?;
     #[cfg(feature = "trace")]
     let (stream, clock) = crate::trace::Socket::new(stream);
+    client_over(stream, request, #[cfg(feature = "trace")] clock).await
+}
+
+/// The caller's WebSocket handshake over an established transport.
+pub(crate) async fn client_over<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S, request: Request, #[cfg(feature = "trace")] clock: Arc<crate::trace::Clock>,
+) -> io::Result<Channel> {
     let wakers = Arc::new(Wakers::default());
     let started = tungstenite::client::client_with_config(request, Io::new(stream, wakers.clone()), Some(config()));
     let (socket, _) = handshake(&wakers, started).await?;
@@ -65,6 +72,13 @@ pub async fn accept(stream: TcpStream) -> io::Result<Channel> {
     stream.set_nodelay(true)?;
     #[cfg(feature = "trace")]
     let (stream, clock) = crate::trace::Socket::new(stream);
+    server_over(stream, #[cfg(feature = "trace")] clock).await
+}
+
+/// The server's WebSocket handshake over an established transport.
+pub(crate) async fn server_over<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S, #[cfg(feature = "trace")] clock: Arc<crate::trace::Clock>,
+) -> io::Result<Channel> {
     let wakers = Arc::new(Wakers::default());
     let started = tungstenite::accept_with_config(Io::new(stream, wakers.clone()), Some(config()));
     let socket = handshake(&wakers, started).await?;
@@ -634,6 +648,8 @@ mod traced {
                     trace::stamp_at(key, Stage::WsReadEntry, entered);
                     trace::stamp_at(key, Stage::WsReadReturn, returned);
                 }
+                #[cfg(feature = "tls")]
+                read.stamp_opens(Some(key));
                 trace::stamp(key, Stage::WsMessage);
             }
         });
@@ -665,6 +681,8 @@ mod traced {
             let flushed = self.send.as_mut().poll_flush(cx);
             if flushed.is_ready() {
                 let (entered, returned) = self.clock.written();
+                #[cfg(feature = "tls")]
+                self.batch.stamp_seals(&self.clock);
                 self.batch.flushed(|stage| if stage == Stage::WsWrite { entered } else { returned }, &[Stage::WsWrite, Stage::WsWritten]);
             }
             flushed

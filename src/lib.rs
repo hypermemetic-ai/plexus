@@ -57,6 +57,8 @@ mod server;
 pub mod stdio;
 #[cfg(feature = "store")]
 pub mod store;
+#[cfg(feature = "tls")]
+pub mod tls;
 #[cfg(feature = "trace")]
 #[doc(hidden)]
 pub mod trace;
