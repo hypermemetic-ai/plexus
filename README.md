@@ -35,7 +35,28 @@ tokio::spawn(driving);
 let readings = connection.stream("studio.kiln.heat", params)?;
 ```
 
-On the server, `Listen::new(&server_identity, allowed_callers)?.accept(tcp).await?` returns the channel and the verified caller principal. The application can inspect the principal before passing the channel to `Server::serve`.
+On the server, `Listen::new(&server_identity, allowed_callers)?.accept(tcp).await?` returns the channel and the verified caller principal. To retain that identity for the application, pass the channel and its authenticated caller to `Server::serve_as`. `Listen::spawn` does this automatically.
+
+## Holding a child over pinned TLS
+
+A native activation built with the `tls` feature can listen through its ordinary `plexus::main` entry point:
+
+```sh
+kiln --wss 127.0.0.1:0 --key-file kiln.key --allow-key "$STUDIO_PRINCIPAL"
+```
+
+The process prints the bound `wss://` URL. Each `--allow-key` names a public principal. On Studio's side, open the connection once at startup and mount the kiln:
+
+```rust
+let studio_key = plexus::tls::Identity::from_key_file(studio_key_path)?;
+let dial = plexus::tls::Dial::new(&studio_key, kiln_principal)?;
+let kiln = plexus::Remote::wss(kiln_url, "kiln", dial)?;
+server.mount("studio.kiln", Box::new(kiln));
+```
+
+`Remote::wss` waits for authentication before returning and drives the shared connection on its own thread. A contextual Studio checks `studio[tenant=acme].kiln.heat` before it invokes a local child or forwards the request. A local child can read the direct caller; the remote reads Studio's service principal. The existing stream credit and cancellation travel across the mount.
+
+The wire reserves `_hash` and `_ir` for interface discovery at each activation. The canonical `studio.kiln._hash` describes the public interface. A client binding at `studio[tenant=acme].kiln` can use `studio[tenant=acme].kiln._hash`, which runs Studio's opening check. Named keys for separate local openings belong on their individual path segments.
 
 ## Callers and context in native activations
 
