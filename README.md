@@ -77,6 +77,22 @@ Implement `FromCaller<Studio>` on the application's `User` to look up the verifi
 
 The two-client example in `tests/caller_context.rs` exercises a streaming guestbook, app-owned user lookup, typed path keys and membership changes on a live connection. Run `cargo test --locked --features tls --test caller_context`. Caller propagation across remote hops and browser sign-in require their own authentication contracts.
 
+## Streaming input
+
+A native activation can accept `Input<T>` while its call runs. It implements
+`Stream<Item = Result<T, Failure>>`. Read with `input.next().await` or
+`input.try_next().await`. Finish reading before committing a stored upload.
+Admission and parameter checks run before input credit is issued.
+
+`Connection::call_with_input(method, params, source)` returns a single
+receipt. `stream_with_input` streams results and input independently.
+At the raw connection boundary, a source yields `Result<Raw, Failure>`.
+Encode each item using its ordinary IR value representation. The source
+can produce at most `WINDOW` items ahead of the callee, including through
+held remotes. Dropping an unfinished call cancels both ends. The input EOF
+leaves the result direction open. Run `cargo test --test input` for the
+native call, cancellation, disconnection, and forwarding cases.
+
 Part of Plexus, built from scratch (tracker: LAYERS-9). Its sibling crates are expected beside it: `../<crate>`.
 
 MIT.

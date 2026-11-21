@@ -49,13 +49,21 @@ impl ContextKeys {
 /// Connection identity and validated path keys for one local invocation.
 #[doc(hidden)]
 pub struct CallContext {
+    pub(crate) input: Option<crate::RawInput>,
     caller: Option<Caller>,
     keys: ContextKeys,
 }
 
 impl CallContext {
     pub(crate) fn new(caller: Option<Caller>, keys: ContextKeys) -> Self {
-        Self { caller, keys }
+        Self { caller, keys, input: None }
+    }
+
+    /// Take the streamed input of this call. Polling it grants the first
+    /// credit, so a refused call never starts pulling its caller's source.
+    pub fn take_input<T: 'static>(&mut self, decode: impl Fn(crate::Raw) -> Result<T, Failure> + Send + 'static) -> Result<crate::Input<T>, Failure> {
+        self.input.take().map(|input| crate::Input::receive(input, decode))
+            .ok_or_else(|| failure("invalid-params", "this method requires an input stream"))
     }
 
     pub fn caller(&self) -> Option<&Caller> {
