@@ -15,6 +15,7 @@ use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Open, Raw};
 use serde::Serialize;
 
 use crate::channel::{Channel, Out, pump};
+use crate::input::InputItem;
 use crate::context::{keyed_path, valid_name};
 use crate::{Activation, CallContext, Caller, ContextKeys, Place, lock};
 
@@ -301,10 +302,20 @@ impl Server {
 
     fn serve_bound(self: &Arc<Self>, channel: Channel, caller: Option<Caller>) -> impl Future<Output = io::Result<()>> + Send + 'static {
         let server = self.clone();
-        let Channel { send, mut receive } = channel;
+        let Channel { send, mut receive, binary_input } = channel;
+        // Keep an output-only leaf's hello byte-for-byte stable. A mount
+        // learns its child's method capability when that call grants credit.
+        let binary_input = binary_input && self.interface.is_some() && (
+            self.methods.values().any(|method| method.input)
+            || self.places.iter().any(|entry| matches!(entry, Entry::Mounted(..)))
+        );
         let (out, frames) = crate::channel::out();
         if let Some(interface) = &self.interface {
-            out.send(|buf| Frame::hello(interface, false).encode_into(Numbering::Counted, buf));
+            let mut hello = Frame::hello(interface, false);
+            if let Body::Hello(hello) = &mut hello.body {
+                hello.binary_input = binary_input;
+            }
+            out.send(|buf| hello.encode_into(Numbering::Counted, buf));
         }
         let (start, started) = mpsc::unbounded::<BoxFuture<'static, ()>>();
         let calls: Arc<Mutex<HashMap<u32, Running>>> = Arc::default();
@@ -312,7 +323,16 @@ impl Server {
             while let Some(bytes) = receive.next().await {
                 #[cfg(feature = "trace")]
                 let read = crate::trace::now();
-                let frame = Frame::decode(&bytes?).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let bytes = bytes?;
+                if bytes.first() == Some(&plexus_proto::binary_input::TAG) {
+                    if !binary_input {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "binary input was not advertised"));
+                    }
+                    let (id, seq, payload) = plexus_proto::binary_input::read(bytes)?;
+                    receive_input(&calls, &out, id, |input| input.item(InputItem::Bytes(payload), Some(seq)));
+                    continue;
+                }
+                let frame = Frame::decode(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 let id = frame.call.0;
                 match frame.body {
                     Body::Open(open) => {
@@ -337,22 +357,8 @@ impl Server {
                             call.credit.grant(n);
                         }
                     }
-                    Body::Item(_) | Body::End(_) => {
-                        let mut calls = lock(&calls);
-                        if let Some(running) = calls.get_mut(&id) {
-                            match (&mut running.input, frame.body) {
-                                (Some(input), Body::Item(raw)) => input.item(raw),
-                                (Some(input), Body::End(end)) => input.end(end),
-                                (None, _) => {
-                                    running.abort.abort();
-                                    calls.remove(&id);
-                                    out.send(|buf| Frame::failed(frame.call, "invalid-params", "call was opened without input")
-                                        .encode_into(Numbering::Counted, buf));
-                                }
-                                _ => unreachable!(),
-                            }
-                        }
-                    }
+                    Body::Item(raw) => receive_input(&calls, &out, frame.call, |input| input.item(InputItem::Json(raw), None)),
+                    Body::End(end) => receive_input(&calls, &out, frame.call, |input| input.end(end)),
                     // Dropped at once: the method's future and stream with it.
                     Body::Cancel => {
                         if let Some(call) = lock(&calls).remove(&id) {
@@ -385,6 +391,23 @@ fn segment(at: &str) -> usize {
 
 /// How many items a stream writes before it steps aside.
 const RUN: u32 = 256;
+
+fn receive_input(
+    calls: &Mutex<HashMap<u32, Running>>, out: &Out, id: CallId,
+    receive: impl FnOnce(&mut crate::input::Ingress),
+) {
+    let mut calls = lock(calls);
+    if let Some(running) = calls.get_mut(&id.0) {
+        if let Some(input) = &mut running.input {
+            receive(input);
+        } else {
+            running.abort.abort();
+            calls.remove(&id.0);
+            out.send(|buf| Frame::failed(id, "invalid-params", "call was opened without input")
+                .encode_into(Numbering::Counted, buf));
+        }
+    }
+}
 
 struct Running {
     input: Option<crate::input::Ingress>,

@@ -299,7 +299,7 @@ fn channel<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(mut ws: WebSocket
     let (read, wakers) = (ws.get_mut().handshaken(), ws.get_ref().wakers.clone());
     let socket = Arc::new(Mutex::new(Socket { ws, server, closed: false }));
     let send = Writer { socket: socket.clone(), wakers: wakers.clone(), held: Vec::new(), closing: false };
-    Channel::new(send, Reader { socket, wakers, server, buf: read, fragments: None, read: VecDeque::new(), held: 0, failed: None, close: None, ended: false })
+    Channel::new(send, Reader { socket, wakers, server, buf: read, fragments: None, read: VecDeque::new(), held: 0, failed: None, close: None, ended: false }).with_binary_input()
 }
 
 /// The reading half: every frame waiting is read in one turn, under one
@@ -458,7 +458,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Reader<S> {
                     utf8(&payload, &mut checked, last)?;
                 }
                 if last {
-                    self.hand_on(payload);
+                    self.hand_on(payload, text)?;
                 } else {
                     self.fragments = Some(Fragments { bytes: BytesMut::from(&payload[..]), text, checked });
                 }
@@ -472,8 +472,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Reader<S> {
                     utf8(&fragments.bytes, &mut fragments.checked, last)?;
                 }
                 if last {
-                    let message = self.fragments.take().expect("fragments").bytes.freeze();
-                    self.hand_on(message);
+                    let fragments = self.fragments.take().expect("fragments");
+                    self.hand_on(fragments.bytes.freeze(), fragments.text)?;
                 }
             }
             (Data::Reserved(_), _) => return Err(refused(PROTOCOL, "a data frame of no known kind")),
@@ -482,9 +482,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Reader<S> {
         Ok(())
     }
 
-    fn hand_on(&mut self, message: Bytes) {
+    fn hand_on(&mut self, message: Bytes, text: bool) -> io::Result<()> {
+        if text && message.first() == Some(&plexus_proto::binary_input::TAG) {
+            return Err(refused(PROTOCOL, "binary input requires a WebSocket binary message"));
+        }
         self.held += message.len();
         self.read.push_back(message);
+        Ok(())
     }
 }
 
@@ -577,9 +581,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Writer<S> {
                 return Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "the WebSocket is closed")));
             }
             for frame in self.held.drain(..) {
-                // Written as it is, with no check: the runtime wrote it as
-                // UTF-8, and the reader checks it.
-                socket.queue(OpCode::Data(Data::Text), frame)?;
+                let kind = if frame.first() == Some(&plexus_proto::binary_input::TAG) { Data::Binary } else { Data::Text };
+                socket.queue(OpCode::Data(kind), frame)?;
             }
         }
         if close && !socket.closed {
@@ -636,7 +639,7 @@ mod traced {
     use crate::trace::{self, Batch, Clock, Frames, Stage};
 
     pub fn channel(channel: Channel, clock: Arc<Clock>) -> Channel {
-        let Channel { send, receive } = channel;
+        let Channel { send, receive, binary_input } = channel;
         let read = clock.clone();
         let mut frames = Frames::default();
         let receive = receive.inspect(move |frame| {
@@ -653,7 +656,7 @@ mod traced {
                 trace::stamp(key, Stage::WsMessage);
             }
         });
-        Channel::new(Written { send, clock, batch: Batch::default() }, receive)
+        Channel { send: Box::pin(Written { send, clock, batch: Batch::default() }), receive: Box::pin(receive), binary_input }
     }
 
     /// The sending half: a frame's write to the socket is stamped once the

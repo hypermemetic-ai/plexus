@@ -17,6 +17,9 @@ use crate::lock;
 /// and a frame received may be a slice of the buffer it was read into:
 /// neither end copies a frame to make it its own.
 pub struct Channel {
+    /// This transport preserves binary frames. A sender also requires an
+    /// explicit capability from the receiving peer before using them.
+    pub binary_input: bool,
     pub send: Pin<Box<dyn Sink<Bytes, Error = io::Error> + Send>>,
     pub receive: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>,
 }
@@ -26,7 +29,13 @@ impl Channel {
         send: impl Sink<Bytes, Error = io::Error> + Send + 'static,
         receive: impl Stream<Item = io::Result<Bytes>> + Send + 'static,
     ) -> Channel {
-        Channel { send: Box::pin(send), receive: Box::pin(receive) }
+        Channel { send: Box::pin(send), receive: Box::pin(receive), binary_input: false }
+    }
+
+    /// Opt a frame-preserving transport into the binary input extension.
+    pub fn with_binary_input(mut self) -> Self {
+        self.binary_input = true;
+        self
     }
 }
 
@@ -178,7 +187,7 @@ pub(crate) async fn pump(mut send: Pin<Box<dyn Sink<Bytes, Error = io::Error> + 
 
 fn end(send: mpsc::UnboundedSender<Vec<Bytes>>, receive: mpsc::UnboundedReceiver<Vec<Bytes>>) -> Channel {
     let send = Held { send, held: Vec::new() };
-    Channel::new(send, receive.flat_map(futures::stream::iter).map(Ok))
+    Channel::new(send, receive.flat_map(futures::stream::iter).map(Ok)).with_binary_input()
 }
 
 /// A pair's sending end: frames are held until a flush and go over
