@@ -62,7 +62,16 @@ impl CallContext {
     /// Take the streamed input of this call. Polling it grants the first
     /// credit, so a refused call never starts pulling its caller's source.
     pub fn take_input<T: 'static>(&mut self, decode: impl Fn(crate::Raw) -> Result<T, Failure> + Send + 'static) -> Result<crate::Input<T>, Failure> {
-        self.input.take().map(|input| crate::Input::receive(input, decode))
+        self.receive(false, move |item| decode(item.json()?))
+    }
+
+    /// Raw binary chunks on capable peers, base64 JSON on text-only peers.
+    pub fn take_byte_input(&mut self) -> Result<crate::Input<crate::Bytes>, Failure> {
+        self.receive(true, crate::input::InputItem::bytes)
+    }
+
+    fn receive<T: 'static>(&mut self, bytes: bool, decode: impl Fn(crate::input::InputItem) -> Result<T, Failure> + Send + 'static) -> Result<crate::Input<T>, Failure> {
+        self.input.take().map(|input| crate::Input::receive(input, bytes, decode))
             .ok_or_else(|| failure("invalid-params", "this method requires an input stream"))
     }
 

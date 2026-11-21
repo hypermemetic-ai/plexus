@@ -5,7 +5,7 @@ use std::fmt;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::channel::{Channel, Out, pump};
 use crate::lock;
-use crate::input::{Source, Upload};
+use crate::input::{InputItem, Source, Upload};
 use crate::server::Credit;
 
 /// How many items a stream's caller says it will take before it has taken
@@ -113,7 +113,7 @@ struct Queue {
 /// once a run, not once an item. Dropped — the call ended, was dropped, or
 /// the channel closed — it hands in what it holds and closes the inbox.
 struct Slot {
-    upload: Option<(Arc<Credit>, AbortHandle)>,
+    upload: Option<Sending>,
     inbox: Arc<Inbox>,
     run: Vec<Event>,
     /// A `call`: its first item is credit for one, as the open was, and
@@ -125,6 +125,15 @@ struct Slot {
     /// Its call, and how many items it has handed in.
     #[cfg(feature = "trace")]
     traced: (u32, u32),
+}
+
+/// Only a byte acknowledgement received before the first positive credit
+/// describes this call. A later progress frame cannot change its type.
+struct Sending {
+    credit: Arc<Credit>,
+    byte_ack: Arc<AtomicBool>,
+    granted: bool,
+    abort: AbortHandle,
 }
 
 impl Slot {
@@ -179,12 +188,14 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
-        if let Some((_, abort)) = &self.upload { abort.abort(); }
+        if let Some(upload) = &self.upload { upload.abort.abort(); }
         self.hand_in(true);
     }
 }
 
 struct Shared {
+    /// Latest peer capability on a binary-preserving channel.
+    binary_input: Arc<AtomicBool>,
     uploads: mpsc::UnboundedSender<BoxFuture<'static, ()>>,
     out: Out,
     /// Closed once the channel has.
@@ -209,6 +220,7 @@ impl Connection {
         let (tell, told) = mpsc::unbounded();
         let (uploads, uploading) = mpsc::unbounded();
         let shared = Arc::new(Shared {
+            binary_input: Arc::new(AtomicBool::new(false)),
             out,
             tell,
             uploads,
@@ -216,8 +228,8 @@ impl Connection {
             expects: expects.map(str::to_owned),
             hello: hello.shared(),
         });
-        let Channel { send, receive } = channel;
-        let drive = drive(receive, pump(send, frames), Arc::downgrade(&shared), told, said);
+        let Channel { send, receive, binary_input } = channel;
+        let drive = drive(receive, pump(send, frames), Arc::downgrade(&shared), told, said, binary_input);
         let drive = async move {
             let sending_input = async {
                 uploading.for_each_concurrent(None, |job| job).await;
@@ -256,7 +268,15 @@ impl Connection {
         &self, method: &str, params: impl Serialize,
         input: impl Stream<Item = Result<Raw, Failure>> + Send + 'static,
     ) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
-        self.call_from(method, params, Some(Source::Local(input.boxed())))
+        self.call_from(method, params, Some(Source::Local(input.map(|v| v.map(InputItem::Json)).boxed())))
+    }
+
+    /// Upload byte chunks in the representation supported by this hop.
+    pub fn call_with_byte_input(
+        &self, method: &str, params: impl Serialize,
+        input: impl Stream<Item = Result<bytes::Bytes, Failure>> + Send + 'static,
+    ) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
+        self.call_from(method, params, Some(Source::Local(input.map(|v| v.map(InputItem::Bytes)).boxed())))
     }
 
     fn call_from(&self, method: &str, params: impl Serialize, input: Option<Source>) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
@@ -309,7 +329,15 @@ impl Connection {
         &self, method: &str, params: impl Serialize,
         input: impl Stream<Item = Result<Raw, Failure>> + Send + 'static,
     ) -> Result<Items, Error> {
-        self.stream_from(method, params, Some(Source::Local(input.boxed())))
+        self.stream_from(method, params, Some(Source::Local(input.map(|v| v.map(InputItem::Json)).boxed())))
+    }
+
+    /// Independently stream byte chunks in and result items out.
+    pub fn stream_with_byte_input(
+        &self, method: &str, params: impl Serialize,
+        input: impl Stream<Item = Result<bytes::Bytes, Failure>> + Send + 'static,
+    ) -> Result<Items, Error> {
+        self.stream_from(method, params, Some(Source::Local(input.map(|v| v.map(InputItem::Bytes)).boxed())))
     }
 
     fn stream_from(&self, method: &str, params: impl Serialize, input: Option<Source>) -> Result<Items, Error> {
@@ -347,15 +375,27 @@ impl Connection {
         let stop_input = if let Some(source) = input {
             let credit = Arc::new(Credit::new(0));
             let (abort, registration) = AbortHandle::new_pair();
-            slot.upload = Some((credit.clone(), abort.clone()));
+            let byte_ack = Arc::new(AtomicBool::new(false));
+            slot.upload = Some(Sending { credit: credit.clone(), byte_ack: byte_ack.clone(), granted: false, abort: abort.clone() });
             let mut upload = Upload::new(source, credit);
             let out = self.shared.out.clone();
             let input_inbox = inbox.clone();
             let tell = self.shared.tell.clone();
+            let binary = self.shared.binary_input.clone();
+            let mut ordinal = 0u64;
             let pump = future::poll_fn(move |cx| {
-                let ended = upload.pump(cx, |body| {
-                    let error = match &body { Body::End(Err(f)) => Some(f.clone()), _ => None };
-                    out.send(|buf| Frame { call: CallId(id), seq: 0, body }.encode_into(Numbering::Counted, buf));
+                let ended = upload.pump(cx, &byte_ack, |next| {
+                    let end = match next {
+                        Ok(Some(item)) => {
+                            ordinal += 1;
+                            out.send(|buf| item.write(buf, CallId(id), ordinal, binary.load(Ordering::Acquire) && byte_ack.load(Ordering::Acquire)));
+                            return;
+                        }
+                        Ok(None) => Ok(()),
+                        Err(f) => Err(f),
+                    };
+                    let error = end.as_ref().err().cloned();
+                    out.send(|buf| Frame { call: CallId(id), seq: 0, body: Body::End(end) }.encode_into(Numbering::Counted, buf));
                     if let Some(f) = error {
                         // A local producer failure owns this outcome even if
                         // a peer returns a receipt for the partial upload.
@@ -465,6 +505,7 @@ async fn drive(
     shared: Weak<Shared>,
     mut told: mpsc::UnboundedReceiver<Told>,
     said: oneshot::Sender<String>,
+    binary_channel: bool,
 ) -> io::Result<()> {
     let mut said = Some(said);
     let mut calls = Calls::default();
@@ -533,13 +574,23 @@ async fn drive(
                 }
                 match received.into_frame().map_err(bad)?.body {
                     Body::Hello(hello) => {
+                        if let Some(shared) = shared.upgrade() {
+                            shared.binary_input.store(binary_channel && hello.binary_input, Ordering::Release);
+                        }
                         if let Some(said) = said.take() {
                             let _ = said.send(hello.interface);
                         }
                     }
+                    Body::Progress(body) => {
+                        if let Some(upload) = calls.get(&call.0).and_then(|slot| slot.upload.as_ref())
+                            && !upload.granted && crate::input::is_byte_ack(&body) {
+                            upload.byte_ack.store(true, Ordering::Release);
+                        }
+                    }
                     Body::Credit(n) => {
-                        if let Some((credit, _)) = calls.get(&call.0).and_then(|slot| slot.upload.as_ref()) {
-                            credit.grant(n);
+                        if let Some(upload) = calls.get_mut(&call.0).and_then(|slot| slot.upload.as_mut()) {
+                            upload.granted |= n != 0;
+                            upload.credit.grant(n);
                         }
                     }
                     Body::End(end) => deliver(&mut calls, &mut waiting, &mut young, call, Event::End(end)),
