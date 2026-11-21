@@ -63,6 +63,12 @@ struct Gate {
     keys: &'static [&'static str],
 }
 
+struct Method {
+    handler: Handler,
+    gate: Option<Gate>,
+    input: bool,
+}
+
 struct DescendantGate {
     keys: &'static [&'static str],
     validate: Validate,
@@ -80,7 +86,7 @@ enum Entry {
 /// [`serve`](Server::serve).
 #[derive(Default)]
 pub struct Server {
-    methods: HashMap<String, (Handler, Option<Gate>)>,
+    methods: HashMap<String, Method>,
     descendant_gates: HashMap<String, DescendantGate>,
     /// Every place described or mounted, in order, for `_tree`.
     places: Vec<Entry>,
@@ -95,6 +101,16 @@ impl Server {
     /// The interface hash said at hello, the first frame of every connection.
     pub fn hello(&mut self, interface: &str) {
         self.interface = Some(interface.to_owned());
+    }
+
+    /// Declare that a registered method requires a caller input stream.
+    #[doc(hidden)]
+    pub fn accepts_input(&mut self, name: &str) {
+        self.methods.get_mut(name).expect("register the method before marking its input").input = true;
+    }
+
+    fn register(&mut self, name: &str, handler: Handler, gate: Option<Gate>) {
+        self.methods.insert(name.to_owned(), Method { handler, gate, input: false });
     }
 
     /// A method with one answer. Its parameters arrive as JSON (`{}` when
@@ -114,7 +130,7 @@ impl Server {
         F: Fn(Raw, CallContext) -> A + Send + Sync + 'static,
         A: Future<Output = Result<Raw, Failure>> + Send + 'static,
     {
-        self.methods.insert(name.to_owned(), (Handler::One(Arc::new(move |p, call| run(p, call).boxed())), None));
+        self.register(name, Handler::One(Arc::new(move |p, call| run(p, call).boxed())), None);
     }
 
     /// A local unary method that takes keys on the activation's segment.
@@ -133,12 +149,12 @@ impl Server {
         F: Fn(Raw) -> S + Send + Sync + 'static,
         S: futures::Stream<Item = Result<Raw, Failure>> + Send + 'static,
     {
-        self.methods.insert(name.to_owned(), (Handler::Many(Arc::new(move |p, _| run(p).boxed())), None));
+        self.register(name, Handler::Many(Arc::new(move |p, _| run(p).boxed())), None);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn paced(&mut self, name: &str, run: Pacing) {
-        self.methods.insert(name.to_owned(), (Handler::Paced(run), None));
+        self.register(name, Handler::Paced(run), None);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -148,7 +164,7 @@ impl Server {
 
     fn gated(&mut self, name: &str, at: &str, keys: &'static [&'static str], handler: Handler) {
         assert!(name.strip_prefix(at).is_some_and(|rest| rest.starts_with('.')));
-        self.methods.insert(name.to_owned(), (handler, Some(Gate { segment: segment(at), keys })));
+        self.register(name, handler, Some(Gate { segment: segment(at), keys }));
     }
 
     /// Require the activation to admit calls under its place before dispatch.
@@ -179,7 +195,7 @@ impl Server {
         self.places.push(Entry::Described(Place { place: at.to_owned(), hash: Some(said) }));
         for (suffix, value) in [("_ir", ir), ("_hash", hash)] {
             let reflect = Handler::Reflect(Arc::new(move |_, _| future::ready(Ok(value.clone())).boxed()));
-            self.methods.insert(format!("{at}.{suffix}"), (reflect, None));
+            self.register(&format!("{at}.{suffix}"), reflect, None);
         }
         Ok(())
     }
@@ -192,17 +208,22 @@ impl Server {
         self.places.push(Entry::Mounted(at.to_owned(), Arc::from(child)));
     }
 
-    async fn find(&self, address: &str, caller: &Option<Caller>) -> Result<(Handler, ContextKeys), Failure> {
+    async fn find(&self, address: &str, caller: &Option<Caller>, input: bool) -> Result<(Handler, ContextKeys), Failure> {
         let not_found = || failure("not-found", &format!("no method {address}"));
         if address == "_tree" {
+            if input { return Err(failure("invalid-params", "_tree takes no input stream")); }
             let places = self.places.clone();
             return Ok((Handler::One(Arc::new(move |_, _| tree(places.clone()).boxed())), ContextKeys::default()));
         }
         let mut keyed = address.contains(['[', ']']).then(|| keyed_path(address)).transpose()?;
         let mut groups = keyed.as_mut().map(|path| std::mem::take(&mut path.groups)).unwrap_or_default();
         let name = keyed.as_ref().map_or(address, |path| path.name.as_str());
-        let (mut handler, leaf, mounted) = if let Some((own, gate)) = self.methods.get(name) {
-            (own.clone(), *gate, None)
+        let (mut handler, leaf, mounted) = if let Some(method) = self.methods.get(name) {
+            if input != method.input {
+                let why = if input { "this method takes no input stream" } else { "this method requires an input stream" };
+                return Err(failure("invalid-params", why));
+            }
+            (method.handler.clone(), method.gate, None)
         } else {
             let (at, rest, child) = self.mounted(name).ok_or_else(not_found)?;
             (Handler::Pass(child.clone(), rest.to_owned(), None), None, Some(at))
@@ -297,17 +318,39 @@ impl Server {
                     Body::Open(open) => {
                         #[cfg(feature = "trace")]
                         crate::trace::stamp_at((id, 0), crate::trace::Stage::Read, read);
-                        let credit = Arc::new(Credit { left: AtomicU32::new(1), wake: AtomicWaker::new() });
+                        let credit = Arc::new(Credit::new(1));
+                        let (ingress, input) = if open.input {
+                            let (ingress, input) = crate::input::incoming(out.clone(), frame.call);
+                            (Some(ingress), Some(input))
+                        } else { (None, None) };
                         let (abort, registration) = AbortHandle::new_pair();
-                        lock(&calls).insert(id, Running { credit: credit.clone(), abort });
-                        let ran = run(server.clone(), id, open, caller.clone(), out.clone(), credit, calls.clone());
+                        if lock(&calls).insert(id, Running { credit: credit.clone(), abort, input: ingress }).is_some() {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate open call id"));
+                        }
+                        let invocation = Invocation { id, open, caller: caller.clone(), input };
+                        let ran = run(server.clone(), invocation, out.clone(), credit, calls.clone());
                         let _ = start.unbounded_send(Abortable::new(ran, registration).map(|_| ()).boxed());
                         stamp!((id, 0), Started);
                     }
                     Body::Credit(n) => {
                         if let Some(call) = lock(&calls).get(&id) {
-                            let _ = call.credit.left.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| Some(left.saturating_add(n)));
-                            call.credit.wake.wake();
+                            call.credit.grant(n);
+                        }
+                    }
+                    Body::Item(_) | Body::End(_) => {
+                        let mut calls = lock(&calls);
+                        if let Some(running) = calls.get_mut(&id) {
+                            match (&mut running.input, frame.body) {
+                                (Some(input), Body::Item(raw)) => input.item(raw),
+                                (Some(input), Body::End(end)) => input.end(end),
+                                (None, _) => {
+                                    running.abort.abort();
+                                    calls.remove(&id);
+                                    out.send(|buf| Frame::failed(frame.call, "invalid-params", "call was opened without input")
+                                        .encode_into(Numbering::Counted, buf));
+                                }
+                                _ => unreachable!(),
+                            }
                         }
                     }
                     // Dropped at once: the method's future and stream with it.
@@ -344,21 +387,31 @@ fn segment(at: &str) -> usize {
 const RUN: u32 = 256;
 
 struct Running {
+    input: Option<crate::input::Ingress>,
     credit: Arc<Credit>,
     abort: AbortHandle,
 }
 
 /// How many items a stream may still write, and who waits to write one.
 /// Atomic, so an item takes its credit with no lock.
-struct Credit {
+pub(crate) struct Credit {
     left: AtomicU32,
     wake: AtomicWaker,
 }
 
 impl Credit {
+    pub(crate) fn new(left: u32) -> Self {
+        Self { left: AtomicU32::new(left), wake: AtomicWaker::new() }
+    }
+
+    pub(crate) fn grant(&self, n: u32) {
+        let _ = self.left.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| Some(left.saturating_add(n)));
+        self.wake.wake();
+    }
+
     /// Up to `most` of the credit there is, or `Pending` with the waker kept
     /// if there is none.
-    fn poll_take(&self, cx: &mut Context<'_>, most: u32) -> Poll<u32> {
+    pub(crate) fn poll_take(&self, cx: &mut Context<'_>, most: u32) -> Poll<u32> {
         let take = || self.left.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| (left > 0).then(|| left - left.min(most)));
         if let Ok(left) = take() {
             return Poll::Ready(left.min(most));
@@ -386,18 +439,26 @@ async fn run_all(mut started: mpsc::UnboundedReceiver<BoxFuture<'static, ()>>) {
     }
 }
 
-async fn run(
-    server: Arc<Server>,
+struct Invocation {
     id: u32,
     open: Open,
     caller: Option<Caller>,
+    input: Option<crate::RawInput>,
+}
+
+async fn run(
+    server: Arc<Server>,
+    invocation: Invocation,
     out: Out,
     credit: Arc<Credit>,
     calls: Arc<Mutex<HashMap<u32, Running>>>,
 ) {
+    let Invocation { id, open, caller, input } = invocation;
     stamp!(enter (id, 0), Running);
     let call = CallId(id);
+    let input_state = input.as_ref().map(|input| input.state());
     let send = |kind: Kind, body: &[u8]| {
+        if kind == Kind::Item && input_state.as_ref().is_some_and(|s| s.error().is_some()) { return; }
         out.send(|buf| plexus_proto::write(buf, call, kind, 0, body, Numbering::Counted));
     };
     // Each frame of the call stamped as the server has it and queues it.
@@ -407,54 +468,70 @@ async fn run(
     let send = |kind: Kind, body: &[u8]| sent.send(&send, kind, body);
     let given = open.params;
     let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
-    let ended: Result<(), Failure> = match server.find(&open.method, &caller).await {
-        Err(f) => Err(f),
-        Ok((Handler::One(f) | Handler::Reflect(f), keys)) => match caught(f(params, CallContext::new(caller, keys))).await.and_then(|answer| answer) {
-            Ok(answer) => {
-                send(Kind::Item, answer.get().as_bytes());
-                Ok(())
-            }
-            Err(f) => Err(f),
-        },
-        Ok((Handler::Many(f), keys)) => {
-            let mut items = f(params, CallContext::new(caller, keys));
-            let mut run = 0;
-            #[cfg(feature = "trace")]
-            let mut n = 0;
-            loop {
-                // Step aside now and then, so what is made is written as it
-                // is made, not a window's worth at a time.
-                run += 1;
-                if run == RUN {
-                    run = 0;
-                    crate::yield_now().await;
+    let dispatch = async {
+        let (handler, keys) = server.find(&open.method, &caller, open.input).await?;
+        let mut context = CallContext::new(caller, keys);
+        context.input = input;
+        match handler {
+            Handler::One(f) | Handler::Reflect(f) => match caught(f(params, context)).await.and_then(|answer| answer) {
+                Ok(answer) => {
+                    send(Kind::Item, answer.get().as_bytes());
+                    Ok(())
                 }
-                // Wait for credit before asking for the next item, so the
-                // method runs no further ahead than the caller allowed.
-                take(&credit).await;
-                stamp!(enter { n += 1; (id, n) }, Asked);
-                match caught(items.next()).await {
-                    Ok(Some(Ok(item))) => send(Kind::Item, item.get().as_bytes()),
-                    Ok(Some(Err(f))) | Err(f) => break Err(f),
-                    Ok(None) => break Ok(()),
-                }
-            }
-        }
-        Ok((Handler::Pass(child, rest, mount_keys), _)) => {
-            // The open carried credit for one item; the open passed on
-            // carries it on.
-            take(&credit).await;
-            let passed = match mount_keys {
-                Some(keys) => child.pass_keyed(&keys, &rest, given),
-                None => Ok(child.pass(&rest, given)),
-            };
-            match passed {
-                Ok(items) => paced(&credit, items, send).await,
                 Err(f) => Err(f),
+            },
+            Handler::Many(f) => {
+                let mut items = f(params, context);
+                let mut run = 0;
+                #[cfg(feature = "trace")]
+                let mut n = 0;
+                loop {
+                    // Step aside now and then, so what is made is written as it
+                    // is made, not a window's worth at a time.
+                    run += 1;
+                    if run == RUN {
+                        run = 0;
+                        crate::yield_now().await;
+                    }
+                    // Wait for credit before asking for the next item, so the
+                    // method runs no further ahead than the caller allowed.
+                    take(&credit).await;
+                    stamp!(enter { n += 1; (id, n) }, Asked);
+                    match caught(items.next()).await {
+                        Ok(Some(Ok(item))) => send(Kind::Item, item.get().as_bytes()),
+                        Ok(Some(Err(f))) | Err(f) => break Err(f),
+                        Ok(None) => break Ok(()),
+                    }
+                }
             }
+            Handler::Pass(child, rest, mount_keys) => {
+                // The open carried credit for one item; the open passed on
+                // carries it on.
+                take(&credit).await;
+                let passed = match (context.input, mount_keys) {
+                    (Some(input), keys) => child.pass_with_input(keys.as_deref(), &rest, given, input),
+                    (None, Some(keys)) => child.pass_keyed(&keys, &rest, given),
+                    (None, None) => Ok(child.pass(&rest, given)),
+                };
+                match passed {
+                    Ok(items) => paced(&credit, items, send).await,
+                    Err(f) => Err(f),
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            Handler::Paced(f) => paced(&credit, f(params, context), send).await,
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        Ok((Handler::Paced(f), keys)) => paced(&credit, f(params, CallContext::new(caller, keys)), send).await,
+    };
+    let ended = if let Some(state) = &input_state {
+        futures::pin_mut!(dispatch);
+        let failed = state.failure();
+        futures::pin_mut!(failed);
+        match future::select(failed, dispatch).await {
+            Either::Left((f, _)) => Err(f),
+            Either::Right((result, _)) => state.error().map_or(result, Err),
+        }
+    } else {
+        dispatch.await
     };
     lock(&calls).remove(&id);
     match ended {

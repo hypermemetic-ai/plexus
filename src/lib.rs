@@ -47,6 +47,8 @@ macro_rules! stamp {
 }
 
 mod channel;
+mod input;
+pub use input::{Input, RawInput};
 #[cfg(feature = "tokio")]
 mod listener;
 mod connection;
@@ -148,6 +150,7 @@ pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
 #[doc(hidden)]
 #[cfg(not(target_arch = "wasm32"))]
 pub mod __private {
+    pub use crate::input::decode_input;
     pub use crate::served::{B64, Later, Local, feed, failed, params, stream, fail_stream, stream_with_caller, stream_with_context};
     pub use futures;
     pub use plexus_proto::bytes;
@@ -188,22 +191,6 @@ impl Caller {
     /// The signed-in identity: `key:54a9…`, `user:ada@example.com`.
     pub fn principal(&self) -> &str {
         &self.principal
-    }
-}
-
-/// Items the caller streams in while the call runs. Not a parameter.
-pub struct Input<T>(Box<dyn Iterator<Item = T>>);
-
-impl<T> Input<T> {
-    pub fn from_iter(items: impl IntoIterator<Item = T> + 'static) -> Input<T> {
-        Input(Box::new(items.into_iter()))
-    }
-}
-
-impl<T> Iterator for Input<T> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        self.0.next()
     }
 }
 
@@ -253,6 +240,12 @@ pub trait Activation: Send + Sync + 'static {
     /// brackets. The child decides whether those keys open its context.
     fn pass_keyed(&self, _keys: &str, _method: &str, _params: Option<Raw>) -> Result<Passed, Failure> {
         Err(server::failure("invalid-context", "the mounted activation does not accept context keys at its place"))
+    }
+
+    /// Pass a call carrying an input stream. The mounted activation must
+    /// forward input credit and cancellation to be able to accept it.
+    fn pass_with_input(&self, _keys: Option<&str>, _method: &str, _params: Option<Raw>, _input: RawInput) -> Result<Passed, Failure> {
+        Err(server::failure("invalid-params", "the mounted activation cannot forward input"))
     }
 
     /// Every place it serves, with its hash, named under `at`, where it is

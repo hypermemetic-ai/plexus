@@ -10,13 +10,15 @@ use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
 use futures::channel::{mpsc, oneshot};
-use futures::future::{self, Either, FutureExt};
+use futures::future::{self, AbortHandle, Abortable, BoxFuture, Either, FutureExt};
 use futures::{Stream, StreamExt};
 use plexus_proto::{Body, CallId, Failure, Frame, Kind, Numbering, Raw, Received};
 use serde::Serialize;
 
 use crate::channel::{Channel, Out, pump};
 use crate::lock;
+use crate::input::{Source, Upload};
+use crate::server::Credit;
 
 /// How many items a stream's caller says it will take before it has taken
 /// any (the open carries one of them).
@@ -111,6 +113,7 @@ struct Queue {
 /// once a run, not once an item. Dropped — the call ended, was dropped, or
 /// the channel closed — it hands in what it holds and closes the inbox.
 struct Slot {
+    upload: Option<(Arc<Credit>, AbortHandle)>,
     inbox: Arc<Inbox>,
     run: Vec<Event>,
     /// A `call`: its first item is credit for one, as the open was, and
@@ -129,6 +132,7 @@ impl Slot {
         Slot {
             inbox,
             run: Vec::new(),
+            upload: None,
             window,
             #[cfg(feature = "trace")]
             traced: (0, 0),
@@ -175,11 +179,13 @@ impl Slot {
 
 impl Drop for Slot {
     fn drop(&mut self) {
+        if let Some((_, abort)) = &self.upload { abort.abort(); }
         self.hand_in(true);
     }
 }
 
 struct Shared {
+    uploads: mpsc::UnboundedSender<BoxFuture<'static, ()>>,
     out: Out,
     /// Closed once the channel has.
     tell: mpsc::UnboundedSender<Told>,
@@ -201,15 +207,27 @@ impl Connection {
         let (out, frames) = crate::channel::out();
         let (said, hello) = oneshot::channel();
         let (tell, told) = mpsc::unbounded();
+        let (uploads, uploading) = mpsc::unbounded();
         let shared = Arc::new(Shared {
             out,
             tell,
+            uploads,
             next: AtomicU32::new(1),
             expects: expects.map(str::to_owned),
             hello: hello.shared(),
         });
         let Channel { send, receive } = channel;
         let drive = drive(receive, pump(send, frames), Arc::downgrade(&shared), told, said);
+        let drive = async move {
+            let sending_input = async {
+                uploading.for_each_concurrent(None, |job| job).await;
+                future::pending::<io::Result<()>>().await
+            };
+            futures::pin_mut!(drive, sending_input);
+            match future::select(drive, sending_input).await {
+                Either::Left((r, _)) | Either::Right((r, _)) => r,
+            }
+        };
         (Connection { shared }, drive)
     }
 
@@ -229,9 +247,22 @@ impl Connection {
     /// [`stream`](Connection::stream) does once the first is in, and answers
     /// the last. A call whose end comes with its first item grants nothing.
     pub fn call(&self, method: &str, params: impl Serialize) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
+        self.call_from(method, params, None)
+    }
+
+    /// One answer to a call with streamed input. A producer is polled
+    /// only with input credit; dropping the future cancels both directions.
+    pub fn call_with_input(
+        &self, method: &str, params: impl Serialize,
+        input: impl Stream<Item = Result<Raw, Failure>> + Send + 'static,
+    ) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
+        self.call_from(method, params, Some(Source::Local(input.boxed())))
+    }
+
+    fn call_from(&self, method: &str, params: impl Serialize, input: Option<Source>) -> impl Future<Output = Result<Raw, Error>> + Send + 'static {
         #[cfg(feature = "trace")]
         let called = crate::trace::now();
-        let opened = encode(&params).and_then(|params| self.open(method, params, true));
+        let opened = encode(&params).and_then(|params| self.open(method, params, true, input));
         #[cfg(feature = "trace")]
         if let Ok(call) = &opened {
             crate::trace::stamp_at((call.id, 0), crate::trace::Stage::Called, called);
@@ -270,7 +301,19 @@ impl Connection {
     /// [`WINDOW`] items ahead of the reader and no further. Dropping the
     /// stream before its end cancels the call.
     pub fn stream(&self, method: &str, params: impl Serialize) -> Result<Items, Error> {
-        let call = self.open(method, encode(&params)?, false)?;
+        self.stream_from(method, params, None)
+    }
+
+    /// Stream results while independently streaming the caller's input.
+    pub fn stream_with_input(
+        &self, method: &str, params: impl Serialize,
+        input: impl Stream<Item = Result<Raw, Failure>> + Send + 'static,
+    ) -> Result<Items, Error> {
+        self.stream_from(method, params, Some(Source::Local(input.boxed())))
+    }
+
+    fn stream_from(&self, method: &str, params: impl Serialize, input: Option<Source>) -> Result<Items, Error> {
+        let call = self.open(method, encode(&params)?, false, input)?;
         // The open itself carries credit for one.
         call.grant(WINDOW - 1);
         Ok(Items { call, taken: 0 })
@@ -283,7 +326,11 @@ impl Connection {
     /// caller allows. Dropped before its end, it cancels. With the
     /// connection closed it fails `unavailable`.
     pub fn pass(&self, method: &str, params: Option<Raw>) -> Passed {
-        match self.open(method, params, false) {
+        self.pass_from(method, params, None)
+    }
+
+    pub(crate) fn pass_from(&self, method: &str, params: Option<Raw>, input: Option<Source>) -> Passed {
+        match self.open(method, params, false, input) {
             Ok(call) => Passed(Ok(call)),
             Err(_) => Passed::failed(unavailable()),
         }
@@ -291,13 +338,46 @@ impl Connection {
 
     /// `window`: the driver grants the rest of the window once the first
     /// item is in, unless the end is right behind it ([`Slot::window`]).
-    fn open(&self, method: &str, params: Option<Raw>, window: bool) -> Result<Open, Error> {
+    fn open(&self, method: &str, params: Option<Raw>, window: bool, input: Option<Source>) -> Result<Open, Error> {
         let inbox = Arc::new(Inbox::default());
         let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
         // Told before the open is sent, so before any answer can arrive.
-        self.shared.tell.unbounded_send(Told::Opened(id, Slot::new(inbox.clone(), window))).map_err(|_| Error::Closed)?;
-        let call = Open { id, inbox, taken: VecDeque::new(), shared: self.shared.clone(), done: false };
-        if !self.shared.send(Frame::open(CallId(id), method, params)) {
+        let mut slot = Slot::new(inbox.clone(), window);
+        let with_input = input.is_some();
+        let stop_input = if let Some(source) = input {
+            let credit = Arc::new(Credit::new(0));
+            let (abort, registration) = AbortHandle::new_pair();
+            slot.upload = Some((credit.clone(), abort.clone()));
+            let mut upload = Upload::new(source, credit);
+            let out = self.shared.out.clone();
+            let input_inbox = inbox.clone();
+            let tell = self.shared.tell.clone();
+            let pump = future::poll_fn(move |cx| {
+                let ended = upload.pump(cx, |body| {
+                    let error = match &body { Body::End(Err(f)) => Some(f.clone()), _ => None };
+                    out.send(|buf| Frame { call: CallId(id), seq: 0, body }.encode_into(Numbering::Counted, buf));
+                    if let Some(f) = error {
+                        // A local producer failure owns this outcome even if
+                        // a peer returns a receipt for the partial upload.
+                        let wake = {
+                            let mut queue = lock(&input_inbox.0);
+                            queue.events.push_back(Event::End(Err(f)));
+                            queue.closed = true;
+                            queue.wake.take()
+                        };
+                        let _ = tell.unbounded_send(Told::Gone(id));
+                        if let Some(wake) = wake { wake.wake(); }
+                    }
+                });
+                if ended { Poll::Ready(()) } else { Poll::Pending }
+            });
+            self.shared.uploads.unbounded_send(Abortable::new(pump, registration).map(|_| ()).boxed()).map_err(|_| Error::Closed)?;
+            Some(abort)
+        } else { None };
+        self.shared.tell.unbounded_send(Told::Opened(id, slot)).map_err(|_| Error::Closed)?;
+        let call = Open { id, inbox, taken: VecDeque::new(), shared: self.shared.clone(), done: false, stop_input };
+        let open = plexus_proto::Open { method: method.to_owned(), params, input: with_input };
+        if !self.shared.send(Frame { call: CallId(id), seq: 0, body: Body::Open(open) }) {
             return Err(Error::Closed);
         }
         stamp!((id, 0), OpenQueued);
@@ -457,6 +537,11 @@ async fn drive(
                             let _ = said.send(hello.interface);
                         }
                     }
+                    Body::Credit(n) => {
+                        if let Some((credit, _)) = calls.get(&call.0).and_then(|slot| slot.upload.as_ref()) {
+                            credit.grant(n);
+                        }
+                    }
                     Body::End(end) => deliver(&mut calls, &mut waiting, &mut young, call, Event::End(end)),
                     _ => {}
                 }
@@ -480,6 +565,7 @@ const RUN: u32 = 256;
 
 /// A call that is open. Dropped before its end, it cancels.
 struct Open {
+    stop_input: Option<AbortHandle>,
     id: u32,
     inbox: Arc<Inbox>,
     /// The run last taken from the inbox, not yet read.
@@ -513,6 +599,7 @@ impl Open {
 
 impl Drop for Open {
     fn drop(&mut self) {
+        if let Some(abort) = &self.stop_input { abort.abort(); }
         if self.done {
             return;
         }

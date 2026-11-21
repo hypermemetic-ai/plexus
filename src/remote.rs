@@ -40,6 +40,11 @@ impl Activation for Remote {
         Ok(self.conn.pass(&format!("{}{keys}.{method}", self.at), params))
     }
 
+    fn pass_with_input(&self, keys: Option<&str>, method: &str, params: Option<Raw>, input: crate::RawInput) -> Result<Passed, Failure> {
+        let address = format!("{}{}.{method}", self.at, keys.unwrap_or_default());
+        Ok(self.conn.pass_from(&address, params, Some(crate::input::Source::Forward(input))))
+    }
+
     fn tree(&self, at: &str) -> BoxFuture<'static, Result<Vec<Place>, Failure>> {
         let (call, far, at) = (self.conn.call("_tree", ()), self.at.clone(), at.to_owned());
         async move {
