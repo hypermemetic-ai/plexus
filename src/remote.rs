@@ -17,12 +17,13 @@ use crate::{Activation, Place};
 pub struct Remote {
     conn: Connection,
     at: String,
+    forward_caller: bool,
 }
 
 impl Remote {
     /// The activation at `at` on the far end of `conn`.
     pub fn new(conn: Connection, at: &str) -> Remote {
-        Remote { conn, at: at.to_owned() }
+        Remote { conn, at: at.to_owned(), forward_caller: false }
     }
 
     /// The connection it is reached over.
@@ -33,16 +34,27 @@ impl Remote {
 
 impl Activation for Remote {
     fn pass(&self, method: &str, params: Option<Raw>) -> Passed {
-        self.conn.pass(&format!("{}.{method}", self.at), params)
+        self.pass_call(None, method, params, None, None).unwrap_or_else(Passed::failed)
     }
 
     fn pass_keyed(&self, keys: &str, method: &str, params: Option<Raw>) -> Result<Passed, Failure> {
-        Ok(self.conn.pass(&format!("{}{keys}.{method}", self.at), params))
+        self.pass_call(Some(keys), method, params, None, None)
     }
 
     fn pass_with_input(&self, keys: Option<&str>, method: &str, params: Option<Raw>, input: crate::RawInput) -> Result<Passed, Failure> {
+        self.pass_call(keys, method, params, None, Some(input))
+    }
+
+    fn pass_call(&self, keys: Option<&str>, method: &str, params: Option<Raw>, caller: Option<&crate::Caller>, input: Option<crate::RawInput>) -> Result<Passed, Failure> {
         let address = format!("{}{}.{method}", self.at, keys.unwrap_or_default());
-        Ok(self.conn.pass_from(&address, params, Some(crate::input::Source::Forward(input))))
+        let input = input.map(crate::input::Source::Forward);
+        if !self.forward_caller {
+            return Ok(self.conn.pass_from(&address, params, input));
+        }
+        let caller = crate::require_caller(caller)?;
+        let body = crate::grants::Forwarded { method: address, principal: caller.principal().into(), params };
+        let envelope = Raw::of(&body).map_err(|_| crate::server::failure("internal", "cannot encode the forwarded call"))?;
+        Ok(self.conn.pass_from(crate::grants::FORWARD, Some(envelope), input))
     }
 
     fn tree(&self, at: &str) -> BoxFuture<'static, Result<Vec<Place>, Failure>> {
@@ -111,6 +123,16 @@ mod spawned {
         pub fn wss(url: &str, at: &str, dial: crate::tls::Dial) -> io::Result<Remote> {
             let url = url.to_owned();
             Self::socket(at, async move { dial.connect(&url).await.map(|(channel, _)| channel) })
+        }
+
+        /// As wss, with the incoming authenticated caller asserted on each
+        /// invocation. The receiving server explicitly trusts this service
+        /// for each eligible method. Unsupported peers refuse the call.
+        #[cfg(feature = "tls")]
+        pub fn wss_for_caller(url: &str, at: &str, dial: crate::tls::Dial) -> io::Result<Remote> {
+            let mut remote = Self::wss(url, at, dial)?;
+            remote.forward_caller = true;
+            Ok(remote)
         }
 
         fn socket(at: &str, connect: impl Future<Output = io::Result<crate::Channel>> + Send + 'static) -> io::Result<Remote> {

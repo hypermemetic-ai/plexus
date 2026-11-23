@@ -102,3 +102,22 @@ remote negotiates each hop. Stdio carries base64 JSON. Use
 Part of Plexus, built from scratch (tracker: LAYERS-9). Its sibling crates are expected beside it: `../<crate>`.
 
 MIT.
+
+### Native method grants and a trusted service hop
+
+An activation declaring `roles(viewer = ["audit"], operator = [viewer, "heat"])`
+registers a grant for each method. A native server's `authorize_grants`
+callback receives the effective caller, the activation's canonical IR grant
+(such as `kiln.heat`, independent of its mount point), and the roles that
+include it. This is where the application consults current role assignments.
+A missing policy denies protected calls. Changes apply to subsequent opens.
+Methods on an activation without grants keep their existing behavior.
+
+A pinned `Remote::wss_for_caller` sends an invocation as an open to `_as`
+with `{method,principal,params?}` as its body. Input, credit and cancellation
+use the same call ID. The receiver accepts an assertion only from an
+authenticated peer registered through `trust_forwarder(peer, address)`, for
+that exact local grant-protected method. The ordinary method grant is then
+checked for the asserted principal. `caller.peer()` identifies the direct
+peer. This gives the peer authority to assert users on the configured
+methods. A direct `Remote::wss` continues to use the service identity.
