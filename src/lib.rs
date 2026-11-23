@@ -53,6 +53,7 @@ pub use input::{Input, RawInput};
 mod listener;
 mod connection;
 mod context;
+mod grants;
 mod remote;
 #[cfg(not(target_arch = "wasm32"))]
 mod served;
@@ -138,11 +139,19 @@ pub trait Serve: Send + Sized + 'static {
 /// ```
 #[cfg(feature = "tokio")]
 pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
+    main_with(activation, |_| {})
+}
+
+/// Serve an activation with the standard listeners and application-specific
+/// grant policy installed before the first connection.
+#[cfg(feature = "tokio")]
+pub fn main_with<A: Serve>(activation: A, configure: impl FnOnce(&mut Server)) -> std::io::Result<()> {
     let listener = listener::Listener::from_args(std::env::args().skip(1))?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let _entered = runtime.enter();
     let mut server = Server::new();
     activation.serve(&mut server, A::NAME);
+    configure(&mut server);
     runtime.block_on(listener.serve(std::sync::Arc::new(server)))
 }
 
@@ -182,12 +191,18 @@ pub mod __private {
 #[derive(Debug, Clone)]
 pub struct Caller {
     principal: std::sync::Arc<str>,
+    via: Option<std::sync::Arc<str>>,
 }
 
 impl Caller {
     pub fn new(principal: impl Into<String>) -> Caller {
-        Caller { principal: std::sync::Arc::from(principal.into()) }
+        Caller { principal: std::sync::Arc::from(principal.into()), via: None }
     }
+    /// The authenticated connection peer, including when it vouches for a user.
+    pub fn peer(&self) -> &str {
+        self.via.as_deref().unwrap_or(&self.principal)
+    }
+
     /// The signed-in identity: `key:54a9…`, `user:ada@example.com`.
     pub fn principal(&self) -> &str {
         &self.principal
@@ -246,6 +261,16 @@ pub trait Activation: Send + Sync + 'static {
     /// forward input credit and cancellation to be able to accept it.
     fn pass_with_input(&self, _keys: Option<&str>, _method: &str, _params: Option<Raw>, _input: RawInput) -> Result<Passed, Failure> {
         Err(server::failure("invalid-params", "the mounted activation cannot forward input"))
+    }
+
+    /// Dispatch a mounted call with its opening caller and optional input.
+    /// Existing mounts retain their service-identity behavior.
+    fn pass_call(&self, keys: Option<&str>, method: &str, params: Option<Raw>, _caller: Option<&Caller>, input: Option<RawInput>) -> Result<Passed, Failure> {
+        match (input, keys) {
+            (Some(input), keys) => self.pass_with_input(keys, method, params, input),
+            (None, Some(keys)) => self.pass_keyed(keys, method, params),
+            (None, None) => Ok(self.pass(method, params)),
+        }
     }
 
     /// Every place it serves, with its hash, named under `at`, where it is

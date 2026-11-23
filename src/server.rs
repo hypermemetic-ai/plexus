@@ -68,6 +68,7 @@ struct Method {
     handler: Handler,
     gate: Option<Gate>,
     input: bool,
+    grant: Option<crate::grants::MethodGrant>,
 }
 
 struct DescendantGate {
@@ -89,6 +90,7 @@ enum Entry {
 pub struct Server {
     methods: HashMap<String, Method>,
     descendant_gates: HashMap<String, DescendantGate>,
+    grants: crate::grants::Grants,
     /// Every place described or mounted, in order, for `_tree`.
     places: Vec<Entry>,
     interface: Option<String>,
@@ -97,6 +99,24 @@ pub struct Server {
 impl Server {
     pub fn new() -> Server {
         Server::default()
+    }
+
+    /// Look up current role membership when a declared method grant is checked.
+    /// Receives the effective caller, the IR grant name and eligible role names.
+    /// Without a policy, every method declaring a grant is denied.
+    pub fn authorize_grants(&mut self, check: impl Fn(&Caller, &str, &[&str]) -> bool + Send + Sync + 'static) {
+        self.grants.authorize(check);
+    }
+
+    /// Permit this authenticated service to vouch for a user on one exact
+    /// local, grant-protected method. The user's grant is checked on every open.
+    pub fn trust_forwarder(&mut self, peer: &str, address: &str) {
+        self.grants.trust(peer, address);
+    }
+
+    #[doc(hidden)]
+    pub fn require_grant(&mut self, address: String, grant: &'static str, roles: &'static [&'static str]) {
+        self.methods.get_mut(&address).expect("register the method before its grant").grant = Some((grant, roles));
     }
 
     /// The interface hash said at hello, the first frame of every connection.
@@ -111,7 +131,7 @@ impl Server {
     }
 
     fn register(&mut self, name: &str, handler: Handler, gate: Option<Gate>) {
-        self.methods.insert(name.to_owned(), Method { handler, gate, input: false });
+        self.methods.insert(name.to_owned(), Method { handler, gate, input: false, grant: None });
     }
 
     /// A method with one answer. Its parameters arrive as JSON (`{}` when
@@ -219,15 +239,15 @@ impl Server {
         let mut keyed = address.contains(['[', ']']).then(|| keyed_path(address)).transpose()?;
         let mut groups = keyed.as_mut().map(|path| std::mem::take(&mut path.groups)).unwrap_or_default();
         let name = keyed.as_ref().map_or(address, |path| path.name.as_str());
-        let (mut handler, leaf, mounted) = if let Some(method) = self.methods.get(name) {
+        let (mut handler, leaf, mounted, grant) = if let Some(method) = self.methods.get(name) {
             if input != method.input {
                 let why = if input { "this method takes no input stream" } else { "this method requires an input stream" };
                 return Err(failure("invalid-params", why));
             }
-            (method.handler.clone(), method.gate, None)
+            (method.handler.clone(), method.gate, None, method.grant)
         } else {
             let (at, rest, child) = self.mounted(name).ok_or_else(not_found)?;
-            (Handler::Pass(child.clone(), rest.to_owned(), None), None, Some(at))
+            (Handler::Pass(child.clone(), rest.to_owned(), None), None, Some(at), None)
         };
         let reflection = matches!(handler, Handler::Reflect(_))
             || mounted.is_some() && name.rsplit_once('.').is_some_and(|(_, suffix)| {
@@ -262,7 +282,7 @@ impl Server {
             if !mount.is_some_and(|mount| groups.keys().all(|&index| index >= mount)) {
                 return Err(failure("invalid-context", "context keys belong on the activation's segment"));
             }
-            if let (Handler::Pass(_, method, keys), Some(path), Some(mount)) = (&mut handler, keyed, mount) {
+            if let (Handler::Pass(_, method, keys), Some(path), Some(mount)) = (&mut handler, keyed.as_ref(), mount) {
                 *method = path.segments[mount + 1..].join(".");
                 if groups.contains_key(&mount) {
                     let mounted = path.segments[mount];
@@ -273,6 +293,9 @@ impl Server {
         }
         for (validate, keys) in checks {
             caught(async { validate(CallContext::new(caller.clone(), keys)).await }).await??;
+        }
+        if let Some(method) = grant {
+            self.grants.check(method, caller.as_ref())?;
         }
         Ok((handler, keys))
     }
@@ -489,9 +512,17 @@ async fn run(
     let sent = crate::trace::Sent::new();
     #[cfg(feature = "trace")]
     let send = |kind: Kind, body: &[u8]| sent.send(&send, kind, body);
-    let given = open.params;
-    let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
     let dispatch = async {
+        let (open, caller) = server.grants.resolve(open, caller, |name, trusted, metadata| {
+            match server.methods.get(name) {
+                Some(method) if trusted && method.grant.is_some() => Ok(()),
+                Some(method) if metadata && matches!(method.handler, Handler::Reflect(_)) => Ok(()),
+                None if metadata => Err(failure("not-found", &format!("no method {name}"))),
+                _ => Err(failure("forbidden", "this peer may not forward the caller on this method")),
+            }
+        })?;
+        let given = open.params;
+        let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
         let (handler, keys) = server.find(&open.method, &caller, open.input).await?;
         let mut context = CallContext::new(caller, keys);
         context.input = input;
@@ -531,11 +562,8 @@ async fn run(
                 // The open carried credit for one item; the open passed on
                 // carries it on.
                 take(&credit).await;
-                let passed = match (context.input, mount_keys) {
-                    (Some(input), keys) => child.pass_with_input(keys.as_deref(), &rest, given, input),
-                    (None, Some(keys)) => child.pass_keyed(&keys, &rest, given),
-                    (None, None) => Ok(child.pass(&rest, given)),
-                };
+                let input = context.input.take();
+                let passed = child.pass_call(mount_keys.as_deref(), &rest, given, context.caller(), input);
                 match passed {
                     Ok(items) => paced(&credit, items, send).await,
                     Err(f) => Err(f),
