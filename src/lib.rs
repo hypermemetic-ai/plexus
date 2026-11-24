@@ -125,6 +125,13 @@ pub trait Serve: Send + Sized + 'static {
         G: for<'a> Fn(&'a P) -> &'a Self + Copy + Send + Sync + 'static;
 }
 
+/// Register an activation on an existing server under its declared namespace.
+/// To choose a different mount path, use [`Serve::serve`].
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serve<A: Serve>(activation: A, server: &mut Server) {
+    activation.serve(server, A::NAME);
+}
+
 /// Serve `activation` as this process: over stdin and stdout until stdin
 /// closes, or with `--ws ADDR` on a WebSocket, every connection sharing the
 /// one activation (the address bound is printed on stdout, one line:
@@ -134,9 +141,10 @@ pub trait Serve: Send + Sized + 'static {
 /// Repeat `--allow-key` for each permitted peer.
 ///
 /// ```no_run
-/// # mod kiln { #[plexus::activation] pub mod kiln { #[derive(Default)] pub struct Kiln; impl Kiln { pub fn get(&self) -> u32 { 6 } } } }
+/// # #[plexus::activation] mod kiln { #[derive(Default)] pub struct Kiln; impl Kiln { pub fn get(&self) -> u32 { 6 } } }
+/// use kiln::Kiln;
 /// fn main() -> std::io::Result<()> {
-///     plexus::main(kiln::kiln::Kiln::default())
+///     plexus::main(Kiln::default())
 /// }
 /// ```
 #[cfg(feature = "tokio")]
@@ -152,7 +160,7 @@ pub fn main_with<A: Serve>(activation: A, configure: impl FnOnce(&mut Server)) -
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let _entered = runtime.enter();
     let mut server = Server::new();
-    activation.serve(&mut server, A::NAME);
+    serve(activation, &mut server);
     configure(&mut server);
     runtime.block_on(listener.serve(std::sync::Arc::new(server)))
 }

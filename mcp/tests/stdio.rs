@@ -159,7 +159,7 @@ async fn round_trip() -> Result<(), Box<dyn Error>> {
 async fn main() -> Result<(), Box<dyn Error>> {
     if std::env::args().nth(1).as_deref() == Some("--fixture") {
         let mut server = plexus::Server::new();
-        studio::serve(studio::Studio::default(), &mut server, "studio");
+        plexus::serve(studio::Studio::default(), &mut server);
         // Register a native input method alongside the macro-defined Studio.
         // Canonical IR has the same advertised hash as the server's description.
         let upload = plexus_ir::Ir::read(

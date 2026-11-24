@@ -3,15 +3,15 @@ use std::sync::Arc;
 
 use axum::http::{HeaderValue, header::AUTHORIZATION};
 use axum::{Router, routing::get};
-use kiln::kiln::Kiln;
-use plexus::{Caller, Serve, Server};
+use kiln::Kiln;
+use plexus::{Caller, Server};
 use plexus_layers_mcp::http::{self as mcp, HttpOrigins};
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = Server::new();
-    Kiln::default().serve(&mut server, Kiln::NAME);
+    plexus::serve(Kiln::default(), &mut server);
 
     // Single-operator example. An application can use its session verifier here.
     let token = std::env::var("KILN_MCP_TOKEN")?;
