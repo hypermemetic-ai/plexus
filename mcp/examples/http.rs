@@ -1,17 +1,17 @@
 //! Start a local kiln with an authenticated /mcp endpoint.
 use std::sync::Arc;
 
-use ::kiln::kiln;
 use axum::http::{HeaderValue, header::AUTHORIZATION};
 use axum::{Router, routing::get};
-use plexus::{Caller, Server};
+use kiln::kiln::Kiln;
+use plexus::{Caller, Serve, Server};
 use plexus_layers_mcp::http::{self as mcp, HttpOrigins};
 use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut server = Server::new();
-    kiln::serve(kiln::Kiln::default(), &mut server, "kiln");
+    Kiln::default().serve(&mut server, Kiln::NAME);
 
     // Single-operator example. An application can use its session verifier here.
     let token = std::env::var("KILN_MCP_TOKEN")?;
