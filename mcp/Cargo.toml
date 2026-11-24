@@ -1,0 +1,26 @@
+[package]
+name = "plexus-layers-mcp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Expose native Plexus Layers activations as Model Context Protocol tools"
+
+[dependencies]
+axum = "0.8"
+futures = "0.3"
+plexus = { path = "..", features = ["tls"] }
+plexus-ir = { path = "../../plexus-ir" }
+rmcp = { version = "=3.11.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-std", "net"] }
+
+[dev-dependencies]
+kiln = { path = "../../plexus-examples/kiln" }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+rmcp = { version = "=3.11.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+
+[[test]]
+name = "stdio"
+path = "tests/stdio.rs"
+harness = false
