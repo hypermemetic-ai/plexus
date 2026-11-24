@@ -1,5 +1,7 @@
 //! Native Layers tools over Model Context Protocol. One handler speaks through
 //! exactly one upstream connection, with the caller that connection established.
+mod app;
+pub use app::{Mcp, McpListener};
 mod catalog;
 pub mod http;
 

@@ -46,6 +46,14 @@ macro_rules! stamp {
     ($($t:tt)*) => {};
 }
 
+#[cfg(feature = "tokio")]
+mod application;
+#[cfg(feature = "tokio")]
+pub use application::{Application, MainInput, Registration, main};
+#[cfg(not(target_arch = "wasm32"))]
+mod registry;
+#[cfg(not(target_arch = "wasm32"))]
+pub use registry::Activations;
 mod channel;
 mod input;
 pub use input::{Input, RawInput};
@@ -130,26 +138,6 @@ pub trait Serve: Send + Sized + 'static {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn serve<A: Serve>(activation: A, server: &mut Server) {
     activation.serve(server, A::NAME);
-}
-
-/// Serve `activation` as this process: over stdin and stdout until stdin
-/// closes, or with `--ws ADDR` on a WebSocket, every connection sharing the
-/// one activation (the address bound is printed on stdout, one line:
-/// `ws://127.0.0.1:PORT/`). With `--data DIR` (feature `store`) every
-/// `Store` keeps its file in DIR. With the `tls` feature, use
-/// `--wss ADDR --key-file PATH --allow-key PRINCIPAL` for mutual TLS.
-/// Repeat `--allow-key` for each permitted peer.
-///
-/// ```no_run
-/// # #[plexus::activation] mod kiln { #[derive(Default)] pub struct Kiln; impl Kiln { pub fn get(&self) -> u32 { 6 } } }
-/// use kiln::Kiln;
-/// fn main() -> std::io::Result<()> {
-///     plexus::main(Kiln::default())
-/// }
-/// ```
-#[cfg(feature = "tokio")]
-pub fn main<A: Serve>(activation: A) -> std::io::Result<()> {
-    main_with(activation, |_| {})
 }
 
 /// Serve an activation with the standard listeners and application-specific

@@ -41,6 +41,11 @@ pub(crate) struct Grants {
 }
 
 impl Grants {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn is_configured(&self) -> bool {
+        self.policy.is_some() || !self.forwarders.is_empty()
+    }
+
     pub fn authorize(
         &mut self,
         policy: impl Fn(&Caller, &str, &[&str]) -> bool + Send + Sync + 'static,

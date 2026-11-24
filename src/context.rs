@@ -26,7 +26,7 @@ pub trait Context<A>: Sized {
 }
 
 /// The named keys supplied on an activation's path segment.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ContextKeys(HashMap<String, String>);
 
 impl ContextKeys {

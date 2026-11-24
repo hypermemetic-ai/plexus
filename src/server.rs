@@ -21,7 +21,7 @@ use crate::{Activation, CallContext, Caller, ContextKeys, Place, lock};
 
 type One = Arc<dyn Fn(Raw, CallContext) -> BoxFuture<'static, Result<Raw, Failure>> + Send + Sync>;
 type Many = Arc<dyn Fn(Raw, CallContext) -> BoxStream<'static, Result<Raw, Failure>> + Send + Sync>;
-type Validate = Box<dyn Fn(CallContext) -> BoxFuture<'static, Result<(), Failure>> + Send + Sync>;
+type Validate = Arc<dyn Fn(CallContext) -> BoxFuture<'static, Result<(), Failure>> + Send + Sync>;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) type Pacing = Arc<dyn Fn(Raw, CallContext) -> Box<dyn Paced> + Send + Sync>;
 
@@ -64,6 +64,7 @@ struct Gate {
     keys: &'static [&'static str],
 }
 
+#[derive(Clone)]
 struct Method {
     handler: Handler,
     gate: Option<Gate>,
@@ -71,9 +72,11 @@ struct Method {
     grant: Option<crate::grants::MethodGrant>,
 }
 
+#[derive(Clone)]
 struct DescendantGate {
     keys: &'static [&'static str],
     validate: Validate,
+    outer: bool,
 }
 
 /// A place in `_tree`: described here, or a child mounted here, whose
@@ -89,16 +92,76 @@ enum Entry {
 #[derive(Default)]
 pub struct Server {
     methods: HashMap<String, Method>,
-    descendant_gates: HashMap<String, DescendantGate>,
+    descendant_gates: HashMap<String, Vec<DescendantGate>>,
     grants: crate::grants::Grants,
     /// Every place described or mounted, in order, for `_tree`.
     places: Vec<Entry>,
     interface: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
+    registry: Option<crate::Activations>,
 }
 
 impl Server {
     pub fn new() -> Server {
         Server::default()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn live(registry: crate::Activations) -> Self {
+        let mut server = Self::new();
+        server.registry = Some(registry);
+        // The catalog identity is stable; individual roots expose their current hashes.
+        server.hello("plexus-live");
+        server
+    }
+
+    // A handwritten Serve must not be able to publish another root's routes,
+    // or quietly install a policy that would be lost in the combined server.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn finish_registration(&self, name: &str) -> Result<(), String> {
+        let owned = |path: &str| path.split('.').next() == Some(name);
+        if self.grants.is_configured() {
+            return Err("configure shared grant policy on the registry server".to_owned());
+        }
+        if self.methods.keys().any(|path| !owned(path)) ||
+            self.descendant_gates.keys().any(|path| !owned(path)) ||
+            self.places.iter().any(|entry| !owned(match entry {
+                Entry::Described(place) => &place.place,
+                Entry::Mounted(place, _) => place,
+            })) {
+            return Err(format!("activation registered a route outside {name}"));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn extend_routes(&mut self, source: &Server) {
+        self.methods.extend(source.methods.clone());
+        self.places.extend(source.places.iter().cloned());
+        for (path, guards) in &source.descendant_gates {
+            self.descendant_gates.entry(path.clone()).or_default().extend(guards.iter().cloned());
+        }
+    }
+
+    fn open_routes(self: &Arc<Self>) -> io::Result<Arc<Self>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(registry) = &self.registry {
+            let dynamic = registry.routes()?;
+            if self.methods.is_empty() && self.places.is_empty() && self.descendant_gates.is_empty() {
+                return Ok(dynamic);
+            }
+            // Static configuration owns its existing methods, and its admission guards
+            // also run for registered routes under those paths.
+            let mut routes = Self::new();
+            routes.extend_routes(self);
+            for guards in routes.descendant_gates.values_mut() {
+                for guard in guards { guard.outer = true; }
+            }
+            routes.extend_routes(&dynamic);
+            routes.methods.extend(self.methods.clone());
+            return Ok(Arc::new(routes));
+        }
+        Ok(self.clone())
     }
 
     /// Look up current role membership when a declared method grant is checked.
@@ -196,10 +259,11 @@ impl Server {
         F: Fn(CallContext) -> A + Send + Sync + 'static,
         A: Future<Output = Result<(), Failure>> + Send + 'static,
     {
-        let previous = self.descendant_gates.insert(at.to_owned(), DescendantGate {
+        let previous = self.descendant_gates.insert(at.to_owned(), vec![DescendantGate {
             keys,
-            validate: Box::new(move |call| run(call).boxed()),
-        });
+            validate: Arc::new(move |call| run(call).boxed()),
+            outer: false,
+        }]);
         assert!(previous.is_none(), "a descendant guard is already registered at {at}");
     }
 
@@ -229,7 +293,7 @@ impl Server {
         self.places.push(Entry::Mounted(at.to_owned(), Arc::from(child)));
     }
 
-    async fn find(&self, address: &str, caller: &Option<Caller>, input: bool) -> Result<(Handler, ContextKeys), Failure> {
+    async fn find(&self, host: &Server, address: &str, caller: &Option<Caller>, input: bool) -> Result<(Handler, ContextKeys), Failure> {
         let not_found = || failure("not-found", &format!("no method {address}"));
         if address == "_tree" {
             if input { return Err(failure("invalid-params", "_tree takes no input stream")); }
@@ -259,14 +323,16 @@ impl Server {
         let mut checks = Vec::new();
         if !self.descendant_gates.is_empty() {
             for (segment, (end, _)) in name.match_indices('.').enumerate() {
-                // The method's own gate is part of its invocation.
-                if leaf.is_some_and(|leaf| leaf.segment == segment) {
-                    continue;
-                }
-                if let Some(guard) = self.descendant_gates.get(&name[..end]) {
-                    let keys = groups.remove(&segment).unwrap_or_default();
-                    keys.check(guard.keys)?;
-                    checks.push((&guard.validate, keys));
+                if let Some(guards) = self.descendant_gates.get(&name[..end]) {
+                    let own = leaf.is_some_and(|leaf| leaf.segment == segment);
+                    for guard in guards {
+                        // Contextual methods open their own activation; outer guards still apply.
+                        if own && (!guard.outer || host.methods.contains_key(name)) { continue; }
+                        let keys = groups.get(&segment).cloned().unwrap_or_default();
+                        keys.check(guard.keys)?;
+                        checks.push((&guard.validate, keys));
+                    }
+                    if !own { groups.remove(&segment); }
                 }
             }
         }
@@ -295,7 +361,7 @@ impl Server {
             caught(async { validate(CallContext::new(caller.clone(), keys)).await }).await??;
         }
         if let Some(method) = grant {
-            self.grants.check(method, caller.as_ref())?;
+            host.grants.check(method, caller.as_ref())?;
         }
         Ok((handler, keys))
     }
@@ -328,10 +394,14 @@ impl Server {
         let Channel { send, mut receive, binary_input } = channel;
         // Keep an output-only leaf's hello byte-for-byte stable. A mount
         // learns its child's method capability when that call grants credit.
+        #[cfg(not(target_arch = "wasm32"))]
+        let channel_supports_binary = binary_input;
         let binary_input = binary_input && self.interface.is_some() && (
             self.methods.values().any(|method| method.input)
             || self.places.iter().any(|entry| matches!(entry, Entry::Mounted(..)))
         );
+        #[cfg(not(target_arch = "wasm32"))]
+        let binary_input = binary_input || (channel_supports_binary && self.registry.is_some());
         let (out, frames) = crate::channel::out();
         if let Some(interface) = &self.interface {
             let mut hello = Frame::hello(interface, false);
@@ -343,6 +413,8 @@ impl Server {
         let (start, started) = mpsc::unbounded::<BoxFuture<'static, ()>>();
         let calls: Arc<Mutex<HashMap<u32, Running>>> = Arc::default();
         let read = async move {
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(registry) = &server.registry { registry.bind_runtime()?; }
             while let Some(bytes) = receive.next().await {
                 #[cfg(feature = "trace")]
                 let read = crate::trace::now();
@@ -371,7 +443,7 @@ impl Server {
                             return Err(io::Error::new(io::ErrorKind::InvalidData, "duplicate open call id"));
                         }
                         let invocation = Invocation { id, open, caller: caller.clone(), input };
-                        let ran = run(server.clone(), invocation, out.clone(), credit, calls.clone());
+                        let ran = run(server.clone(), server.open_routes()?, invocation, out.clone(), credit, calls.clone());
                         let _ = start.unbounded_send(Abortable::new(ran, registration).map(|_| ()).boxed());
                         stamp!((id, 0), Started);
                     }
@@ -494,6 +566,7 @@ struct Invocation {
 
 async fn run(
     server: Arc<Server>,
+    routes: Arc<Server>,
     invocation: Invocation,
     out: Out,
     credit: Arc<Credit>,
@@ -514,7 +587,7 @@ async fn run(
     let send = |kind: Kind, body: &[u8]| sent.send(&send, kind, body);
     let dispatch = async {
         let (open, caller) = server.grants.resolve(open, caller, |name, trusted, metadata| {
-            match server.methods.get(name) {
+            match routes.methods.get(name) {
                 Some(method) if trusted && method.grant.is_some() => Ok(()),
                 Some(method) if metadata && matches!(method.handler, Handler::Reflect(_)) => Ok(()),
                 None if metadata => Err(failure("not-found", &format!("no method {name}"))),
@@ -523,7 +596,7 @@ async fn run(
         })?;
         let given = open.params;
         let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
-        let (handler, keys) = server.find(&open.method, &caller, open.input).await?;
+        let (handler, keys) = routes.find(&server, &open.method, &caller, open.input).await?;
         let mut context = CallContext::new(caller, keys);
         context.input = input;
         match handler {

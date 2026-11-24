@@ -13,6 +13,7 @@ plexus = { path = "..", features = ["tls"] }
 plexus-ir = { path = "../../plexus-ir" }
 rmcp = { version = "=3.11.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 serde_json = "1"
+subtle = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-std", "net"] }
 
 [dev-dependencies]

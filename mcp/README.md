@@ -2,6 +2,34 @@
 
 `plexus-layers-mcp` exposes the methods of a native Layers-1 activation as MCP tools. It lives in the Layers repository beside the runtime and uses its native connection, interface description and caller checks. MCP clients speak stdio to the executable. A Layers application can also mount the library's Streamable HTTP endpoint.
 
+## Start an application with MCP
+
+```rust
+use kiln::Kiln;
+use plexus_layers_mcp::Mcp;
+
+fn main() -> std::io::Result<()> {
+    plexus::main([Kiln::default()]).mcp().run()
+}
+```
+
+The application registers each activation under its declared namespace. Set `PLEXUS_MCP_TOKEN` to a secret bearer token, then run `cargo run --locked --example http` in this directory. A client connects to `http://127.0.0.1:3000/mcp` and sends `Authorization: Bearer <token>`. Calls run as `local:mcp-operator` under the service's native grants. Add `-- --ws 127.0.0.1:0` to serve the same activations over a native WebSocket as well. [Runnable main](examples/http.rs)
+
+For several Rust types, use `plexus::activations![kiln, glaze]`. Keep the registry handle when another part of your application controls which services are available.
+
+```rust
+let app = plexus::main(plexus::activations![kiln, glaze]).mcp();
+let roots = app.activations();
+let service = tokio::spawn(app.run_async());
+
+roots.insert(audit)?;
+roots.replace(updated_kiln)?;
+roots.remove("glaze")?;
+service.await??;
+```
+
+Each edit applies to subsequent discovery requests and calls across listeners, including open native connections. The connection identifies the catalog. Native clients can bind to an individual activation by checking its current interface hash, for example `kiln._hash`. A call already running keeps its activation until it finishes. Inserting a duplicate namespace returns `AlreadyExists`. Replacing or removing an absent namespace returns `NotFound`. Use `.configure(...)` to set shared grants and `.mcp_with(...)` for your own listener and caller verifier. [Live registry and HTTP tests](tests/app.rs)
+
 ## Run a service as an MCP child
 
 From this directory in the native sibling checkouts:
@@ -22,8 +50,6 @@ plexus-layers-mcp --place 'studio[tenant=acme]' \
 Each stdio client owns its process and upstream identity. The optional `--place` selects a mount and its descendants. Context keys stay on the native dispatch address, so a client sees the stable tool name `studio.kiln.heat` and the service receives `studio[tenant=acme].kiln.heat`.
 
 ## Mount HTTP
-
-[Complete application main](examples/http.rs) serves a local kiln at `http://127.0.0.1:3000/mcp`. Set `KILN_MCP_TOKEN` and run `cargo run --locked --example http` from this directory.
 
 Mount `plexus_layers_mcp::http::router(server, origins, verify_request)` in the application's Axum router. It serves `/mcp` using stateless Streamable HTTP. The host's async verifier receives the original HTTP request parts and returns the authenticated `Option<plexus::Caller>`. Returning `None` produces HTTP 401. Each request uses its own caller for native discovery and dispatch. Configure accepted browser origins with `HttpOrigins::allow_origin`. With `HttpOrigins::default()`, a native client can reach a loopback listener.
 
