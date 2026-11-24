@@ -49,11 +49,11 @@ macro_rules! stamp {
 #[cfg(feature = "tokio")]
 mod application;
 #[cfg(feature = "tokio")]
-pub use application::{Application, MainInput, Registration, main};
+pub use application::{Application, MainInput, main};
 #[cfg(not(target_arch = "wasm32"))]
 mod registry;
 #[cfg(not(target_arch = "wasm32"))]
-pub use registry::Activations;
+pub use registry::{Activations, Registration, namespace};
 mod channel;
 mod input;
 pub use input::{Input, RawInput};

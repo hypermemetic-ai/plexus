@@ -15,6 +15,23 @@ fn main() -> std::io::Result<()> {
 
 The application registers each activation under its declared namespace. Set `PLEXUS_MCP_TOKEN` to a secret bearer token, then run `cargo run --locked --example http` in this directory. A client connects to `http://127.0.0.1:3000/mcp` and sends `Authorization: Bearer <token>`. Calls run as `local:mcp-operator` under the service's native grants. Add `-- --ws 127.0.0.1:0` to serve the same activations over a native WebSocket as well. [Runnable main](examples/http.rs)
 
+To run two instances of the same activation, give each one a root name. MCP clients can call `bisque.fire` and `glaze.fire`.
+
+```rust
+use kiln::Kiln;
+use plexus::namespace;
+use plexus_layers_mcp::Mcp;
+
+fn main() -> std::io::Result<()> {
+    plexus::main([
+        namespace("bisque", Kiln::default()),
+        namespace("glaze", Kiln::default()),
+    ]).mcp().run()
+}
+```
+
+The live registry accepts the same syntax. For example, `roots.replace(namespace("bisque", repaired_kiln))?` replaces the instance serving `bisque`. The application controls any external storage shared by its instances.
+
 For several Rust types, use `plexus::activations![kiln, glaze]`. Keep the registry handle when another part of your application controls which services are available.
 
 ```rust

@@ -148,3 +148,47 @@ fn missing_default_bearer_is_reported_before_any_listener_starts() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     assert!(error.to_string().contains("PLEXUS_MCP_TOKEN"));
 }
+
+#[tokio::test]
+async fn two_kilns_expose_their_methods_under_their_mount_names() {
+    use plexus::namespace;
+
+    let socket = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let url = format!("http://{}/mcp", socket.local_addr().unwrap());
+    let app = plexus::main([
+        namespace("bisque", Kiln::default()),
+        namespace("glaze", Kiln::default()),
+    ])
+    .mcp_with(socket, HttpOrigins::default(), |parts| async move {
+        parts
+            .headers
+            .get(AUTHORIZATION)
+            .is_some_and(|v| v == "Bearer app-operator")
+            .then(|| Caller::new("operator"))
+    });
+    let running = tokio::spawn(app.run_async());
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let listed = tools(&client, &url).await;
+    assert!(!listed.iter().any(|tool| tool.starts_with("kiln.")));
+    for tool in ["bisque.heat", "glaze.heat"] {
+        assert!(listed.iter().any(|t| t == tool));
+        let answer = rpc(
+            &client,
+            &url,
+            "tools/call",
+            json!({
+                "name": tool, "arguments": {"cone": 6, "hours": 0.0}
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer["result"]["structuredContent"]["items"][0]["minute"], 0,
+            "{answer}"
+        );
+    }
+    running.abort();
+    let _ = running.await;
+}

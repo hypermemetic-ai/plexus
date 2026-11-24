@@ -5,7 +5,29 @@ use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 
-type Install = Box<dyn FnOnce(&mut Server) + Send>;
+type Install = Box<dyn FnOnce(&mut Server, &str) + Send>;
+
+/// An activation and the top-level name at which it will be served.
+pub struct Registration {
+    name: String,
+    install: Install,
+}
+
+/// Mount one instance under an explicit name in an activation collection.
+/// Clients address its methods directly as `name.method`. The registry checks
+/// the name and rejects duplicate roots when inserting the registration.
+pub fn namespace<A: Serve>(name: impl Into<String>, activation: A) -> Registration {
+    Registration {
+        name: name.into(),
+        install: Box::new(move |server, at| activation.serve(server, at)),
+    }
+}
+
+impl<A: Serve> From<A> for Registration {
+    fn from(activation: A) -> Self {
+        namespace(A::NAME, activation)
+    }
+}
 
 #[derive(Clone, Default)]
 struct Runtime {
@@ -24,8 +46,7 @@ impl Runtime {
 
 // A root is initialized once across all catalog generations that contain it.
 struct Root {
-    name: &'static str,
-    install: Mutex<Option<Install>>,
+    registration: Mutex<Option<Registration>>,
     server: OnceLock<Result<Arc<Server>, String>>,
 }
 
@@ -36,11 +57,13 @@ impl Root {
             let _enter = runtime.handle.as_ref().map(|h| h.enter());
             #[cfg(not(feature = "tokio"))]
             let _ = runtime;
-            let install = lock(&self.install).take().expect("root initialized once");
+            let registration = lock(&self.registration)
+                .take()
+                .expect("root initialized once");
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut server = Server::new();
-                install(&mut server);
-                server.finish_registration(self.name)?;
+                (registration.install)(&mut server, &registration.name);
+                server.finish_registration(&registration.name)?;
                 Ok(Arc::new(server))
             }))
             .unwrap_or_else(|_| Err("activation registration panicked".to_owned()))
@@ -72,41 +95,40 @@ pub struct Activations {
 }
 
 impl Activations {
-    /// Register a new root under its canonical declared namespace.
-    pub fn insert<A: Serve>(&self, activation: A) -> io::Result<()> {
-        self.install(activation, false)
+    /// Register a root under its declared name or an explicit [`namespace`].
+    pub fn insert<A: Into<Registration>>(&self, activation: A) -> io::Result<()> {
+        self.install(activation.into(), false)
     }
 
     /// Change the implementation of an existing root, keeping current calls alive.
-    pub fn replace<A: Serve>(&self, activation: A) -> io::Result<()> {
-        self.install(activation, true)
+    pub fn replace<A: Into<Registration>>(&self, activation: A) -> io::Result<()> {
+        self.install(activation.into(), true)
     }
 
-    fn install<A: Serve>(&self, activation: A, replace: bool) -> io::Result<()> {
-        let name = A::NAME;
-        check_name(name)?;
+    fn install(&self, registration: Registration, replace: bool) -> io::Result<()> {
+        check_name(&registration.name)?;
+        let name = registration.name.clone();
         let root = Arc::new(Root {
-            name,
-            install: Mutex::new(Some(Box::new(move |s| activation.serve(s, name)))),
+            registration: Mutex::new(Some(registration)),
             server: OnceLock::new(),
         });
         // Stage atomically if the listener hasn't started. Otherwise prepare
         // the replacement outside the lock before publishing it.
         let runtime = {
             let state = lock(&self.state);
-            check_exists(&state.current, name, replace)?;
+            check_exists(&state.current, &name, replace)?;
             match &state.running {
                 Some(runtime) => runtime.clone(),
                 None => {
-                    change(state, name, Some(root));
+                    change(state, &name, Some(root));
                     return Ok(());
                 }
             }
         };
         root.get(&runtime)?;
         let state = lock(&self.state);
-        check_exists(&state.current, name, replace)?;
-        change(state, name, Some(root));
+        check_exists(&state.current, &name, replace)?;
+        change(state, &name, Some(root));
         Ok(())
     }
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use futures::future::{BoxFuture, FutureExt, select_all};
 
-use crate::{Activations, Serve, Server, listener::Listener};
+use crate::{Activations, Registration, Serve, Server, listener::Listener};
 
 /// Start a single native activation, or build an application from a collection.
 ///
@@ -35,17 +35,6 @@ impl<A: Serve> MainInput for A {
     type Output = io::Result<()>;
     fn start(self) -> Self::Output {
         crate::main_with(self, |_| {})
-    }
-}
-
-type Install = Box<dyn FnOnce(&Activations) -> io::Result<()> + Send>;
-
-/// An owned activation in a mixed-type array. [`crate::activations!`] constructs these.
-pub struct Registration(Install);
-
-impl<A: Serve> From<A> for Registration {
-    fn from(activation: A) -> Self {
-        Self(Box::new(move |roots| roots.insert(activation)))
     }
 }
 
@@ -100,7 +89,7 @@ impl Application {
     fn from_list<T: Into<Registration>>(entries: impl IntoIterator<Item = T>) -> Self {
         let mut app = Activations::default().start();
         for entry in entries {
-            if let Err(err) = entry.into().0(&app.roots) {
+            if let Err(err) = app.roots.insert(entry) {
                 app.startup_error = Some(err);
                 break;
             }
