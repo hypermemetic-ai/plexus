@@ -23,6 +23,8 @@ Each stdio client owns its process and upstream identity. The optional `--place`
 
 ## Mount HTTP
 
+[Complete application main](examples/http.rs) serves a local kiln at `http://127.0.0.1:3000/mcp`. Set `KILN_MCP_TOKEN` and run `cargo run --locked --example http` from this directory.
+
 Mount `plexus_layers_mcp::http::router(server, origins, verify_request)` in the application's Axum router. It serves `/mcp` using stateless Streamable HTTP. The host's async verifier receives the original HTTP request parts and returns the authenticated `Option<plexus::Caller>`. Returning `None` produces HTTP 401. Each request uses its own caller for native discovery and dispatch. Configure accepted browser origins with `HttpOrigins::allow_origin`. With `HttpOrigins::default()`, a native client can reach a loopback listener.
 
 The application supplies its session or bearer verifier, TLS termination and any OAuth discovery routes. The executable's fixed WSS key is for one MCP client. The HTTP adapter uses the host-verified caller on each request. [Runnable HTTP integration](tests/http.rs)
