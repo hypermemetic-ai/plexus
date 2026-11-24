@@ -53,6 +53,8 @@ pub use input::{Input, RawInput};
 mod listener;
 mod connection;
 mod context;
+mod grant;
+pub use grant::Grant;
 mod grants;
 mod remote;
 #[cfg(not(target_arch = "wasm32"))]

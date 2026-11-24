@@ -121,3 +121,28 @@ that exact local grant-protected method. The ordinary method grant is then
 checked for the asserted principal. `caller.peer()` identifies the direct
 peer. This gives the peer authority to assert users on the configured
 methods. A direct `Remote::wss` continues to use the service identity.
+
+### Loading resource grants at startup
+
+```rust
+let grants: Vec<plexus::Grant<Principal, Method, Target>> =
+    plexus::Grant::load_file_from_env("MENGER_GRANTS", None)?;
+```
+
+The three type parameters belong to the application. Each implements
+`serde::Deserialize`: a validated principal ID, a method (typically an enum
+with wire names), and a target struct. Give target structs
+`#[serde(deny_unknown_fields)]` to catch misspelled fields.
+
+```text
+principal(builder = "key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+principal(owner = "key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+grant(principal = builder, method = agent.connect,
+      target = { org: "hypermemetic:", owner: owner, agent: "notes" })
+```
+
+Quote literals, declare principal aliases before use, and write method paths
+as dotted identifiers. An unset variable selects the supplied
+`Option<Vec<Grant<…>>>` defaults. A file replaces the defaults as a unit.
+I/O or parsing failures return an error. The activation validates its targets
+and authorizes calls using the resulting grants.
