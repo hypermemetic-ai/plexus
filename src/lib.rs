@@ -87,6 +87,8 @@ pub use connection::{Connection, Error, Items, Passed, TOP_UP, WINDOW};
 pub use context::{CallContext, Context, ContextKeys, FromCaller, require_caller};
 pub use remote::Remote;
 pub use plexus_macros::{activation, Context};
+mod encoded;
+pub use encoded::Encoded;
 pub use plexus_proto::{Failure, Raw};
 pub use server::{Server, fail, raw};
 #[cfg(feature = "store")]

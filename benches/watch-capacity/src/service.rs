@@ -19,9 +19,25 @@ struct Revision {
 
 #[derive(Debug)]
 struct Evaluated {
-    page: tickets::Page,
+    page: StoredPage,
+    sequence: u64,
     digest: u128,
     row_bytes: usize,
+}
+
+#[derive(Debug)]
+enum StoredPage {
+    Shared(plexus::Encoded<tickets::Page>),
+    PerCall(tickets::Page),
+}
+
+impl StoredPage {
+    fn answer(&self, store: &Store) -> plexus::Encoded<tickets::Page> {
+        match self {
+            Self::Shared(page) => page.clone(),
+            Self::PerCall(page) => store.encode(page),
+        }
+    }
 }
 
 // The fixture has immutable membership and one fixed projection, sort and
@@ -55,19 +71,25 @@ pub struct Store {
     encoded: AtomicU64,
     revisions: Vec<watch::Sender<Revision>>,
     groups: Option<Vec<Group>>,
+    share_encoding: bool,
+    page_encodes: AtomicU64,
     read_hits: AtomicU64,
     initial_hits: AtomicU64,
 }
 
 impl Store {
-    fn new(keys: &[String], orgs: usize, rows: usize) -> Result<Self> {
+    pub(crate) fn new(keys: &[String], orgs: usize, rows: usize) -> Result<Self> {
         let hot = std::env::var("WATCH_PROFILE").as_deref() == Ok("hot");
         let mode = std::env::var("WATCH_EVALUATION").unwrap_or_else(|_| "per-watch".into());
         ensure!(
             matches!(mode.as_str(), "per-watch" | "shared"),
             "unknown evaluation mode"
         );
-        Self::configured(keys, orgs, rows, hot, mode == "shared")
+        let encoding = std::env::var("WATCH_ENCODING").unwrap_or_else(|_| "shared".into());
+        ensure!(matches!(encoding.as_str(), "shared" | "per-call"), "unknown encoding mode");
+        let mut store = Self::configured(keys, orgs, rows, hot, mode == "shared")?;
+        store.share_encoding = encoding == "shared";
+        Ok(store)
     }
 
     fn configured(
@@ -110,6 +132,8 @@ impl Store {
                     })
                     .collect()
             }),
+            share_encoding: true,
+            page_encodes: AtomicU64::new(0),
             read_hits: AtomicU64::new(0),
             initial_hits: AtomicU64::new(0),
             db: Mutex::new(db),
@@ -148,19 +172,29 @@ impl Store {
         }
     }
 
+    fn encode(&self, page: &tickets::Page) -> plexus::Encoded<tickets::Page> {
+        self.page_encodes.fetch_add(1, Ordering::Relaxed);
+        plexus::Encoded::new(page).expect("ticket page is serializable")
+    }
+
     fn evaluate(&self, org: usize) -> Evaluated {
         let page = self.query(org);
         let encoded = serde_json::to_vec(&page.rows).unwrap();
         self.encoded
             .fetch_add(encoded.len() as u64, Ordering::Relaxed);
         Evaluated {
-            page,
+            sequence: page.sequence,
+            page: if self.share_encoding && self.groups.is_some() {
+                StoredPage::Shared(self.encode(&page))
+            } else {
+                StoredPage::PerCall(page)
+            },
             digest: xxhash_rust::xxh3::xxh3_128(&encoded),
             row_bytes: encoded.len(),
         }
     }
 
-    fn read(&self, org: usize) -> tickets::Page {
+    fn read(&self, org: usize) -> plexus::Encoded<tickets::Page> {
         if let Some(groups) = &self.groups {
             let group = &groups[org];
             // Use the same publication boundary as writes and last-watch removal.
@@ -170,10 +204,10 @@ impl Store {
             };
             if let Some(snapshot) = snapshot {
                 self.read_hits.fetch_add(1, Ordering::Relaxed);
-                return snapshot.page.clone();
+                return snapshot.page.answer(self);
             }
         }
-        self.query(org)
+        self.encode(&self.query(org))
     }
 
     fn subscribe(self: &Arc<Self>, org: usize) -> Option<SharedWatch> {
@@ -245,13 +279,13 @@ pub mod tickets {
     pub struct Tickets(pub Arc<Store>);
 
     impl Tickets {
-        pub fn list(&self, caller: &Caller) -> Page {
+        pub fn list(&self, caller: &Caller) -> plexus::Encoded<Page> {
             self.0.read(self.0.members[caller.principal()])
         }
         pub fn advance(&self, caller: &Caller) -> u64 {
             self.0.write(self.0.members[caller.principal()])
         }
-        pub fn watch(&self, caller: &Caller) -> impl Stream<Item = Page> {
+        pub fn watch(&self, caller: &Caller) -> impl Stream<Item = plexus::Encoded<Page>> {
             let store = self.0.clone();
             let org = store.members[caller.principal()];
             if let Some(subscription) = store.subscribe(org) {
@@ -263,14 +297,14 @@ pub mod tickets {
                                 subscription.current.changed().await.ok()?;
                             }
                             let current = subscription.current.borrow_and_update().clone()?;
-                            let version = (current.page.sequence, current.digest);
+                            let version = (current.sequence, current.digest);
                             if let Some((old_seq, old_digest)) = last {
                                 if version.0 <= old_seq || version.1 == old_digest {
                                     last = Some(version);
                                     continue;
                                 }
                             }
-                            return Some((current.page.clone(), (subscription, Some(version))));
+                            return Some((current.page.answer(&subscription.store), (subscription, Some(version))));
                         }
                     },
                 ));
@@ -286,7 +320,7 @@ pub mod tickets {
                         rx.borrow_and_update();
                         let current = store.evaluate(org);
                         if previous != Some(current.digest) {
-                            return Some((current.page, (store, rx, Some(current.digest))));
+                            return Some((current.page.answer(&store), (store, rx, Some(current.digest))));
                         }
                     }
                 },
@@ -295,11 +329,15 @@ pub mod tickets {
     }
 }
 
-// Each native activation owns one execution thread. Replicas share the same
-// authority, database and live views. A connection stays on its tenant's lane.
-fn serving(store: Arc<Store>, observer: String, lanes: usize) -> Arc<plexus::Server> {
+// Tenant dispatch pins a connection to a replica. Concurrent dispatch serves
+// a single activation on a worker pool. Both share the same store and authority.
+fn serving(store: Arc<Store>, observer: String, lanes: std::num::NonZeroUsize, concurrent: bool) -> Arc<plexus::Server> {
     let mut server = plexus::Server::new();
-    plexus::serve(tickets::Tickets(store.clone()), &mut server);
+    if concurrent {
+        plexus::serve_concurrent(tickets::Tickets(store.clone()), lanes, &mut server);
+    } else {
+        plexus::serve(tickets::Tickets(store.clone()), &mut server);
+    }
     server.method_with_caller("bench.clock", |_, _| async {
         plexus::raw(&crate::clock_us())
     });
@@ -312,6 +350,7 @@ fn serving(store: Arc<Store>, observer: String, lanes: usize) -> Arc<plexus::Ser
             }
             let mut cached_views = 0;
             let mut cached_row_bytes = 0;
+            let mut cached_page_bytes = 0;
             let mut shared_subscriptions = 0;
             if let Some(groups) = &store.groups {
                 for group in groups {
@@ -320,15 +359,22 @@ fn serving(store: Arc<Store>, observer: String, lanes: usize) -> Arc<plexus::Ser
                     if let Some(snapshot) = group.current.borrow().as_ref() {
                         cached_views += 1;
                         cached_row_bytes += snapshot.row_bytes;
+                        if let StoredPage::Shared(page) = &snapshot.page {
+                            cached_page_bytes += page.as_raw().get().len();
+                        }
                     }
                 }
             }
             plexus::raw(&serde_json::json!({
-                "activation_lanes": lanes,
+                "activation_lanes": lanes.get(),
+                "dispatch": if concurrent { "concurrent" } else { "tenant" },
+                "encoding": if store.share_encoding { "shared" } else { "per-call" },
+                "page_encodes": store.page_encodes.load(Ordering::Relaxed),
                 "list_cache_hits": store.read_hits.load(Ordering::Relaxed),
                 "initial_cache_hits": store.initial_hits.load(Ordering::Relaxed),
                 "cached_views": cached_views,
                 "cached_row_json_bytes": cached_row_bytes,
+                "cached_page_json_bytes": cached_page_bytes,
                 "shared_subscriptions": shared_subscriptions,
                 "page_queries":store.queries.load(Ordering::Relaxed),
                 "watch_bytes_hashed":store.encoded.load(Ordering::Relaxed)
@@ -349,7 +395,12 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
     let lanes: usize = std::env::var("WATCH_ACTIVATION_LANES")
         .unwrap_or_else(|_| "1".into()).parse()?;
     ensure!((1..=64).contains(&lanes), "expected 1..64 activation lanes");
-    let servers: Arc<Vec<_>> = Arc::new((0..lanes).map(|_| serving(store.clone(), keys[0].clone(), lanes)).collect());
+    let lanes = std::num::NonZeroUsize::new(lanes).unwrap();
+    let dispatch = std::env::var("WATCH_DISPATCH").unwrap_or_else(|_| "tenant".into());
+    ensure!(matches!(dispatch.as_str(), "tenant" | "concurrent"), "unknown activation dispatch");
+    let concurrent = dispatch == "concurrent";
+    let replicas = if concurrent { 1 } else { lanes.get() };
+    let servers: Arc<Vec<_>> = Arc::new((0..replicas).map(|_| serving(store.clone(), keys[0].clone(), lanes, concurrent)).collect());
     // Multiple loopback destination ports give a colocated driver enough TCP
     // four-tuples. Every listener feeds the same process, store and acceptor.
     let listener = Arc::new(Listen::new(&identity, keys.iter().map(String::as_str))?);
@@ -387,10 +438,63 @@ mod tests {
     use super::*;
     use futures::{FutureExt, StreamExt};
 
+    fn page(value: plexus::Encoded<tickets::Page>) -> tickets::Page {
+        serde_json::from_str(value.as_raw().get()).unwrap()
+    }
+
     fn store(shared: bool) -> Arc<Store> {
         Arc::new(
             Store::configured(&["a".into(), "b".into(), "c".into()], 2, 51, false, shared).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn generated_read_and_watch_keep_the_previous_client_contract() {
+        // The original generated fixture's IR hash, before encoded responses.
+        assert_eq!(tickets::HASH, "70e40dfb4526da26");
+        let store = store(true);
+        let server = serving(store.clone(), "a".into(), 2.try_into().unwrap(), true);
+        let (client, transport) = plexus::pair();
+        tokio::spawn(server.serve_as(transport, plexus::Caller::new("a")));
+        let (connection, driver) = plexus::Connection::new(client, Some(tickets::HASH));
+        tokio::spawn(driver);
+        connection.ready().await.unwrap();
+        let mut watch = connection.stream("tickets.watch", ()).unwrap();
+        let item = watch.next().await.unwrap().unwrap();
+        let answer = connection.call("tickets.list", ()).await.unwrap();
+        let expected = serde_json::to_string(&store.query(0)).unwrap();
+        assert_eq!(item.get(), expected);
+        assert_eq!(answer.get(), expected);
+        let page: tickets::Page = serde_json::from_str(answer.get()).unwrap();
+        assert_eq!((page.org, page.rows.len()), (0, 50));
+        assert_eq!(store.page_encodes.load(Ordering::Relaxed), 1);
+        let a = store.read(0);
+        let b = store.read(0);
+        assert_eq!(a.as_raw().get().as_ptr(), b.as_raw().get().as_ptr());
+    }
+
+    #[test]
+    #[ignore = "release microbenchmark, run with --ignored --nocapture"]
+    fn repeated_50_row_page_encoding_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let store = store(true);
+        let page = store.query(0);
+        let shared = store.encode(&page);
+        for _ in 0..3 {
+            for mode in ["clone-and-encode", "encode", "shared"] {
+                let start = Instant::now();
+                for _ in 0..10_000 {
+                    let body = match mode {
+                        "clone-and-encode" => plexus::raw(&black_box(&page).clone()).unwrap(),
+                        "encode" => store.encode(black_box(&page)).into_raw(),
+                        _ => black_box(&shared).clone().into_raw(),
+                    };
+                    black_box(body);
+                }
+                eprintln!("{mode}: {:.0} ns/page", start.elapsed().as_nanos() as f64 / 10_000.0);
+            }
+        }
     }
 
     #[tokio::test]
@@ -403,21 +507,21 @@ mod tests {
         let mut first = Box::pin(tickets.watch(&a));
         let mut other = Box::pin(tickets.watch(&b));
         let mut same = Box::pin(tickets.watch(&c));
-        assert_eq!(first.next().await.unwrap().org, 0);
-        assert_eq!(same.next().await.unwrap().org, 0);
-        assert_eq!(other.next().await.unwrap().org, 1);
-        assert_eq!(tickets.list(&a).rows.len(), 50);
+        assert_eq!(page(first.next().await.unwrap()).org, 0);
+        assert_eq!(page(same.next().await.unwrap()).org, 0);
+        assert_eq!(page(other.next().await.unwrap()).org, 1);
+        assert_eq!(page(tickets.list(&a)).rows.len(), 50);
         assert_eq!(store.queries.load(Ordering::Relaxed), 2);
         assert_eq!(store.initial_hits.load(Ordering::Relaxed), 1);
         assert_eq!(store.read_hits.load(Ordering::Relaxed), 1);
         assert_eq!(tickets.advance(&c), 1);
-        assert_eq!(first.next().await.unwrap().sequence, 1);
+        assert_eq!(page(first.next().await.unwrap()).sequence, 1);
         assert!(other.next().now_or_never().is_none());
         assert_eq!(tickets.advance(&a), 2);
-        let latest = same.next().await.unwrap();
+        let latest = page(same.next().await.unwrap());
         assert_eq!(latest.sequence, 2);
         assert_eq!(latest.rows[0].status, "Revision 2");
-        assert_eq!(tickets.list(&b).sequence, 0);
+        assert_eq!(page(tickets.list(&b)).sequence, 0);
         assert_eq!(store.queries.load(Ordering::Relaxed), 4);
         drop(first);
         drop(same);
@@ -426,7 +530,7 @@ mod tests {
         assert!(groups[1].current.borrow().is_some());
         tickets.advance(&a);
         assert_eq!(store.queries.load(Ordering::Relaxed), 4);
-        assert_eq!(tickets.list(&a).sequence, 3);
+        assert_eq!(page(tickets.list(&a)).sequence, 3);
         assert_eq!(store.queries.load(Ordering::Relaxed), 5);
         assert!(groups[0].current.borrow().is_none());
     }
@@ -446,8 +550,8 @@ mod tests {
         });
         let current = subscription.current.borrow();
         let snapshot = current.as_ref().unwrap();
-        assert_eq!(snapshot.page.sequence, 48);
-        assert_eq!(snapshot.page.rows[0].status, "Revision 48");
+        assert_eq!(snapshot.sequence, 48);
+        assert_eq!(page(snapshot.page.answer(&store)).rows[0].status, "Revision 48");
         assert_eq!(store.queries.load(Ordering::Relaxed), 49);
     }
 
@@ -457,21 +561,19 @@ mod tests {
         let tickets = tickets::Tickets(store.clone());
         let a = plexus::Caller::new("a");
         let mut subscription = Box::pin(tickets.watch(&a));
-        assert_eq!(subscription.next().await.unwrap().sequence, 0);
+        assert_eq!(page(subscription.next().await.unwrap()).sequence, 0);
         let group = &store.groups.as_ref().unwrap()[0];
         {
             let _count = group.subscribers.lock().unwrap();
-            let mut same = store.evaluate(0);
-            same.page.sequence = 1;
             store.revisions[0].send_replace(Revision {
                 seq: 1,
                 committed_us: 0,
             });
-            group.current.send_replace(Some(Arc::new(same)));
+            group.current.send_replace(Some(Arc::new(store.evaluate(0))));
         }
         assert!(subscription.next().now_or_never().is_none());
         assert_eq!(tickets.advance(&a), 2);
-        assert_eq!(subscription.next().await.unwrap().sequence, 2);
+        assert_eq!(page(subscription.next().await.unwrap()).sequence, 2);
     }
 
     #[tokio::test]
@@ -482,12 +584,12 @@ mod tests {
         let c = plexus::Caller::new("c");
         let mut first = Box::pin(tickets.watch(&a));
         let mut second = Box::pin(tickets.watch(&c));
-        assert_eq!(first.next().await.unwrap().sequence, 0);
-        assert_eq!(second.next().await.unwrap().sequence, 0);
+        assert_eq!(page(first.next().await.unwrap()).sequence, 0);
+        assert_eq!(page(second.next().await.unwrap()).sequence, 0);
         tickets.list(&a);
         tickets.advance(&a);
-        assert_eq!(first.next().await.unwrap().sequence, 1);
-        assert_eq!(second.next().await.unwrap().sequence, 1);
+        assert_eq!(page(first.next().await.unwrap()).sequence, 1);
+        assert_eq!(page(second.next().await.unwrap()).sequence, 1);
         assert_eq!(store.queries.load(Ordering::Relaxed), 5);
         assert_eq!(store.read_hits.load(Ordering::Relaxed), 0);
     }
