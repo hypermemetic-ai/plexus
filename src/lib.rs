@@ -122,7 +122,55 @@ pub trait WatchSource {
 
 #[doc(hidden)]
 pub fn watch_digest(value: &Raw) -> u128 {
-    xxhash_rust::xxh3::xxh3_128(value.get().as_bytes())
+    use serde_json::value::RawValue;
+    use std::collections::BTreeMap;
+    use xxhash_rust::xxh3::Xxh3;
+
+    // Keep number tokens exact, including integers outside u64. Sorted object
+    // keys and ordered array items give equivalent projections the same digest.
+    fn visit(text: &str, hash: &mut Xxh3) {
+        match text.as_bytes().first() {
+            Some(b'{') => {
+                if let Ok(fields) = serde_json::from_str::<BTreeMap<String, &RawValue>>(text) {
+                    hash.update(b"{");
+                    for (key, value) in fields {
+                        hash.update(b"k");
+                        hash.update(&(key.len() as u64).to_le_bytes());
+                        hash.update(key.as_bytes());
+                        visit(value.get(), hash);
+                    }
+                    hash.update(b"}");
+                    return;
+                }
+            }
+            Some(b'[') => {
+                if let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(text) {
+                    hash.update(b"[");
+                    for item in items {
+                        visit(item.get(), hash);
+                    }
+                    hash.update(b"]");
+                    return;
+                }
+            }
+            Some(b'"') => {
+                if let Ok(string) = serde_json::from_str::<String>(text) {
+                    hash.update(b"s");
+                    hash.update(&(string.len() as u64).to_le_bytes());
+                    hash.update(string.as_bytes());
+                    return;
+                }
+            }
+            _ => {}
+        }
+        hash.update(b"v");
+        hash.update(&(text.len() as u64).to_le_bytes());
+        hash.update(text.as_bytes());
+    }
+
+    let mut hash = Xxh3::new();
+    visit(value.get(), &mut hash);
+    hash.digest128()
 }
 pub use plexus_proto::{Failure, Raw};
 pub use server::{Server, fail, raw};

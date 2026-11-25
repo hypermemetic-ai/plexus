@@ -220,3 +220,14 @@ async fn keyed_watch_reopens_the_typed_scope_on_refresh() {
     assert_eq!(revoked.code(), unary.code());
     assert!(good.next().await.is_none());
 }
+
+#[test]
+fn fallback_digest_normalizes_nested_objects_and_preserves_list_order() {
+    fn digest(json: &str) -> u128 {
+        plexus::watch_digest(&Raw::parse(json).unwrap())
+    }
+    let initial = digest(r#"{"rows":[{"id":1,"name":"a"},2],"count":2}"#);
+    assert_eq!(initial, digest(r#"{ "count" : 2, "rows" : [ { "name": "\u0061", "id": 1 }, 2 ] }"#));
+    assert_ne!(initial, digest(r#"{"count":2,"rows":[2,{"id":1,"name":"a"}]}"#));
+    assert_ne!(digest("18446744073709551616"), digest("18446744073709551617"));
+}
