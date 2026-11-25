@@ -12,6 +12,9 @@ import select
 import subprocess
 import sys
 import time
+import tempfile
+from capacity_verdict import Schedule, add_arguments, budgets, classify, exit_code
+from server_resources import CpuWindow
 from urllib.parse import urlsplit
 
 
@@ -58,6 +61,7 @@ def main():
     p.add_argument("--profile", choices=("uniform", "hot"), default="uniform")
     p.add_argument("--writes-per-second", type=int, default=4)
     p.add_argument("--read-interval-ms", type=int, default=10000)
+    add_arguments(p)
     args = p.parse_args()
     if not 1 <= args.orgs <= args.users <= 1_000_000 or args.rows < 50 or min(args.seconds,args.read_interval_ms,args.writes_per_second) <= 0:
         p.error("invalid workload dimensions")
@@ -99,8 +103,10 @@ def main():
 
     run = call("prepare", first=0, count=args.users, total=args.users, orgs=args.orgs, seconds=args.seconds)
     record("run", run=run, users=args.users, orgs=args.orgs, rows=args.rows, seconds=args.seconds,
-           profile=args.profile, offered_reads_s=args.users*1000/args.read_interval_ms, offered_writes_s=args.writes_per_second)
+           profile=args.profile, read_interval_ms=args.read_interval_ms, server_budgets=budgets(args), offered_reads_s=args.users*1000/args.read_interval_ms, offered_writes_s=args.writes_per_second)
     with contextlib.ExitStack() as cleanup:
+        window_path = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="watch-fixture-"))) / "window.json"
+        expected_ports = (args.users + 7999)//8000
         def stop():
             try:
                 call("stop", run=run)
@@ -111,7 +117,9 @@ def main():
         fixture = cleanup.enter_context(subprocess.Popen(
             [str(args.bin_dir/"watch-capacity"), "serve-external", str(args.orgs), str(args.rows),
              str(args.ryzen), str(args.mac)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-            env={**os.environ, "WATCH_PROFILE":args.profile, "WATCH_EVALUATION":"shared"}))
+            env={**os.environ, "WATCH_PROFILE":args.profile, "WATCH_EVALUATION":"shared",
+                 "WATCH_SERVER_TIMING":"1", "WATCH_TIMING_WINDOW_FILE":str(window_path),
+                 "WATCH_TIMING_SKIP_READS":str(expected_ports)}))
         cleanup.callback(fixture.kill)
         with fixture.stdin as keys:
             for offset in range(0, args.users, 1024):
@@ -124,6 +132,8 @@ def main():
             raise TimeoutError("fixture did not become ready")
         addresses, pin = fixture.stdout.readline().strip().split()
         sockets = [urlsplit(addr) for addr in addresses.split(",")]
+        if len(sockets) != expected_ports:
+            raise ValueError("fixture listener count differs from expected enrollment probes")
         if any(addr.scheme!="wss" or addr.hostname!=str(args.ryzen) or not addr.port for addr in sockets):
             raise ValueError("unexpected fixture listener")
         record("seeded", server=process_memory(fixture.pid))
@@ -137,15 +147,32 @@ def main():
                tcp=tcp_sample(sockets[0].port, sample_count))
         clock = min((clock_sample() for _ in range(5)), key=lambda m:m["uncertainty_us"])
         record("clock_before", **clock)
-        start = time.time_ns()//1000 + clock["offset_us"] + max(2_000_000, clock["uncertainty_us"]*10)
-        call("start", run=run, **{"unix-us":start})
-        end = wait_phase("result", args.seconds+180)
-        record("result", worker=json.loads(end["result"]), server=process_memory(fixture.pid),
+        local_start_unix_us = time.time_ns()//1000 + max(2_000_000, clock["uncertainty_us"]*10)
+        window = {"start_unix_us":local_start_unix_us, "duration_us":args.seconds*1_000_000}
+        staged = window_path.with_suffix(".tmp")
+        staged.write_text(json.dumps(window))
+        staged.replace(window_path)
+        record("schedule", **window, expected_port_probes=expected_ports)
+        with CpuWindow(fixture.pid, local_start_unix_us, args.seconds) as cpu:
+            call("start", run=run, **{"unix-us":local_start_unix_us + clock["offset_us"]})
+            end = wait_phase("result", args.seconds+180)
+        worker = json.loads(end["result"])
+        schedule = Schedule(args.users, args.orgs, args.seconds, args.read_interval_ms,
+                            args.writes_per_second, args.profile, port_probes=expected_ports)
+        verdict = classify(worker, schedule, budgets(args), remote=True, start_unix_us=local_start_unix_us,
+                           clock_uncertainty_us=clock["uncertainty_us"])
+        record("result", worker=worker, server=process_memory(fixture.pid), server_cpu=cpu.report(),
                tcp=tcp_sample(sockets[0].port, sample_count))
         call("drop", run=run)
         wait_phase("closed", 60 + args.users/4000)
         record("closed", server=process_memory(fixture.pid))
+        record("verdict", verdict=verdict)
+        return exit_code(verdict)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        record("verdict", verdict={"status":"fail","code":"runner_error","reasons":[str(exc)]})
+        raise SystemExit(1)

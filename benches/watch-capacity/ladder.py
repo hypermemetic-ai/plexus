@@ -8,6 +8,7 @@ import platform
 import resource
 import signal
 import subprocess
+from capacity_verdict import Schedule, add_arguments, budgets, classify, exit_code
 
 RUNGS = (1, 10, 100, 1_000, 10_000, 100_000, 250_000, 500_000, 750_000, 1_000_000)
 
@@ -25,15 +26,17 @@ def main():
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--tickets-per-org", type=int, default=2000)
     parser.add_argument("--profile", choices=["uniform","hot"], default="uniform")
-    parser.add_argument("--read-p99-ms", type=float, default=100)
-    parser.add_argument("--update-p99-ms", type=float, default=250)
+    add_arguments(parser)
     args=parser.parse_args()
     if args.seconds < 1 or args.tickets_per_org < 50:
         parser.error("positive duration and at least 50 tickets per organization required")
     binary = args.bin.resolve(strict=True)
     port_range = list(map(int, Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()))
     fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-    env = {**os.environ, "WATCH_PROFILE":args.profile}
+    env = {**os.environ, "WATCH_PROFILE":args.profile, "WATCH_SERVER_TIMING":"1", "WATCH_TIMING_SKIP_READS":"0"}
+    workload = env.get("WATCH_WORKLOAD", "mixed")
+    interval_ms = int(env.get("WATCH_READ_INTERVAL_MS", "10000"))
+    writes_per_second = int(env.get("WATCH_WRITES_PER_SECOND", "4"))
     with args.out.open("x", buffering=1) as out:
         def record(kind, **values):
             row = json.dumps(dict(kind=kind, **values))
@@ -43,7 +46,8 @@ def main():
                cpu=next(l.split(":",1)[1].strip() for l in Path("/proc/cpuinfo").read_text().splitlines() if l.startswith("model name")),
                ticks_per_sec=os.sysconf("SC_CLK_TCK"), mem_available=memory_available(),
                source_ports=port_range, fd_limit=fd_limit, load_average=os.getloadavg(),
-               profile=args.profile, read_p99_ms=args.read_p99_ms, update_p99_ms=args.update_p99_ms)
+               profile=args.profile, server_budgets=budgets(args), workload=workload,
+               read_interval_ms=interval_ms, writes_per_second=writes_per_second)
         previous = None
         for users in RUNGS:
             if users>args.max_users:
@@ -76,11 +80,12 @@ def main():
                 record("stop",users=users,reason=stderr[-2000:] or f"exit {proc.returncode}")
                 return 1
             result=json.loads(stdout)
-            record("rung",**result)
-            for metric,limit in [("read_scheduled_to_receive",args.read_p99_ms),("commit_to_receive",args.update_p99_ms)]:
-                if result[metric]["n"] and result[metric]["p99_us"]>1000*limit:
-                    record("stop",users=users,reason=f"{metric} exceeded {limit} ms")
-                    return 2
+            schedule = Schedule(users, orgs, args.seconds, interval_ms, writes_per_second, args.profile, workload)
+            verdict = classify(result, schedule, budgets(args))
+            record("rung", **result, verdict=verdict)
+            if verdict["status"] != "pass":
+                record("stop", users=users, reason=verdict["code"], verdict=verdict)
+                return exit_code(verdict)
             previous=result
         record("finished",highest_measured=previous["users"])
     return 0
