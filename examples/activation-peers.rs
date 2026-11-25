@@ -1,4 +1,4 @@
-//! A worker behind an outbound connection supplies Studio's named kiln.
+//! A worker behind an outbound connection supplies Studio's injected kiln.
 use plexus::{Caller, Connection, PeerHost, PeerKeys, RunningPeers, tls::Identity};
 use std::{error::Error, io, process::Stdio, time::Duration};
 use tokio::{
@@ -17,17 +17,13 @@ pub mod kiln {
     }
 }
 
-#[plexus::activation]
+#[plexus::activation(injections(Peer<Kiln>))]
 pub mod studio {
     use super::kiln::Kiln;
     use plexus::Peer;
     pub struct Studio;
     impl Studio {
-        pub async fn fire(
-            &self,
-            #[peer("north")] kiln: Peer<Kiln>,
-            degrees: u32,
-        ) -> Result<String, String> {
+        pub async fn fire(&self, kiln: Peer<Kiln>, degrees: u32) -> Result<String, String> {
             kiln.fire(degrees).await.map_err(|e| e.to_string())
         }
         pub fn status(&self) -> String {
@@ -65,17 +61,20 @@ async fn configured(mode: &str, url: &str, dir: &str, identity: &str, pin: &str)
         "studio" => {
             let own = me.principal().to_owned();
             let mut studio = PeerHost::new(studio::Studio, me);
-            studio.peer::<kiln::Kiln>("north").accept(url, pin)?;
-            studio.requires_peer("north")?;
+            studio
+                .inject_peer::<kiln::Kiln>()
+                .required()
+                .accept(url, pin)?;
             let studio = studio.start().await?;
-            println!("Studio is listening at {url}, waiting for north.");
+            println!("Studio is listening at {url}, waiting for its kiln.");
             studio.ready().await;
             fire(&rpc(&studio), &own).await
         }
         "kiln" => {
             let mut kiln = PeerHost::new(kiln::Kiln, me);
-            kiln.peer::<studio::Studio>("studio").dial(url, pin)?;
-            kiln.requires_peer("studio")?;
+            kiln.inject_peer::<studio::Studio>()
+                .required()
+                .dial(url, pin)?;
             let kiln = kiln.start().await?;
             kiln.ready().await;
             println!("Kiln is connected. Press Ctrl-C to stop.");
@@ -95,9 +94,9 @@ async fn local(controller: Option<&str>) -> Result<()> {
             .await?
             .ok_or("missing controller address")?;
         let mut kiln = PeerHost::new(kiln::Kiln, me);
-        kiln.peer::<studio::Studio>("studio")
+        kiln.inject_peer::<studio::Studio>()
+            .required()
             .dial(&url, controller_pin)?;
-        kiln.requires_peer("studio")?;
         let host = kiln.start().await?;
         host.ready().await;
         input.next_line().await?;
@@ -117,16 +116,16 @@ async fn local(controller: Option<&str>) -> Result<()> {
         .ok_or("missing worker pin")?;
     let mut studio = PeerHost::new(studio::Studio, me);
     studio
-        .peer::<kiln::Kiln>("north")
+        .inject_peer::<kiln::Kiln>()
+        .required()
         .accept("wss://127.0.0.1:0", worker_pin)?;
-    studio.requires_peer("north")?;
     let host = studio.start().await?;
     let client = rpc(&host);
     let offline = client.call("studio.status", ()).await.unwrap_err();
     if offline.code() != Some("unavailable") {
         return Err(offline.into());
     }
-    println!("Studio is waiting for its required north kiln.");
+    println!("Studio is waiting for its required kiln.");
     let addr = host.listen_addr("127.0.0.1:0").ok_or("missing listener")?;
     let mut command = worker.stdin.take().ok_or("worker stdin")?;
     command

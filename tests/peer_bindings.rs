@@ -25,7 +25,7 @@ mod kiln {
         }
     }
 }
-#[plexus::activation]
+#[plexus::activation(injections(Peer<Kiln>))]
 mod studio {
     use super::kiln::Kiln;
     use super::{Arc, AtomicU32, Ordering};
@@ -35,18 +35,23 @@ mod studio {
         pub fn status(&self) -> u32 {
             self.0.load(Ordering::SeqCst)
         }
-        pub async fn implicit(&self, k: Peer<Kiln>) -> Result<(u32, String), String> {
+        pub async fn inspect(&self, k: Peer<Kiln>) -> Result<(u32, String), String> {
             self.0.fetch_add(1, Ordering::SeqCst);
             k.who().await.map_err(|e| e.to_string())
         }
-        pub async fn north(
+        pub async fn verify(&self, k: plexus::Peer<Kiln>) -> Result<(u32, String), String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            k.who().await.map_err(|e| e.to_string())
+        }
+        pub async fn identities(
             &self,
-            #[peer("north")] k: plexus::Peer<Kiln>,
-        ) -> Result<(u32, String), String> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            k.who().await.map_err(|e| e.to_string())
+            user: plexus::User,
+            kiln: Peer<Kiln>,
+        ) -> Result<(String, String), String> {
+            let (_, service) = kiln.who().await.map_err(|error| error.to_string())?;
+            Ok((user.principal().into(), service))
         }
-        pub fn streamed(&self, #[peer("north")] _k: Peer<Kiln>) -> impl Iterator<Item = u32> {
+        pub fn streamed(&self, _k: Peer<Kiln>) -> impl Iterator<Item = u32> {
             0..2
         }
     }
@@ -76,18 +81,20 @@ async fn worker(seed: u8, url: &str, controller: &str) -> RunningPeers {
 }
 
 #[tokio::test]
-async fn method_injection_named_selection_proxy_and_reconnect() {
+async fn application_selects_the_injected_peer_independently_of_the_proxy() {
     tokio::time::timeout(Duration::from_secs(6), async {
         let local = key(1);
         let pin = local.principal().to_owned();
         let count = Arc::new(AtomicU32::new(0));
         let mut studio = PeerHost::new(studio::Studio(count.clone()), local);
-        for (name, seed) in [("north", 2), ("south", 3)] {
-            studio
-                .peer::<kiln::Kiln>(name)
-                .accept("wss://127.0.0.1:0", key(seed).principal())
-                .unwrap();
-        }
+        studio
+            .peer::<kiln::Kiln>("north")
+            .accept("wss://127.0.0.1:0", key(2).principal())
+            .unwrap();
+        studio
+            .inject_peer::<kiln::Kiln>()
+            .accept("wss://127.0.0.1:0", key(3).principal())
+            .unwrap();
         studio.mount_peer("kiln", "north").unwrap();
         let host = studio.start().await.unwrap();
         let client = rpc(&host);
@@ -95,7 +102,7 @@ async fn method_injection_named_selection_proxy_and_reconnect() {
         assert!(host.is_ready());
         assert_eq!(client.call("studio.status", ()).await.unwrap().get(), "0");
         assert_eq!(
-            client.call("studio.north", ()).await.unwrap_err().code(),
+            client.call("studio.verify", ()).await.unwrap_err().code(),
             Some("unavailable")
         );
         assert_eq!(
@@ -103,31 +110,45 @@ async fn method_injection_named_selection_proxy_and_reconnect() {
             Some("unavailable")
         );
         assert_eq!(
-            client.call("studio.implicit", ()).await.unwrap_err().code(),
-            Some("ambiguous-peer")
+            client.call("studio.inspect", ()).await.unwrap_err().code(),
+            Some("unavailable")
         );
         assert_eq!(count.load(Ordering::SeqCst), 0);
         let north = worker(2, &url, &pin).await;
         let south = worker(3, &url, &pin).await;
         north.ready().await;
         south.ready().await;
-        for name in ["north", "south"] {
+        for name in ["north", "kiln"] {
             while host.peer::<kiln::Kiln>(name).is_err() {
                 tokio::task::yield_now().await;
             }
         }
         assert_eq!(
             serde_json::from_str::<(u32, String)>(
-                client.call("studio.north", ()).await.unwrap().get()
+                client.call("studio.verify", ()).await.unwrap().get()
             )
             .unwrap(),
-            (2, pin.clone())
+            (3, pin.clone())
         );
         assert_eq!(
             client.call("studio.kiln.who", ()).await.unwrap().get(),
             r#"[2,"user:ada"]"#
         );
-        let k = host.peer::<kiln::Kiln>("south").unwrap();
+        assert_eq!(
+            serde_json::from_str::<(u32, String)>(
+                client.call("studio.inspect", ()).await.unwrap().get()
+            )
+            .unwrap(),
+            (3, pin.clone())
+        );
+        assert_eq!(
+            serde_json::from_str::<(String, String)>(
+                client.call("studio.identities", ()).await.unwrap().get()
+            )
+            .unwrap(),
+            ("user:ada".into(), pin.clone())
+        );
+        let k = host.peer::<kiln::Kiln>("kiln").unwrap();
         assert_eq!(k.who().await.unwrap(), (3, pin.clone()));
         assert_eq!(
             k.sequence(3)
@@ -150,7 +171,7 @@ async fn method_injection_named_selection_proxy_and_reconnect() {
         );
         assert_eq!(
             client
-                .call("studio.north", serde_json::json!({"k":"south"}))
+                .call("studio.verify", serde_json::json!({"k":"south"}))
                 .await
                 .unwrap_err()
                 .code(),
@@ -159,21 +180,22 @@ async fn method_injection_named_selection_proxy_and_reconnect() {
         let tree = client.call("_tree", ()).await.unwrap();
         assert!(!tree.get().contains("south") && !tree.get().contains("north"));
         assert!(tree.get().contains("studio.kiln"));
-        drop(north);
-        while host.peer::<kiln::Kiln>("north").is_ok() {
+        drop(south);
+        while host.peer::<kiln::Kiln>("kiln").is_ok() {
             tokio::task::yield_now().await;
         }
         assert_eq!(
-            client.call("studio.north", ()).await.unwrap_err().code(),
+            client.call("studio.verify", ()).await.unwrap_err().code(),
             Some("unavailable")
         );
-        let north = worker(2, &url, &pin).await;
-        north.ready().await;
-        while host.peer::<kiln::Kiln>("north").is_err() {
+        assert!(host.peer::<kiln::Kiln>("north").is_ok());
+        let south = worker(3, &url, &pin).await;
+        south.ready().await;
+        while host.peer::<kiln::Kiln>("kiln").is_err() {
             tokio::task::yield_now().await;
         }
-        assert!(client.call("studio.north", ()).await.is_ok());
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        assert!(client.call("studio.verify", ()).await.is_ok());
+        assert_eq!(count.load(Ordering::SeqCst), 3);
     })
     .await
     .expect("peer sessions became ready");
@@ -184,10 +206,10 @@ async fn required_binding_opens_only_after_pin_and_interface_verify() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let count = Arc::new(AtomicU32::new(0));
         let mut s = PeerHost::new(studio::Studio(count.clone()), key(1));
-        s.peer::<kiln::Kiln>("north")
+        s.inject_peer::<kiln::Kiln>()
+            .required()
             .accept("wss://127.0.0.1:0", key(2).principal())
             .unwrap();
-        s.requires_peer("north").unwrap();
         let host = s.start().await.unwrap();
         let client = rpc(&host);
         let addr = host.listen_addr("127.0.0.1:0").unwrap();
@@ -223,7 +245,13 @@ async fn required_binding_opens_only_after_pin_and_interface_verify() {
         );
         let worker = worker(2, &url, key(1).principal()).await;
         host.ready().await;
-        assert!(client.call("studio.implicit", ()).await.is_ok());
+        assert_eq!(
+            serde_json::from_str::<(u32, String)>(
+                client.call("studio.inspect", ()).await.unwrap().get()
+            )
+            .unwrap(),
+            (2, key(1).principal().to_owned())
+        );
         drop(worker);
         while host.is_ready() {
             tokio::task::yield_now().await;
@@ -253,13 +281,45 @@ fn keystore_references_and_generated_contract() {
     assert!(keys.identity("keystore://../studio").is_err());
     assert!(keys.pin("keystore://studio").is_err());
     assert!(!studio::CLIENT_TS.contains("Peer<"));
+    assert_eq!(
+        <studio::Studio as plexus::Serve>::PEER_INJECTIONS,
+        &[plexus::PeerDependency::of::<kiln::Kiln>()]
+    );
     let ir: serde_json::Value = serde_json::from_str(studio::IR).unwrap();
-    let north = ir["methods"]
+    let method = ir["methods"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|m| m["name"] == "north")
+        .find(|m| m["name"] == "verify")
         .unwrap();
-    assert!(north["params"].as_array().is_none_or(Vec::is_empty));
+    assert!(method["params"].as_array().is_none_or(Vec::is_empty));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn two_candidates_require_an_application_choice_before_listening() {
+    let mut studio = PeerHost::new(studio::Studio(Default::default()), key(1));
+    for (name, seed) in [("first", 2), ("second", 3)] {
+        studio
+            .peer::<kiln::Kiln>(name)
+            .accept("wss://127.0.0.1:0", key(seed).principal())
+            .unwrap();
+    }
+    let err = studio.start().await.err().expect("ambiguous wiring");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(err.to_string().contains("kiln"));
+}
+
+#[tokio::test]
+async fn missing_provider_only_blocks_methods_that_use_it() {
+    let studio = PeerHost::new(studio::Studio(Default::default()), key(1))
+        .start()
+        .await
+        .unwrap();
+    let client = rpc(&studio);
+    assert_eq!(client.call("studio.status", ()).await.unwrap().get(), "0");
+    assert_eq!(
+        client.call("studio.inspect", ()).await.unwrap_err().code(),
+        Some("unavailable")
+    );
 }

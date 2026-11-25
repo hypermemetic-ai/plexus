@@ -76,8 +76,8 @@ impl CallContext {
             .ok_or_else(|| failure("invalid-params", "this method requires an input stream"))
     }
 
-    pub fn peer<T: crate::PeerInterface>(&self, slot: Option<&str>) -> Result<crate::Peer<T>, Failure> {
-        self.peers.as_ref().ok_or_else(|| failure("unavailable", "activation has no peer bindings"))?.resolve(slot)
+    pub fn peer<T: crate::PeerInterface>(&self) -> Result<crate::Peer<T>, Failure> {
+        self.peers.as_ref().ok_or_else(|| failure("unavailable", "activation has no peer bindings"))?.resolve(None)
     }
 
     pub fn caller(&self) -> Option<&Caller> {

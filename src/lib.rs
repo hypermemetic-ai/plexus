@@ -62,7 +62,7 @@ mod listener;
 mod connection;
 pub mod peer;
 mod bindings;
-pub use bindings::{Peer, PeerInterface};
+pub use bindings::{Peer, PeerDependency, PeerInterface};
 #[cfg(feature = "tls")]
 mod peer_host;
 #[cfg(feature = "tls")]
@@ -127,6 +127,8 @@ impl<'de> serde::Deserialize<'de> for Json {
 pub trait Serve: Send + Sized + 'static {
     /// Where it is served unless told otherwise: its own name.
     const NAME: &'static str;
+    /// Interfaces requested by this activation's native methods.
+    const PEER_INJECTIONS: &'static [PeerDependency] = &[];
     /// Register every method on `server` under `at`, with its IR and hash,
     /// and every child under `<at>.<child>`; say its hash at hello.
     fn serve(self, server: &mut Server, at: &str);
@@ -199,6 +201,9 @@ pub struct Caller {
     principal: std::sync::Arc<str>,
     via: Option<std::sync::Arc<str>>,
 }
+
+/// The authenticated user supplied to an activation method.
+pub use Caller as User;
 
 impl Caller {
     pub fn new(principal: impl Into<String>) -> Caller {

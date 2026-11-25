@@ -77,6 +77,7 @@ pub struct PeerHost {
     server: Server,
     identity: Identity,
     bindings: Bindings,
+    injections: &'static [crate::PeerDependency],
     endpoints: Vec<Endpoint>,
 }
 impl PeerHost {
@@ -90,6 +91,7 @@ impl PeerHost {
                 root: A::NAME.to_owned(),
                 ..Default::default()
             },
+            injections: A::PEER_INJECTIONS,
             endpoints: Vec::new(),
         }
     }
@@ -101,8 +103,17 @@ impl PeerHost {
         PeerBuilder {
             host: self,
             name,
+            provider: false,
+            required: false,
             marker: std::marker::PhantomData,
         }
+    }
+    /// Bind the provider injected into every Peer<T> parameter on this activation.
+    /// Its local binding name is the interface namespace.
+    pub fn inject_peer<T: PeerInterface>(&mut self) -> PeerBuilder<'_, T> {
+        let mut peer = self.peer::<T>(T::NAMESPACE);
+        peer.provider = true;
+        peer
     }
     /// Publish an existing binding as a child, forwarding the inbound caller.
     /// The child name is relative to the activation's canonical namespace.
@@ -119,7 +130,7 @@ impl PeerHost {
         self.server.mount_peer_at(
             &place,
             Box::new(Proxy {
-                namespace: binding.namespace,
+                namespace: binding.interface.namespace,
                 live: binding.live.clone(),
             }),
         )
@@ -135,6 +146,14 @@ impl PeerHost {
     }
     /// Bind listeners and start dialing before applying activation readiness.
     pub async fn start(mut self) -> io::Result<RunningPeers> {
+        for interface in self.injections {
+            self.bindings.provider(*interface).map_err(|_| {
+                invalid(&format!(
+                    "multiple bindings for {}: select a provider with inject_peer",
+                    interface.namespace
+                ))
+            })?;
+        }
         let bindings = Arc::new(self.bindings);
         self.server.peers = Some(bindings.clone());
         let server = Arc::new(self.server);
@@ -244,9 +263,17 @@ impl PeerHost {
 pub struct PeerBuilder<'a, T> {
     host: &'a mut PeerHost,
     name: &'a str,
+    provider: bool,
+    required: bool,
     marker: std::marker::PhantomData<T>,
 }
 impl<T: PeerInterface> PeerBuilder<'_, T> {
+    /// Gate the activation on this authenticated connection.
+    pub fn required(mut self) -> Self {
+        self.required = true;
+        self
+    }
+
     fn install(self, make: impl FnOnce(Target) -> Endpoint) -> io::Result<()> {
         if !crate::context::valid_name(self.name)
             || self.host.bindings.slots.contains_key(self.name)
@@ -261,11 +288,14 @@ impl<T: PeerInterface> PeerBuilder<'_, T> {
         self.host.bindings.slots.insert(
             self.name.into(),
             Slot {
-                namespace: T::NAMESPACE,
-                hash: T::HASH,
+                interface: crate::PeerDependency::of::<T>(),
+                provider: self.provider,
                 live,
             },
         );
+        if self.required {
+            self.host.bindings.required.push(self.name.to_owned());
+        }
         Ok(())
     }
     pub fn accept(self, url: &str, pin: impl AsRef<str>) -> io::Result<()> {
