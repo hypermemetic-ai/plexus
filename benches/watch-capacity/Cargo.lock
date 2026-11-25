@@ -1155,6 +1155,7 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "plexus",
+ "plexus-proto",
  "rusqlite",
  "serde",
  "serde_json",

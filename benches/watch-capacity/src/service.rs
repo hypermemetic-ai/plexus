@@ -1,4 +1,6 @@
 //! Native transport and query baseline, independent of the proposed watch IR.
+mod timing;
+
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::sync::{
@@ -65,6 +67,7 @@ impl Drop for SharedWatch {
 }
 
 pub struct Store {
+    timing: Option<Arc<timing::Timing>>,
     db: Mutex<Connection>,
     members: HashMap<String, usize>,
     queries: AtomicU64,
@@ -89,6 +92,7 @@ impl Store {
         ensure!(matches!(encoding.as_str(), "shared" | "per-call"), "unknown encoding mode");
         let mut store = Self::configured(keys, orgs, rows, hot, mode == "shared")?;
         store.share_encoding = encoding == "shared";
+        store.timing = timing::Timing::configured(orgs)?;
         Ok(store)
     }
 
@@ -124,6 +128,7 @@ impl Store {
             .map(|(i, k)| (k.clone(), crate::user_org(i, orgs, hot)))
             .collect();
         Ok(Self {
+            timing: None,
             groups: shared.then(|| {
                 (0..orgs)
                     .map(|_| Group {
@@ -241,6 +246,9 @@ impl Store {
             rusqlite::params![format!("Revision {seq}"), org as i64],
         )
         .unwrap();
+        if let Some(meter) = &self.timing {
+            meter.committed(org, seq);
+        }
         source.send_replace(Revision {
             seq,
             committed_us: crate::clock_us(),
@@ -261,7 +269,7 @@ impl Store {
 pub mod tickets {
     use super::Store;
     use futures::future::Either;
-    use futures::{Stream, stream};
+    use futures::{Stream, StreamExt, stream};
     use plexus::Caller;
     use std::sync::Arc;
 
@@ -288,8 +296,9 @@ pub mod tickets {
         pub fn watch(&self, caller: &Caller) -> impl Stream<Item = plexus::Encoded<Page>> {
             let store = self.0.clone();
             let org = store.members[caller.principal()];
-            if let Some(subscription) = store.subscribe(org) {
-                return Either::Left(stream::unfold(
+            let observed = store.timing.as_ref().map(|m| m.watch(org));
+            let items = if let Some(subscription) = store.subscribe(org) {
+                Either::Left(stream::unfold(
                     (subscription, None),
                     |(mut subscription, mut last)| async move {
                         loop {
@@ -307,24 +316,29 @@ pub mod tickets {
                             return Some((current.page.answer(&subscription.store), (subscription, Some(version))));
                         }
                     },
-                ));
-            }
-            let rx = store.revisions[org].subscribe();
-            Either::Right(stream::unfold(
-                (store, rx, None),
-                move |(store, mut rx, previous)| async move {
-                    loop {
-                        if previous.is_some() {
-                            rx.changed().await.ok()?;
+                ))
+            } else {
+                let rx = store.revisions[org].subscribe();
+                Either::Right(stream::unfold(
+                    (store, rx, None),
+                    move |(store, mut rx, previous)| async move {
+                        loop {
+                            if previous.is_some() {
+                                rx.changed().await.ok()?;
+                            }
+                            rx.borrow_and_update();
+                            let current = store.evaluate(org);
+                            if previous != Some(current.digest) {
+                                return Some((current.page.answer(&store), (store, rx, Some(current.digest))));
+                            }
                         }
-                        rx.borrow_and_update();
-                        let current = store.evaluate(org);
-                        if previous != Some(current.digest) {
-                            return Some((current.page.answer(&store), (store, rx, Some(current.digest))));
-                        }
-                    }
-                },
-            ))
+                    },
+                ))
+            };
+            items.map(move |item| {
+                let _ = &observed;
+                item
+            })
         }
     }
 }
@@ -366,6 +380,7 @@ fn serving(store: Arc<Store>, observer: String, lanes: std::num::NonZeroUsize, c
                 }
             }
             plexus::raw(&serde_json::json!({
+                "server_timing": store.timing.as_ref().map(|m| m.snapshot()),
                 "activation_lanes": lanes.get(),
                 "dispatch": if concurrent { "concurrent" } else { "tenant" },
                 "encoding": if store.share_encoding { "shared" } else { "per-call" },
@@ -420,6 +435,10 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
                 tokio::spawn(async move {
                     if let Ok((channel, principal)) = listener.accept(tcp).await {
                         let org = store.members[&principal];
+                        let channel = match &store.timing {
+                            Some(meter) => meter.wrap(channel, org),
+                            None => channel,
+                        };
                         let _ = servers[org % servers.len()]
                             .serve_as(channel, plexus::Caller::new(principal))
                             .await;
