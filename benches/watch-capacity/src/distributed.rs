@@ -377,7 +377,7 @@ pub async fn generator(
 
 /// Open each write at its scheduled time. The pinned worker admits at most four
 /// writes per second and an acknowledgement expires ten seconds after opening.
-async fn scheduled_writes<F, A>(
+pub(super) async fn scheduled_writes<F, A>(
     start: Instant,
     rate: u64,
     schedule: impl Iterator<Item = (usize, usize)>,

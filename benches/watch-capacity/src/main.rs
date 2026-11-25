@@ -322,7 +322,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
                 }
             }
             let expected = expected_for_watch;
-            ensure!(previous == expected as u64, "watch {index} got {previous}, expected {expected}");
+            ensure!(previous == expected, "watch {index} got {previous}, expected {expected}");
             Ok::<_, anyhow::Error>(())
         });
         if workload == "updates" {
@@ -354,32 +354,23 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         });
     }
     eprintln!("load: {users} watches; starting scheduled reads and writes");
-    let mut expected = 0;
-    let mut written = vec![0; orgs];
-    let mut write_latency = histogram();
-    for w in 0..writes {
-        let due = start + Duration::from_secs_f64(w as f64 / rate as f64);
-        sleep_until(due).await;
-        let org = target_org(w);
-        written[org] += 1;
-        let reply = timeout(
-            Duration::from_secs(10),
-            writers[org].call("tickets.advance", ()),
-        )
-        .await.with_context(|| format!("write {w} to organization {org} exceeded 10s; completed reads={}, observed deliveries={}, server={:?}", read_latency.lock().unwrap().len(), delivery.lock().unwrap().len(), process(pid)))??;
-        ensure!(
-            reply.get().parse::<usize>()? == written[org],
-            "write failed"
-        );
-        write_latency.record(due.elapsed().as_micros() as u64)?;
-        expected += population[org];
-    }
+    let expected: u64 = target_counts.iter().zip(&population)
+        .map(|(writes, users)| writes * *users as u64)
+        .sum();
+    let schedule = (0..writes).map(|index| (index, target_org(index)));
+    let write_latency = distributed::scheduled_writes(start, rate, schedule, &target_counts, |org| {
+        let response = writers[org].call("tickets.advance", ());
+        async move { Ok(response.await?.get().parse::<u64>()?) }
+    }).await.with_context(|| format!(
+        "write schedule failed; completed reads={}, observed deliveries={}, server={:?}",
+        read_latency.lock().unwrap().len(), delivery.lock().unwrap().len(), process(pid)
+    ))?;
     sleep_until(start + length).await;
     while let Some(result) = readers.join_next().await {
         result??;
     }
     let grace = Instant::now() + Duration::from_secs(5);
-    while delivery.lock().unwrap().len() < expected as u64 && Instant::now() < grace {
+    while delivery.lock().unwrap().len() < expected && Instant::now() < grace {
         sleep(Duration::from_millis(10)).await;
     }
     let elapsed_s = start.elapsed().as_secs_f64();
@@ -397,7 +388,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
             units.push(("read", read_latency.lock().unwrap().len()));
         } else if workload == "updates" {
             units.push(("committed_update_including_fanout", writes as u64));
-            units.push(("delivered_page_including_commit", expected as u64));
+            units.push(("delivered_page_including_commit", expected));
         }
         Some(json!({
             "scope":"fixture process; retired user instructions, process CPU includes user and kernel",
@@ -421,7 +412,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         result??;
     }
     ensure!(
-        delivery.lock().unwrap().len() == expected as u64,
+        delivery.lock().unwrap().len() == expected,
         "incomplete fan-out"
     );
     drop(held);
