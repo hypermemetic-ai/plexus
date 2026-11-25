@@ -60,6 +60,42 @@ server.mount("studio.kiln", Box::new(kiln));
 
 The wire reserves `_hash` and `_ir` for interface discovery at each activation. The canonical `studio.kiln._hash` describes the public interface. A client binding at `studio[tenant=acme].kiln` can use `studio[tenant=acme].kiln._hash`, which runs Studio's opening check. Named keys for separate local openings belong on their individual path segments.
 
+## Distributed peers
+
+Run the two-process demo from this checkout. It generates disposable identities,
+starts a controller on a free loopback TCP port and starts a worker that dials it.
+
+```sh
+cargo run --locked --features tls --example distributed-peers
+```
+
+The controller opens `worker.watch`. While the watch is live, the worker handles
+`worker.check_in` by calling `controller.identify` on the same authenticated
+WebSocket. The controller checks the callback result, cancels its watch and
+checks that `worker.status` still answers. Both processes then exit.
+
+For separate machines, build the example on both. Use an existing Synapse
+Ed25519 key file on each host and exchange the public pins printed by
+`distributed-peers principal KEY_FILE`. Supply a reachable controller address.
+
+```sh
+# Controller
+target/debug/examples/distributed-peers controller "$CONTROLLER_KEY_FILE" "$WORKER_PIN" "$LISTEN_ADDR"
+
+# Worker
+target/debug/examples/distributed-peers worker "$WORKER_KEY_FILE" "$CONTROLLER_PIN" "$CONTROLLER_WSS_URL"
+```
+
+Both ends call `peer::connect` with the principal verified by TLS, their local
+server and the interface they require. The worker uses `Side::Dial`, the
+controller `Side::Accept`. A peer offer exchanges the protocol version, side,
+served interface and required interface before dispatch. On this opt-in channel
+odd call IDs belong to the dialer and even IDs to the acceptor. The returned
+`Connection` uses the usual call and stream APIs, including binary input,
+credit and cancellation. Drive its companion future for the session lifetime.
+After a disconnect, establish a new authenticated session for new work. An
+interrupted call can have taken effect at its destination.
+
 ## Callers and context in native activations
 
 `Listen::spawn` supplies the verified peer to each call on the connection. An application accepting its own connections can use `server.serve_as(channel, verified_caller)` after authentication. `server.serve(channel)` serves anonymous calls. A method can take `caller: &Caller` to require a caller, or `Option<&Caller>` to accept either. The client sends only the ordinary method arguments.

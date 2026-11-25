@@ -182,6 +182,10 @@ impl Server {
         self.methods.get_mut(&address).expect("register the method before its grant").grant = Some((grant, roles));
     }
 
+    pub(crate) fn interface(&self) -> Option<&str> {
+        self.interface.as_deref()
+    }
+
     /// The interface hash said at hello, the first frame of every connection.
     pub fn hello(&mut self, interface: &str) {
         self.interface = Some(interface.to_owned());

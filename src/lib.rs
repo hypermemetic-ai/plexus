@@ -60,6 +60,7 @@ pub use input::{Input, RawInput};
 #[cfg(feature = "tokio")]
 mod listener;
 mod connection;
+pub mod peer;
 mod context;
 mod grant;
 pub use grant::Grant;

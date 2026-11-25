@@ -201,6 +201,7 @@ struct Shared {
     /// Closed once the channel has.
     tell: mpsc::UnboundedSender<Told>,
     next: AtomicU32,
+    stride: u32,
     expects: Option<String>,
     hello: future::Shared<oneshot::Receiver<String>>,
 }
@@ -215,6 +216,12 @@ impl Connection {
     ///
     /// [`ready`]: Connection::ready
     pub fn new(channel: Channel, expects: Option<&str>) -> (Connection, impl Future<Output = io::Result<()>> + Send + 'static) {
+        Self::numbered(channel, expects, 1, 1)
+    }
+
+    pub(crate) fn numbered(channel: Channel, expects: Option<&str>, first: u32, stride: u32)
+        -> (Connection, impl Future<Output = io::Result<()>> + Send + 'static + use<>)
+    {
         let (out, frames) = crate::channel::out();
         let (said, hello) = oneshot::channel();
         let (tell, told) = mpsc::unbounded();
@@ -224,7 +231,8 @@ impl Connection {
             out,
             tell,
             uploads,
-            next: AtomicU32::new(1),
+            next: AtomicU32::new(first),
+            stride,
             expects: expects.map(str::to_owned),
             hello: hello.shared(),
         });
@@ -368,7 +376,10 @@ impl Connection {
     /// item is in, unless the end is right behind it ([`Slot::window`]).
     fn open(&self, method: &str, params: Option<Raw>, window: bool, input: Option<Source>) -> Result<Open, Error> {
         let inbox = Arc::new(Inbox::default());
-        let id = self.shared.next.fetch_add(1, Ordering::Relaxed);
+        // Zero marks exhaustion. Never reuse an ID while a previous call may be live.
+        let id = self.shared.next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            (id != 0).then(|| id.checked_add(self.shared.stride).unwrap_or(0))
+        }).map_err(|_| Error::Failed(crate::fail("call-ids-exhausted", "open a new connection", ())))?;
         // Told before the open is sent, so before any answer can arrive.
         let mut slot = Slot::new(inbox.clone(), window);
         let with_input = input.is_some();

@@ -94,3 +94,7 @@ required-features = ["store"]
 [[example]]
 name = "autobahn"
 required-features = ["tokio"]
+
+[[example]]
+name = "distributed-peers"
+required-features = ["tls"]
