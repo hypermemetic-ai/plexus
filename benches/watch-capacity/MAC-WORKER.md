@@ -88,3 +88,16 @@ For successive populations, keep the foreground worker available and use the
 worker's local MAX_USERS to the largest population the operator intends to
 permit. Each rung uses fresh user keys, a fresh fixture and a fresh run ID.
 The ladder fetches the complete worker result and retains per-profile verdicts.
+
+The generator opens each scheduled write while earlier acknowledgements can
+still be in flight. It bounds outstanding writes at 64 and gives each issued
+call ten seconds to finish. Before reporting a result it checks that every
+organization assigned to this worker returned its full contiguous set of
+revisions, including when acknowledgements arrive in a different order.
+
+On a generator error, `worker.status` returns the phase and up to 1,024
+characters of the cause. The generator emits this terminal event and the
+supervisor records it. Rebuild both Mac executables and restart the foreground
+worker to enable the diagnostic. If the OS terminates the process before it
+can emit an error, the worker reports the interrupted protocol and its local
+stderr remains available to the operator.

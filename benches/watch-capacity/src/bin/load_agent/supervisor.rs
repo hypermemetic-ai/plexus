@@ -102,6 +102,13 @@ impl Run {
     }
     fn event(&mut self, event: Value) -> Result<()> {
         match (self.phase, event["event"].as_str()) {
+            (_, Some("error")) => {
+                let reason = event["message"]
+                    .as_str()
+                    .context("missing generator error")?;
+                let reason: String = reason.chars().take(1024).collect();
+                bail!("generator {}: {reason}", self.phase.name());
+            }
             (Phase::Preparing, Some("principal")) => {
                 let index = u64::from(self.first) + self.keys.len() as u64;
                 ensure!(

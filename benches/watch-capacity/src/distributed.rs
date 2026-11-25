@@ -301,8 +301,10 @@ pub async fn generator(
                 );
             while due < finish {
                 sleep_until(due).await;
-                let value =
-                    timeout(Duration::from_secs(10), conn.call("tickets.list", ())).await??;
+                let value = timeout(Duration::from_secs(10), conn.call("tickets.list", ()))
+                    .await
+                    .with_context(|| format!("user {index}, org {org}: read exceeded 10 seconds"))?
+                    .with_context(|| format!("user {index}, org {org}: read failed"))?;
                 verify(value.get(), org)?;
                 reads
                     .lock()
@@ -313,24 +315,14 @@ pub async fn generator(
             Ok::<_, anyhow::Error>(())
         });
     }
-    let mut acks = histogram();
-    let mut revisions = HashMap::<usize, u64>::new();
-    for n in 0..writes {
-        let org = target(n);
-        if let Some(writer) = writers.get(&org) {
-            let due = start + Duration::from_secs_f64(n as f64 / rate as f64);
-            sleep_until(due).await;
-            let ack =
-                timeout(Duration::from_secs(10), writer.call("tickets.advance", ())).await??;
-            let seq = revisions.entry(org).or_default();
-            *seq += 1;
-            ensure!(
-                ack.get().parse::<u64>()? == *seq,
-                "unexpected commit sequence"
-            );
-            acks.record(due.elapsed().as_micros() as u64)?;
-        }
-    }
+    let schedule = (0..writes)
+        .map(|n| (n, target(n)))
+        .filter(|(_, org)| writers.contains_key(org));
+    let acks = scheduled_writes(start, rate, schedule, &wanted, |org| {
+        let response = writers[&org].call("tickets.advance", ());
+        async move { Ok(response.await?.get().parse::<u64>()?) }
+    })
+    .await?;
     sleep_until(finish).await;
     while let Some(joined) = readers.join_next().await {
         joined??;
@@ -381,4 +373,123 @@ pub async fn generator(
         let _ = driver.await;
     }
     emit(json!({"event":"closed"}))
+}
+
+/// Open each write at its scheduled time. The pinned worker admits at most four
+/// writes per second and an acknowledgement expires ten seconds after opening.
+async fn scheduled_writes<F, A>(
+    start: Instant,
+    rate: u64,
+    schedule: impl Iterator<Item = (usize, usize)>,
+    wanted: &[u64],
+    mut open: F,
+) -> Result<hdrhistogram::Histogram<u64>>
+where
+    F: FnMut(usize) -> A,
+    A: Future<Output = Result<u64>> + Send + 'static,
+{
+    const MAX_IN_FLIGHT: usize = 64;
+
+    let mut pending = JoinSet::new();
+    let mut revisions: HashMap<usize, HashSet<u64>> = HashMap::new();
+    let mut acks = histogram();
+    let mut record = |(org, revision, elapsed): (usize, u64, Duration)| -> Result<()> {
+        ensure!(
+            (1..=wanted[org]).contains(&revision),
+            "out-of-range revision {revision} for org {org}"
+        );
+        ensure!(
+            revisions.entry(org).or_default().insert(revision),
+            "duplicate revision {revision} for org {org}"
+        );
+        acks.record(elapsed.as_micros() as u64)?;
+        Ok(())
+    };
+    for (index, org) in schedule {
+        let due = start + Duration::from_secs_f64(index as f64 / rate as f64);
+        sleep_until(due).await;
+        while let Some(joined) = pending.try_join_next() {
+            record(joined??)?;
+        }
+        ensure!(
+            pending.len() < MAX_IN_FLIGHT,
+            "generator write backlog reached {MAX_IN_FLIGHT}"
+        );
+        // Connection::call opens immediately, before its response future is polled.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let response = open(org);
+        pending.spawn(async move {
+            let revision = tokio::time::timeout_at(deadline, response)
+                .await
+                .with_context(|| {
+                    format!(
+                        "scheduled write {index}, org {org}: acknowledgement exceeded 10 seconds"
+                    )
+                })?
+                .with_context(|| format!("scheduled write {index}, org {org}: call failed"))?;
+            Ok::<_, anyhow::Error>((org, revision, due.elapsed()))
+        });
+    }
+    while let Some(joined) = pending.join_next().await {
+        record(joined??)?;
+    }
+    for (org, seen) in revisions {
+        ensure!(
+            seen.len() as u64 == wanted[org],
+            "missing revisions for org {org}"
+        );
+    }
+    Ok(acks)
+}
+
+#[cfg(test)]
+mod write_schedule_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn opens_second_write_before_first_ack_and_validates_reordered_revisions() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let mut sequence = 0;
+        let result = timeout(
+            Duration::from_secs(2),
+            scheduled_writes(
+                Instant::now(),
+                100,
+                [(0, 0), (1, 0)].into_iter(),
+                &[2],
+                |_| {
+                    sequence += 1;
+                    let number = sequence;
+                    let gate = Arc::clone(&gate);
+                    async move {
+                        if number == 1 {
+                            gate.notified().await;
+                            Ok(2)
+                        } else {
+                            gate.notify_one();
+                            Ok(1)
+                        }
+                    }
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejects_duplicate_revision() {
+        let error = scheduled_writes(
+            Instant::now(),
+            100,
+            [(0, 0), (1, 0)].into_iter(),
+            &[2],
+            |_| async { Ok(1) },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("duplicate revision"));
+    }
 }

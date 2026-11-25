@@ -96,7 +96,9 @@ with tempfile.TemporaryDirectory() as directory:
         r3 = rpc("prepare", plan)
         wait(r3, "keys_ready")
         rpc("connect", {**connect, "run": r3, "pin": worker_pin})
-        assert wait(r3, "failed")["error"]
+        failure = wait(r3, "failed")["error"]
+        assert failure.startswith("generator connecting: "), failure
+        assert len(failure) > len("generator connecting: ")
         r4 = rpc("prepare", plan)
         wait(r4, "keys_ready")
         child_pid = int(subprocess.check_output(["pgrep", "-P", str(service.pid)], text=True).strip())

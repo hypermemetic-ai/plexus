@@ -472,13 +472,18 @@ fn main() -> Result<()> {
             runtime.block_on(service::run(orgs.parse()?, rows.parse()?, access))
         }
         [mode, first, count, total, orgs, seconds] if mode == "generator" => {
-            runtime.block_on(distributed::generator(
+            let outcome = runtime.block_on(distributed::generator(
                 first.parse()?,
                 count.parse()?,
                 total.parse()?,
                 orgs.parse()?,
                 seconds.parse()?,
-            ))
+            ));
+            if let Err(error) = &outcome {
+                let reason: String = format!("{error:#}").chars().take(1024).collect();
+                println!("{}", serde_json::json!({"event":"error","message":reason}));
+            }
+            outcome
         }
         #[cfg(target_os = "linux")]
         [users, orgs, seconds, rows] => runtime.block_on(run(
