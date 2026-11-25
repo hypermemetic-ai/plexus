@@ -176,6 +176,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     let urls: Vec<_> = urls.split(',').collect();
     let pid = server.0.id();
     let baseline = process(pid)?;
+    eprintln!("opening {users} WSS sessions on {} listener(s)", urls.len());
     let open_start = Instant::now();
     let mut sessions: Vec<_> = stream::iter(keys.into_iter().enumerate())
         .map(|(i, key)| {
@@ -185,7 +186,8 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
                     Duration::from_secs(20),
                     open(key, url, pin, user_org(i, orgs, hot)),
                 )
-                .await??;
+                .await
+                .with_context(|| format!("initial watch timed out for user {i}"))??;
                 Ok::<_, anyhow::Error>((i, session))
             }
         })
@@ -195,6 +197,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     sessions.sort_by_key(|s| s.0);
     let open_ms = open_start.elapsed().as_millis();
     let idle_start = process(pid)?;
+    eprintln!("idle: {users} authenticated sockets and first pages, server={idle_start}");
     sleep(Duration::from_secs(2)).await;
     let idle_end = process(pid)?;
     let delivery = Arc::new(Mutex::new(histogram()));
@@ -245,24 +248,24 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         let mut stop = closed.clone();
         let expected_for_watch = target_counts[org];
         consumers.spawn(async move {
-            let mut previous=0;
+            let mut previous = 0;
             loop {
                 tokio::select! {
                     biased;
                     item=updates.next()=> {
-                        let item=item.context("watch closed during load")??;
-                        let arrived=clock_us();
-                        let (seq,stamp)=verify(item.get(),org)?;
-                        ensure!(seq==previous+1,"missing or duplicate update for {index}: {previous} -> {seq}");
-                        previous=seq;
+                        let item = item.context("watch closed during load")??;
+                        let arrived = clock_us();
+                        let (seq, stamp) = verify(item.get(), org)?;
+                        ensure!(seq == previous + 1, "missing or duplicate update for {index}: {previous} -> {seq}");
+                        previous = seq;
                         delivered.lock().unwrap().record(arrived.checked_sub(stamp).context("system clock stepped")?)?;
                     },
-                    _=stop.changed()=>break,
+                    _ = stop.changed() => break,
                 }
             }
             let expected = expected_for_watch;
-            ensure!(previous==expected as u64,"watch {index} got {previous}, expected {expected}");
-            Ok::<_,anyhow::Error>(())
+            ensure!(previous == expected as u64, "watch {index} got {previous}, expected {expected}");
+            Ok::<_, anyhow::Error>(())
         });
         let measured = read_latency.clone();
         readers.spawn(async move {
@@ -276,7 +279,8 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
                     Duration::from_secs(10),
                     session.conn.call("tickets.list", ()),
                 )
-                .await??;
+                .await
+                .with_context(|| format!("ticket read timed out for user {index}"))??;
                 let elapsed = scheduled.elapsed();
                 verify(result.get(), org)?;
                 measured
@@ -288,6 +292,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
             Ok::<_, anyhow::Error>(())
         });
     }
+    eprintln!("load: {users} watches; starting scheduled reads and writes");
     let mut expected = 0;
     let mut written = vec![0; orgs];
     let mut write_latency = histogram();
@@ -300,7 +305,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
             Duration::from_secs(10),
             writers[org].call("tickets.advance", ()),
         )
-        .await??;
+        .await.with_context(|| format!("write {w} to organization {org} exceeded 10s; completed reads={}, observed deliveries={}, server={:?}", read_latency.lock().unwrap().len(), delivery.lock().unwrap().len(), process(pid)))??;
         ensure!(
             reply.get().parse::<usize>()? == written[org],
             "write failed"
