@@ -169,11 +169,15 @@ fn verify(raw: &str, org: usize) -> Result<(u64, u64)> {
 }
 
 async fn open(key: Identity, url: &str, pin: &str, org: usize) -> Result<Session> {
-    let (channel, _) = Dial::new(&key, pin)?.connect(url).await?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let (channel, _) = tokio::time::timeout_at(deadline, Dial::new(&key, pin)?.connect(url))
+        .await.context("WSS connection or authentication exceeded enrollment deadline")??;
     let (conn, drive) = Connection::new(channel, None);
     let driver = tokio::spawn(drive);
     let mut stream = conn.stream("tickets.watch", ())?;
-    let first = stream.next().await.context("watch closed during open")??;
+    let first = tokio::time::timeout_at(deadline, stream.next())
+        .await.context("first watch page exceeded enrollment deadline")?
+        .context("watch closed during open")??;
     ensure!(verify(first.get(), org)?.0 == 0, "unexpected initial state");
     Ok(Session {
         conn,
@@ -218,21 +222,20 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     };
     let mut sample = || meter.as_mut().map(cpu::Meter::sample).transpose();
     let cpu_start = sample()?;
+    let open_concurrency: usize = std::env::var("WATCH_OPEN_CONCURRENCY")
+        .unwrap_or_else(|_| "32".into()).parse()?;
+    ensure!(open_concurrency > 0, "enrollment concurrency must be positive");
     let open_start = Instant::now();
     let mut sessions: Vec<_> = stream::iter(keys.into_iter().enumerate())
         .map(|(i, key)| {
             let (url, pin) = (urls[i % urls.len()], &pin);
             async move {
-                let session = timeout(
-                    Duration::from_secs(20),
-                    open(key, url, pin, user_org(i, orgs, hot)),
-                )
-                .await
-                .with_context(|| format!("initial watch timed out for user {i}"))??;
+                let session = open(key, url, pin, user_org(i, orgs, hot)).await
+                    .with_context(|| format!("enrolling user {i}"))?;
                 Ok::<_, anyhow::Error>((i, session))
             }
         })
-        .buffer_unordered(32)
+        .buffer_unordered(open_concurrency)
         .try_collect()
         .await?;
     sessions.sort_by_key(|s| s.0);
@@ -426,7 +429,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         "{}",
         json!({"users":users,"authenticated_wss":users,"initial_watches":users,"loopback_listeners":urls.len(),"largest_org_users":population.iter().max(),"server_counters":metrics,"organizations":orgs,
         "tickets_per_org":rows,"total_tickets":orgs*rows,"workload":workload,"cpu_phases":cpu_phases,"scheduled_load_s":seconds,"load_and_drain_s":elapsed_s, "profile":profile,"evaluation":std::env::var("WATCH_EVALUATION").unwrap_or_else(|_|"per-watch".into()), "offered_reads_per_s":if workload == "updates" {0.0} else {users as f64*1000.0/interval_ms as f64},"offered_writes_per_s":if workload=="reads" {0} else {rate},"scheduled_write_to_ack":stats(&write_latency),
-        "writes":writes,"open_ms":open_ms,"expected_deliveries":expected,
+        "writes":writes,"open_ms":open_ms,"open_concurrency":open_concurrency,"expected_deliveries":expected,
         "read_scheduled_to_receive":stats(&read_latency.lock().unwrap()),
         "commit_to_receive":stats(&delivery.lock().unwrap()),
         "server":{"seeded":baseline,"idle_start":idle_start,"idle_end":idle_end,"load_end":load_end,"after_close":process(pid)?},

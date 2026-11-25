@@ -203,11 +203,8 @@ pub async fn generator(
         let url = &urls[i % urls.len()];
         let pin = &pin;
         async move {
-            let s = timeout(
-                Duration::from_secs(20),
-                open(key, url, pin, user_org(i, orgs, hot)),
-            )
-            .await??;
+            let s = open(key, url, pin, user_org(i, orgs, hot)).await
+                .with_context(|| format!("enrolling user {i}"))?;
             Ok::<_, anyhow::Error>((i, s))
         }
     };
