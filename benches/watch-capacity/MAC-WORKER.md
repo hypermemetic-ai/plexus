@@ -77,3 +77,7 @@ It uses loopback and generated temporary keys, then stops both services.
 ```sh
 python3 tests/load-agent.py target/release
 ```
+
+## A Mac with an outbound-only tailnet path
+
+On the Ryzen, run `load-agent rendezvous "$RYZEN_IP:47674" 127.0.0.1:24762 "$MAC_IP"`. On the Mac, run `load-agent dial-back ./mac-worker.key "$RYZEN_IP:47674" "$RYZEN_CONTROLLER_PRINCIPAL" "$RYZEN_IP" "$MAX_USERS"`. The worker opens two outgoing TCP connections and serves the same pinned control activation on them. Its TLS role stays the server. The Ryzen coordinator connects to `wss://127.0.0.1:24762/` using the Mac pin. Its benchmark data sockets still run directly from the Mac to the Ryzen. The rendezvous takes incoming worker sockets only from the fixed Mac IP and takes controller sockets only on loopback.

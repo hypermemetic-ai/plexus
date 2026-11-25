@@ -102,6 +102,7 @@ async fn serve(
     controller: &str,
     target: std::net::IpAddr,
     max: u32,
+    outbound: bool,
 ) -> Result<()> {
     ensure!(
         !bind.ip().is_unspecified() && !bind.ip().is_multicast(),
@@ -114,15 +115,70 @@ async fn serve(
     let mut server = plexus::Server::new();
     plexus::serve(worker::Worker(supervisor.clone()), &mut server);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let addr = listener.spawn(bind, Arc::new(server)).await?;
-    println!(
-        "{}",
-        json!({"url":format!("wss://{addr}/"),"principal":identity.principal(),"max_users":max,"target":target})
-    );
+    let server = Arc::new(server);
+    if outbound {
+        ensure!(
+            bind.ip() == target && bind.port() != 0,
+            "control rendezvous must be on the configured fixture host"
+        );
+        let listener = Arc::new(listener);
+        // Each fixed socket serves one mutually authenticated control session.
+        // Reconnect after the controller closes it or the tailnet path changes.
+        for _ in 0..2 {
+            let (listener, server) = (listener.clone(), server.clone());
+            tokio::spawn(async move {
+                loop {
+                    if let Ok(tcp) = tokio::net::TcpStream::connect(bind).await {
+                        if let Ok((channel, peer)) = listener.accept(tcp).await {
+                            let _ = server.serve_as(channel, plexus::Caller::new(peer)).await;
+                            continue;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            });
+        }
+        println!(
+            "{}",
+            json!({"rendezvous":bind.to_string(),"principal":identity.principal(),"max_users":max,"target":target})
+        );
+    } else {
+        let addr = listener.spawn(bind, server).await?;
+        println!(
+            "{}",
+            json!({"url":format!("wss://{addr}/"),"principal":identity.principal(),"max_users":max,"target":target})
+        );
+    }
     std::io::stdout().flush()?;
     tokio::select! { _=tokio::signal::ctrl_c() => (), _=term.recv() => () }
     supervisor.shutdown();
     Ok(())
+}
+
+/// Pair a controller socket on loopback with a fixed worker's outbound socket.
+/// TLS is end-to-end between the native controller and the worker activation.
+async fn rendezvous(bind: SocketAddr, local: SocketAddr, worker: std::net::IpAddr) -> Result<()> {
+    ensure!(
+        local.ip().is_loopback() && !bind.ip().is_unspecified() && !bind.ip().is_multicast(),
+        "use loopback for control and an explicit worker-facing interface"
+    );
+    let external = tokio::net::TcpListener::bind(bind).await?;
+    let internal = tokio::net::TcpListener::bind(local).await?;
+    println!(
+        "{}",
+        json!({"worker":external.local_addr()?.to_string(),"controller":internal.local_addr()?.to_string()})
+    );
+    std::io::stdout().flush()?;
+    loop {
+        let (mut peer, address) = external.accept().await?;
+        if address.ip() != worker {
+            continue;
+        }
+        let (mut operator, _) = internal.accept().await?;
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut peer, &mut operator).await;
+        });
+    }
 }
 
 async fn call(key: &str, url: &str, pin: &str, method: &str, params: &str) -> Result<()> {
@@ -158,14 +214,25 @@ async fn main() -> Result<()> {
             println!("{}", Identity::from_key_file(path)?.principal());
             Ok(())
         }
-        [mode, key, bind, peer, target, max] if mode == "serve" => {
-            serve(key, bind.parse()?, peer, target.parse()?, max.parse()?).await
+        [mode, key, bind, peer, target, max] if mode == "serve" || mode == "dial-back" => {
+            serve(
+                key,
+                bind.parse()?,
+                peer,
+                target.parse()?,
+                max.parse()?,
+                mode == "dial-back",
+            )
+            .await
+        }
+        [mode, bind, local, worker] if mode == "rendezvous" => {
+            rendezvous(bind.parse()?, local.parse()?, worker.parse()?).await
         }
         [mode, key, url, pin, method, params] if mode == "call" => {
             call(key, url, pin, method, params).await
         }
         _ => bail!(
-            "load-agent keygen PATH | principal PATH | serve KEY BIND_SOCKET CONTROLLER_KEY TARGET_IP MAX_USERS | call KEY WSS_URL WORKER_KEY METHOD JSON"
+            "load-agent keygen PATH | principal PATH | serve KEY BIND_SOCKET CONTROLLER_KEY TARGET_IP MAX_USERS | dial-back KEY RYZEN_SOCKET CONTROLLER_KEY TARGET_IP MAX_USERS | rendezvous BIND_SOCKET LOOPBACK_SOCKET WORKER_IP | call KEY WSS_URL WORKER_KEY METHOD JSON"
         ),
     }
 }

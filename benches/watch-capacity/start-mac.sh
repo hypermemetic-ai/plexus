@@ -33,4 +33,7 @@ if ! curl --noproxy '*' -fsS --max-time 10 -X POST --data-binary "$pin" "http://
   echo "Automatic pairing unavailable. Share this public worker pin with the Ryzen operator: $pin" >&2
 fi
 echo "Ryzen fixture $target; maximum $max_users sessions; press Control-C to stop."
+if [ -f dial-back ]; then
+    exec "$agent" dial-back "$key" "$target:47674" "$controller" "$target" "$max_users"
+fi
 exec "$agent" serve "$key" "$mac:47671" "$controller" "$target" "$max_users"
