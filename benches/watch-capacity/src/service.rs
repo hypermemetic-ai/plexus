@@ -437,9 +437,12 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
     // Multiple loopback destination ports give a colocated driver enough TCP
     // four-tuples. Every listener feeds the same process, store and acceptor.
     let listener = Arc::new(Listen::new(&identity, keys.iter().map(String::as_str))?);
+    let listener_count = keys.len().div_ceil(8000);
+    // Membership and TLS each own the principals they need after enrollment.
+    drop(keys);
     let mut urls = Vec::new();
     let access = Arc::new(access);
-    for _ in 0..keys.len().div_ceil(8000) {
+    for _ in 0..listener_count {
         let socket = tokio::net::TcpListener::bind((access.bind, 0)).await?;
         urls.push(format!("wss://{}/", socket.local_addr()?));
         let (servers, store, listener) = (servers.clone(), store.clone(), listener.clone());
