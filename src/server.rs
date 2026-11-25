@@ -91,6 +91,7 @@ enum Entry {
 /// [`serve`](Server::serve).
 #[derive(Default)]
 pub struct Server {
+    pub(crate) peers: Option<Arc<crate::bindings::Bindings>>,
     methods: HashMap<String, Method>,
     descendant_gates: HashMap<String, Vec<DescendantGate>>,
     grants: crate::grants::Grants,
@@ -289,6 +290,19 @@ impl Server {
         Ok(())
     }
 
+    #[cfg(feature = "tls")]
+    pub(crate) fn mount_peer_at(&mut self, at: &str, child: Box<dyn Activation>) -> io::Result<()> {
+        let occupied = self.places.iter().any(|entry| match entry {
+            Entry::Described(place) => place.place == at,
+            Entry::Mounted(place, _) => place == at,
+        });
+        if occupied || self.methods.contains_key(at) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{at} already exists")));
+        }
+        self.mount(at, child);
+        Ok(())
+    }
+
     /// Hold `child` at `at`: every call under `<at>.`, its `_ir` and `_hash`
     /// too, is passed to it, unless a method of that name is registered
     /// here; `_tree` lists its places, asked of it each time. Its credit and
@@ -297,12 +311,12 @@ impl Server {
         self.places.push(Entry::Mounted(at.to_owned(), Arc::from(child)));
     }
 
-    async fn find(&self, host: &Server, address: &str, caller: &Option<Caller>, input: bool) -> Result<(Handler, ContextKeys), Failure> {
+    async fn find(&self, host: &Server, address: &str, caller: Option<Caller>, input: bool) -> Result<(Handler, CallContext), Failure> {
         let not_found = || failure("not-found", &format!("no method {address}"));
         if address == "_tree" {
             if input { return Err(failure("invalid-params", "_tree takes no input stream")); }
             let places = self.places.clone();
-            return Ok((Handler::One(Arc::new(move |_, _| tree(places.clone()).boxed())), ContextKeys::default()));
+            return Ok((Handler::One(Arc::new(move |_, _| tree(places.clone()).boxed())), CallContext::new(caller, ContextKeys::default())));
         }
         let mut keyed = address.contains(['[', ']']).then(|| keyed_path(address)).transpose()?;
         let mut groups = keyed.as_mut().map(|path| std::mem::take(&mut path.groups)).unwrap_or_default();
@@ -322,7 +336,7 @@ impl Server {
                 matches!(suffix, "_ir" | "_hash") && name.split('.').all(valid_name)
             });
         if reflection && keyed.is_none() {
-            return Ok((handler, ContextKeys::default()));
+            return Ok((handler, CallContext::new(caller, ContextKeys::default())));
         }
         let mut checks = Vec::new();
         if !self.descendant_gates.is_empty() {
@@ -367,7 +381,17 @@ impl Server {
         if let Some(method) = grant {
             host.grants.check(method, caller.as_ref())?;
         }
-        Ok((handler, keys))
+        let mut context = CallContext::new(caller, keys);
+        if let Some(peers) = &host.peers
+            && let Some((root, rest)) = name.split_once('.')
+            && root == peers.root
+        {
+            peers.check()?;
+            if !rest.contains('.') {
+                context.peers = Some(peers.clone());
+            }
+        }
+        Ok((handler, context))
     }
 
     fn mounted<'a, 'b>(&'a self, name: &'b str) -> Option<(&'a str, &'b str, &'a Arc<dyn Activation>)> {
@@ -600,8 +624,7 @@ async fn run(
         })?;
         let given = open.params;
         let params = given.clone().unwrap_or_else(|| raw(&serde_json::Map::new()).expect("{} is JSON"));
-        let (handler, keys) = routes.find(&server, &open.method, &caller, open.input).await?;
-        let mut context = CallContext::new(caller, keys);
+        let (handler, mut context) = routes.find(&server, &open.method, caller, open.input).await?;
         context.input = input;
         match handler {
             Handler::One(f) | Handler::Reflect(f) => match caught(f(params, context)).await.and_then(|answer| answer) {

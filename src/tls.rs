@@ -295,7 +295,7 @@ fn provider() -> CryptoProvider {
     provider
 }
 
-fn validate_pin(pin: &str) -> io::Result<()> {
+pub(crate) fn validate_pin(pin: &str) -> io::Result<()> {
     if pin.strip_prefix("key:").is_some_and(|key| {
         key.len() == 64
             && key

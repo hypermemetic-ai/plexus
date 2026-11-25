@@ -26,6 +26,13 @@ impl Remote {
         Remote { conn, at: at.to_owned(), forward_caller: false }
     }
 
+    /// Forward the inbound caller on a mounted route. Each destination method
+    /// must explicitly trust this service and authorize that caller.
+    pub fn for_caller(mut self) -> Self {
+        self.forward_caller = true;
+        self
+    }
+
     /// The connection it is reached over.
     pub fn connection(&self) -> &Connection {
         &self.conn
@@ -130,9 +137,7 @@ mod spawned {
         /// for each eligible method. Unsupported peers refuse the call.
         #[cfg(feature = "tls")]
         pub fn wss_for_caller(url: &str, at: &str, dial: crate::tls::Dial) -> io::Result<Remote> {
-            let mut remote = Self::wss(url, at, dial)?;
-            remote.forward_caller = true;
-            Ok(remote)
+            Ok(Self::wss(url, at, dial)?.for_caller())
         }
 
         fn socket(at: &str, connect: impl Future<Output = io::Result<crate::Channel>> + Send + 'static) -> io::Result<Remote> {

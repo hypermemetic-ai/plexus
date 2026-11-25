@@ -18,7 +18,7 @@ store = ["dep:rusqlite", "dep:wit-bindgen"]
 # Off: none of its code exists.
 trace = []
 # WebSocket channels over mutually pinned Ed25519 TLS 1.3.
-tls = ["tokio", "dep:base64", "dep:rcgen", "dep:rustls", "dep:tokio-rustls", "dep:zeroize"]
+tls = ["tokio", "tokio/time", "tokio/sync", "dep:base64", "dep:rcgen", "dep:rustls", "dep:tokio-rustls", "dep:zeroize"]
 
 [dependencies]
 syn = { version = "2", default-features = false, features = ["parsing", "derive"] }
@@ -97,4 +97,12 @@ required-features = ["tokio"]
 
 [[example]]
 name = "distributed-peers"
+required-features = ["tls"]
+
+[[example]]
+name = "activation-peers"
+required-features = ["tls"]
+
+[[test]]
+name = "peer_bindings"
 required-features = ["tls"]

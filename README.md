@@ -60,6 +60,81 @@ server.mount("studio.kiln", Box::new(kiln));
 
 The wire reserves `_hash` and `_ir` for interface discovery at each activation. The canonical `studio.kiln._hash` describes the public interface. A client binding at `studio[tenant=acme].kiln` can use `studio[tenant=acme].kiln._hash`, which runs Studio's opening check. Named keys for separate local openings belong on their individual path segments.
 
+## Typed peer dependencies
+
+Use the matching `test/activation-peer-bindings` branches of `plexus` and
+`plexus-macros` in sibling checkouts. Run the demo from the Plexus checkout:
+
+```sh
+cargo run --locked --features tls --example activation-peers
+```
+
+The demo starts two processes, each with a fresh Ed25519 identity. Studio
+opens its WSS listener before its required north kiln is available. The kiln
+dials Studio, the two verify pins and interface hashes, and Studio accepts
+`studio.fire`. Kiln reports the Studio principal that called it.
+
+```rust
+// Inside the Studio activation
+pub async fn fire(&self, #[peer("north")] kiln: Peer<Kiln>, degrees: u32)
+    -> Result<String, String>
+{
+    kiln.fire(degrees).await.map_err(|error| error.to_string())
+}
+```
+
+The RPC caller supplies only `degrees`. With one configured binding of that
+interface, `kiln: Peer<Kiln>` selects it by type. With several, select a slot
+using `#[peer("north")]`. A missing binding yields `unavailable`, and an
+ambiguous selection yields `ambiguous-peer`, before entering the method body.
+Generated clients support unary calls, streams, typed input and binary chunks.
+
+```rust
+// Each host has its own key directory. Only public pins are exchanged.
+let keys = PeerKeys::new(key_directory);
+let mut studio = PeerHost::new(Studio, keys.identity("keystore://studio")?);
+studio.peer::<Kiln>("north").accept("wss://0.0.0.0:7443", keys.pin("keystore://north")?)?;
+studio.requires_peer("north")?;
+let studio = studio.start().await?;
+studio.ready().await;
+
+// On the other host
+let mut kiln = PeerHost::new(Kiln, keys.identity("keystore://north")?);
+kiln.peer::<Studio>("studio").dial("wss://studio.example:7443", keys.pin("keystore://studio")?)?;
+let kiln = kiln.start().await?;
+```
+
+`PeerHost::new` also accepts an existing `tls::Identity`. Pass a literal
+`key:<hex>` pin to `dial` or `accept`, or use the directory-backed keystore.
+`identity("keystore://north")` loads the Synapse seed file `north.key`;
+`pin("keystore://north")` reads the public principal in `north.pub`.
+An identity can also be loaded from a file path. Listeners sharing the same
+bind address select their configured slot by the verified remote principal.
+
+`start()` starts network maintenance and returns a handle. Keep it alive.
+Serve ordinary RPC clients through `handle.server()`. By default only methods
+requesting an offline peer are unavailable. With `requires_peer("north")`,
+application calls under the activation are admitted while all required slots
+are connected. Readiness drops on disconnect and recovers after a verified
+redial. In-flight calls retain their original session and are never replayed.
+
+A peer binding is private to the activation. To publish it as a child,
+call `studio.mount_peer("kiln", "north")?` before start. This publishes
+`studio.kiln.*`. Mounted calls forward the original authenticated caller;
+the kiln must explicitly trust Studio for each forwarded method and authorize
+that caller. Calls to `kiln.fire(...)` through an injected peer use Studio's
+own service identity. Configure the usual grant policy via `server_mut()`.
+
+To use two machines, build the example on both and run these commands with
+your own keystore directory, public pins and reachable controller URL:
+
+```sh
+# Studio host
+target/debug/examples/activation-peers studio wss://0.0.0.0:7443 "$KEYSTORE" keystore://studio keystore://north
+# Kiln host
+target/debug/examples/activation-peers kiln "$STUDIO_WSS_URL" "$KEYSTORE" keystore://north keystore://studio
+```
+
 ## Distributed peers
 
 Run the two-process demo from this checkout. It generates disposable identities,

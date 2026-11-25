@@ -61,6 +61,12 @@ pub use input::{Input, RawInput};
 mod listener;
 mod connection;
 pub mod peer;
+mod bindings;
+pub use bindings::{Peer, PeerInterface};
+#[cfg(feature = "tls")]
+mod peer_host;
+#[cfg(feature = "tls")]
+pub use peer_host::{PeerHost, PeerKeys, RunningPeers};
 mod context;
 mod grant;
 pub use grant::Grant;
@@ -159,6 +165,7 @@ pub fn main_with<A: Serve>(activation: A, configure: impl FnOnce(&mut Server)) -
 #[cfg(not(target_arch = "wasm32"))]
 pub mod __private {
     pub use crate::input::decode_input;
+    pub use crate::bindings::decode as peer_decode;
     pub use crate::served::{B64, Later, Local, feed, failed, params, stream, fail_stream, stream_with_caller, stream_with_context};
     pub use futures;
     pub use plexus_proto::bytes;

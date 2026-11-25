@@ -49,6 +49,7 @@ impl ContextKeys {
 /// Connection identity and validated path keys for one local invocation.
 #[doc(hidden)]
 pub struct CallContext {
+    pub(crate) peers: Option<std::sync::Arc<crate::bindings::Bindings>>,
     pub(crate) input: Option<crate::RawInput>,
     caller: Option<Caller>,
     keys: ContextKeys,
@@ -56,7 +57,7 @@ pub struct CallContext {
 
 impl CallContext {
     pub(crate) fn new(caller: Option<Caller>, keys: ContextKeys) -> Self {
-        Self { caller, keys, input: None }
+        Self { caller, keys, input: None, peers: None }
     }
 
     /// Take the streamed input of this call. Polling it grants the first
@@ -73,6 +74,10 @@ impl CallContext {
     fn receive<T: 'static>(&mut self, bytes: bool, decode: impl Fn(crate::input::InputItem) -> Result<T, Failure> + Send + 'static) -> Result<crate::Input<T>, Failure> {
         self.input.take().map(|input| crate::Input::receive(input, bytes, decode))
             .ok_or_else(|| failure("invalid-params", "this method requires an input stream"))
+    }
+
+    pub fn peer<T: crate::PeerInterface>(&self, slot: Option<&str>) -> Result<crate::Peer<T>, Failure> {
+        self.peers.as_ref().ok_or_else(|| failure("unavailable", "activation has no peer bindings"))?.resolve(slot)
     }
 
     pub fn caller(&self) -> Option<&Caller> {
