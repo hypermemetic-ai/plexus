@@ -59,14 +59,16 @@ impl Drop for Fixture {
 }
 
 #[cfg(target_os = "linux")]
-fn fixture(keys: &[Identity], orgs: usize, rows: usize) -> Result<(Fixture, String, String)> {
-    let mut child = Fixture(
-        Command::new(std::env::current_exe()?)
-            .args(["serve", &orgs.to_string(), &rows.to_string()])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?,
-    );
+fn fixture(keys: &[Identity], orgs: usize, rows: usize, timing_dir: Option<&tempfile::TempDir>) -> Result<(Fixture, String, String)> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.args(["serve", &orgs.to_string(), &rows.to_string()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    if let Some(dir) = timing_dir {
+        cmd.env("WATCH_TIMING_WINDOW_FILE", dir.path().join("window.json"))
+            .env("WATCH_TIMING_SKIP_READS", "0");
+    }
+    let mut child = Fixture(cmd.spawn()?);
     let mut input = child.0.stdin.take().unwrap();
     for key in keys {
         writeln!(input, "{}", key.principal())?;
@@ -201,7 +203,10 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     let keys = (0..users)
         .map(|_| Identity::generate())
         .collect::<std::io::Result<Vec<_>>>()?;
-    let (server, urls, pin) = fixture(&keys, orgs, rows)?;
+    let timing_dir = (std::env::var("WATCH_SERVER_TIMING").as_deref() == Ok("1"))
+        .then(tempfile::tempdir)
+        .transpose()?;
+    let (server, urls, pin) = fixture(&keys, orgs, rows, timing_dir.as_ref())?;
     let urls: Vec<_> = urls.split(',').collect();
     let pid = server.0.id();
     let baseline = process(pid)?;
@@ -249,8 +254,18 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         .take(orgs)
         .map(|(_, s)| s.conn.clone())
         .collect();
-    let start = Instant::now() + Duration::from_millis(100);
+    let lead = Duration::from_millis(100);
+    let start = Instant::now() + lead;
     let length = Duration::from_secs(seconds);
+    if let Some(dir) = timing_dir.as_ref() {
+        let window = json!({
+            "start_unix_us": clock_us() + lead.as_micros() as u64,
+            "duration_us": seconds.checked_mul(1_000_000).context("duration overflow")?,
+        });
+        let pending = dir.path().join("window.tmp");
+        fs::write(&pending, serde_json::to_vec(&window)?)?;
+        fs::rename(pending, dir.path().join("window.json"))?;
+    }
     let rate: u64 = std::env::var("WATCH_WRITES_PER_SECOND")
         .unwrap_or_else(|_| "4".into())
         .parse()?;
