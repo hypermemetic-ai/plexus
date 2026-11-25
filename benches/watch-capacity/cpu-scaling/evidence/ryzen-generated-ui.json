@@ -1,0 +1,566 @@
+{
+  "date_utc": "2026-11-25",
+  "cpu": "AMD Ryzen 9 5900X 12-Core Processor",
+  "tickets_per_org": 2000,
+  "page_rows": 50,
+  "gate": {
+    "read": 100,
+    "write": 250,
+    "watch_update": 250,
+    "min_load_fraction": 0.95
+  },
+  "server_timing": "native RPC ingress or commit through successful local socket flush",
+  "native_ladder_binary_sha256": "2635deb7d7a016dc97ed6574a2c38d8f03eb4fcc8e345415b83e2cba86cdb54c",
+  "native_30s_ladders": [
+    {
+      "native_sessions": 1,
+      "native_watches": 1,
+      "organizations": 1,
+      "largest_org_users": 1,
+      "seconds": 30,
+      "profile": "hot",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 1,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 3,
+          "flushed": 3,
+          "server_p99_us": 1466
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 5991
+        },
+        "watch_update": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 5823
+        }
+      },
+      "verified_after_drain": {
+        "read": 3,
+        "write": 120,
+        "watch_update": 120
+      },
+      "cpu_cores_including_drain": 0.002
+    },
+    {
+      "native_sessions": 10,
+      "native_watches": 10,
+      "organizations": 2,
+      "largest_org_users": 6,
+      "seconds": 30,
+      "profile": "hot",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 13,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 30,
+          "flushed": 30,
+          "server_p99_us": 671
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 1401
+        },
+        "watch_update": {
+          "admitted": 696,
+          "flushed": 696,
+          "server_p99_us": 1424
+        }
+      },
+      "verified_after_drain": {
+        "read": 30,
+        "write": 120,
+        "watch_update": 696
+      },
+      "cpu_cores_including_drain": 0.0033
+    },
+    {
+      "native_sessions": 100,
+      "native_watches": 100,
+      "organizations": 2,
+      "largest_org_users": 60,
+      "seconds": 30,
+      "profile": "hot",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 58,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 300,
+          "flushed": 300,
+          "server_p99_us": 198
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 824
+        },
+        "watch_update": {
+          "admitted": 6960,
+          "flushed": 6960,
+          "server_p99_us": 1126
+        }
+      },
+      "verified_after_drain": {
+        "read": 300,
+        "write": 120,
+        "watch_update": 6960
+      },
+      "cpu_cores_including_drain": 0.0107
+    },
+    {
+      "native_sessions": 1000,
+      "native_watches": 1000,
+      "organizations": 10,
+      "largest_org_users": 199,
+      "seconds": 30,
+      "profile": "hot",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 376,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 3000,
+          "flushed": 3000,
+          "server_p99_us": 110
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 1418
+        },
+        "watch_update": {
+          "admitted": 21603,
+          "flushed": 21603,
+          "server_p99_us": 1380
+        }
+      },
+      "verified_after_drain": {
+        "read": 3000,
+        "write": 120,
+        "watch_update": 21603
+      },
+      "cpu_cores_including_drain": 0.0303
+    },
+    {
+      "native_sessions": 10000,
+      "native_watches": 10000,
+      "organizations": 100,
+      "largest_org_users": 1981,
+      "seconds": 30,
+      "profile": "hot",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 3257,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 29999,
+          "flushed": 29999,
+          "server_p99_us": 4335
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 13063
+        },
+        "watch_update": {
+          "admitted": 194061,
+          "flushed": 194061,
+          "server_p99_us": 17183
+        }
+      },
+      "verified_after_drain": {
+        "read": 30000,
+        "write": 120,
+        "watch_update": 194061
+      },
+      "cpu_cores_including_drain": 0.2424
+    },
+    {
+      "native_sessions": 100000,
+      "native_watches": 100000,
+      "organizations": 1000,
+      "largest_org_users": 19801,
+      "seconds": 30,
+      "profile": "hot",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 29569,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 299991,
+          "flushed": 299991,
+          "server_p99_us": 97023
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 107199
+        },
+        "watch_update": {
+          "admitted": 1922601,
+          "flushed": 1922601,
+          "server_p99_us": 112575
+        }
+      },
+      "verified_after_drain": {
+        "read": 300000,
+        "write": 120,
+        "watch_update": 1922601
+      },
+      "cpu_cores_including_drain": 2.2386
+    },
+    {
+      "native_sessions": 1,
+      "native_watches": 1,
+      "organizations": 1,
+      "largest_org_users": 1,
+      "seconds": 30,
+      "profile": "uniform",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 1,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 3,
+          "flushed": 3,
+          "server_p99_us": 130
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 265
+        },
+        "watch_update": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 199
+        }
+      },
+      "verified_after_drain": {
+        "read": 3,
+        "write": 120,
+        "watch_update": 120
+      },
+      "cpu_cores_including_drain": 0.001
+    },
+    {
+      "native_sessions": 10,
+      "native_watches": 10,
+      "organizations": 2,
+      "largest_org_users": 5,
+      "seconds": 30,
+      "profile": "uniform",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 3,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 30,
+          "flushed": 30,
+          "server_p99_us": 147
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 337
+        },
+        "watch_update": {
+          "admitted": 600,
+          "flushed": 600,
+          "server_p99_us": 253
+        }
+      },
+      "verified_after_drain": {
+        "read": 30,
+        "write": 120,
+        "watch_update": 600
+      },
+      "cpu_cores_including_drain": 0.0021
+    },
+    {
+      "native_sessions": 100,
+      "native_watches": 100,
+      "organizations": 2,
+      "largest_org_users": 50,
+      "seconds": 30,
+      "profile": "uniform",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 55,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 300,
+          "flushed": 300,
+          "server_p99_us": 369
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 3469
+        },
+        "watch_update": {
+          "admitted": 6000,
+          "flushed": 6000,
+          "server_p99_us": 6875
+        }
+      },
+      "verified_after_drain": {
+        "read": 300,
+        "write": 120,
+        "watch_update": 6000
+      },
+      "cpu_cores_including_drain": 0.0091
+    },
+    {
+      "native_sessions": 1000,
+      "native_watches": 1000,
+      "organizations": 10,
+      "largest_org_users": 100,
+      "seconds": 30,
+      "profile": "uniform",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 398,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 3000,
+          "flushed": 3000,
+          "server_p99_us": 603
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 1902
+        },
+        "watch_update": {
+          "admitted": 12000,
+          "flushed": 12000,
+          "server_p99_us": 3389
+        }
+      },
+      "verified_after_drain": {
+        "read": 3000,
+        "write": 120,
+        "watch_update": 12000
+      },
+      "cpu_cores_including_drain": 0.0239
+    },
+    {
+      "native_sessions": 10000,
+      "native_watches": 10000,
+      "organizations": 100,
+      "largest_org_users": 100,
+      "seconds": 30,
+      "profile": "uniform",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 3204,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 29999,
+          "flushed": 29999,
+          "server_p99_us": 86
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 807
+        },
+        "watch_update": {
+          "admitted": 12000,
+          "flushed": 12000,
+          "server_p99_us": 820
+        }
+      },
+      "verified_after_drain": {
+        "read": 30000,
+        "write": 120,
+        "watch_update": 12000
+      },
+      "cpu_cores_including_drain": 0.08
+    },
+    {
+      "native_sessions": 100000,
+      "native_watches": 100000,
+      "organizations": 1000,
+      "largest_org_users": 100,
+      "seconds": 30,
+      "profile": "uniform",
+      "watch_method": "tickets.list-watch",
+      "interface_hash": "cefa17375b7c7b43",
+      "open_ms": 29479,
+      "verdict": "pass",
+      "reasons": [],
+      "within_window": {
+        "read": {
+          "admitted": 299991,
+          "flushed": 299985,
+          "server_p99_us": 125
+        },
+        "write": {
+          "admitted": 120,
+          "flushed": 120,
+          "server_p99_us": 857
+        },
+        "watch_update": {
+          "admitted": 12000,
+          "flushed": 12000,
+          "server_p99_us": 838
+        }
+      },
+      "verified_after_drain": {
+        "read": 300000,
+        "write": 120,
+        "watch_update": 12000
+      },
+      "cpu_cores_including_drain": 0.4874
+    }
+  ],
+  "browser_rung_binary_sha256": "10baaab1b49b047c98087fa521cdfcba89a406dd85c086e45c8beb6435cca1c4",
+  "native_rung_with_chromium": {
+    "native_sessions": 100000,
+    "native_watches": 100000,
+    "organizations": 1000,
+    "largest_org_users": 19801,
+    "seconds": 30,
+    "profile": "hot",
+    "watch_method": "tickets.list-watch",
+    "interface_hash": "cefa17375b7c7b43",
+    "open_ms": 30122,
+    "verdict": "pass",
+    "reasons": [],
+    "within_window": {
+      "read": {
+        "admitted": 299991,
+        "flushed": 299991,
+        "server_p99_us": 94591
+      },
+      "write": {
+        "admitted": 120,
+        "flushed": 120,
+        "server_p99_us": 106431
+      },
+      "watch_update": {
+        "admitted": 1922601,
+        "flushed": 1922601,
+        "server_p99_us": 110719
+      }
+    },
+    "verified_after_drain": {
+      "read": 300000,
+      "write": 120,
+      "watch_update": 1922601
+    },
+    "cpu_cores_including_drain": 2.1971
+  },
+  "additional_browser": {
+    "chromium": "153.0.8010.12",
+    "svelte": "5.57.2",
+    "updates": 97,
+    "first_revision": 0,
+    "final_revision": 97,
+    "monotonic": true,
+    "cancelled": 1,
+    "row": "Organization 0 ticket 0"
+  },
+  "renderless_client_test": {
+    "source": "../../tests/generated-clients/renderless-results.jsonl",
+    "largest_authenticated_svelte_population": 1000,
+    "changed_pages": 5000
+  },
+  "isolated_rate_cell": {
+    "native_sessions": 480,
+    "native_watches": 480,
+    "organizations": 48,
+    "largest_org_users": 95,
+    "seconds": 15,
+    "profile": "hot",
+    "watch_method": "tickets.list-watch",
+    "interface_hash": "cefa17375b7c7b43",
+    "open_ms": 207,
+    "verdict": "pass",
+    "reasons": [],
+    "within_window": {
+      "read": {
+        "admitted": 1799827,
+        "flushed": 1799827,
+        "server_p99_us": 2029
+      },
+      "write": {
+        "admitted": 60,
+        "flushed": 60,
+        "server_p99_us": 2791
+      },
+      "watch_update": {
+        "admitted": 4745,
+        "flushed": 4745,
+        "server_p99_us": 3123
+      }
+    },
+    "verified_after_drain": {
+      "read": 1800000,
+      "write": 60,
+      "watch_update": 4745
+    },
+    "cpu_cores_including_drain": 2.2947,
+    "offered_reads_per_second": 120000.0,
+    "fixture_physical_cores": 4,
+    "generator_physical_cores": 8
+  },
+  "tested_browser_acceptance": {
+    "svelte": "5.57.2",
+    "chromium": "153.0.8010.12",
+    "orgs": 2,
+    "watched": 5,
+    "cancelled": 5,
+    "refusals": 2
+  },
+  "source_branches": {
+    "plexus": "882d1b8fcb1333cefe82e08881748d2757150ce8",
+    "plexus-macros": "fb48ffc9d3653c36c606095fe5db76d8279ff988",
+    "plexus-ir": "71b582a727f6e2cd03822b1fd7165cc2faf00059",
+    "plexus-gen": "3f829f38331e2698dde1037a9f75172e6d110a9e",
+    "plexus-rt": "a145c5aa7009bb7fa0699f6e9c8b4ec8895f16e5",
+    "plexus-proto": "4ee41281f95ecabd8670c9ec35fbd642b8ecba35",
+    "plexus-ui": "9e5ac1fa29aeb64d274a2a8ab8573c9275888962"
+  },
+  "native_ladder_settings": {
+    "profile": "mixed workload, one read per user every 10 seconds, 4 writes/s",
+    "dispatch": "concurrent",
+    "activation_workers": 4,
+    "server_io_workers": 6,
+    "generator_workers": 8,
+    "enrollment_concurrency": 16,
+    "query_evaluation": "shared",
+    "response_encoding": "shared"
+  }
+}

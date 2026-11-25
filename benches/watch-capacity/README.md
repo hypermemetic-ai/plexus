@@ -80,3 +80,5 @@ ladder tests.
 Create a fresh private directory for one rung, build `watch-capacity` in release mode and start `plexus-ui/tests/native_watch_browser.mjs` with the binary, the TypeScript runtime, the codec Wasm and that directory. Use the same directory in `WATCH_BROWSER_RUN_DIR` when launching the native benchmark. The page enrolls its own ephemeral public pin and mounts a compiled component scoped to organization zero. The generator waits for its first rendered row before scheduling writes. On completion the page must see the final expected revision and cancel the watch. The JSON result includes the rendered revisions and the browser and Svelte versions under `browser_observer`.
 
 The native population uses one independent authenticated socket and one full-page watch per user. The browser adds one authenticated connection watching ticket zero. Its reads and row updates are counted separately from the native full-page workload. The server’s CPU and memory measurements include both.
+
+[Measured native and browser results on the Ryzen](cpu-scaling/evidence/ryzen-generated-ui.json)
