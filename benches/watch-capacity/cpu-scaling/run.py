@@ -9,10 +9,14 @@ import platform
 import select
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+from capacity_verdict import Schedule, add_arguments, budgets, classify
+
 TICKS = os.sysconf("SC_CLK_TCK")
 
 
@@ -43,7 +47,7 @@ def affinity(pid, expected):
 
 
 def trial(a, shim, lanes, reactor, workload, interval, server, generator):
-    env = dict(os.environ, WATCH_CPU="1", WATCH_EVALUATION=a.evaluation,
+    env = dict(os.environ, WATCH_SERVER_TIMING="1", WATCH_TIMING_SKIP_READS="0", WATCH_CPU="1", WATCH_EVALUATION=a.evaluation,
                WATCH_PROFILE=a.profile, WATCH_ENCODING=a.encoding, WATCH_DISPATCH=a.dispatch,
                WATCH_ACTIVATION_LANES=str(lanes),
                WATCH_SERVER_THREADS=str(reactor), WATCH_GENERATOR_THREADS=str(a.generator_threads),
@@ -96,7 +100,9 @@ def trial(a, shim, lanes, reactor, workload, interval, server, generator):
     threads = [{"tid":t["tid"], "name":t["name"],
                 "cpu_cores":t["scheduler_cpu_ns"] / 1e9 / phase["wall_s"]}
                for t in phase["threads"]]
-    return dict(activation_lanes=lanes, wss_threads=reactor, workload=workload,
+    schedule = Schedule(a.users, a.orgs, a.seconds, interval, a.writes_per_second, a.profile, workload)
+    verdict = classify(result, schedule, budgets(a))
+    return dict(verdict=verdict, activation_lanes=lanes, wss_threads=reactor, workload=workload,
                 interval_ms=interval, server_cpus=sorted(server), generator_cpus=sorted(generator),
                 generator_threads=a.generator_threads, encoding=a.encoding, dispatch=a.dispatch, profile=a.profile, users=a.users, organizations=a.orgs,
                 scheduled_seconds=a.seconds, load_and_drain_s=seconds,
@@ -125,12 +131,13 @@ def main():
     for k,v in (("users",240),("orgs",24),("rows",100),("seconds",3),
                 ("writes-per-second",4),("generator-threads",8),("repeats",1),("timeout",180)):
         p.add_argument("--"+k, type=int, default=v)
+    add_arguments(p)
     a=p.parse_args()
     server,generator=cpus(a.server_cpus),cpus(a.generator_cpus)
     if {core(c) for c in server} & {core(c) for c in generator}:
         p.error("server and generator must use disjoint physical cores, including SMT siblings")
     print(json.dumps(dict(type="environment",cpu=next(line.partition(":")[2].strip() for line in Path("/proc/cpuinfo").read_text().splitlines() if line.startswith("model name")),kernel=platform.release(),
-              binary_sha256=hashlib.sha256(a.bin.read_bytes()).hexdigest(),ticks_per_second=TICKS,
+              binary_sha256=hashlib.sha256(a.bin.read_bytes()).hexdigest(),ticks_per_second=TICKS,server_budgets=budgets(a),
               server_physical_cores=len({core(c) for c in server}),
               generator_physical_cores=len({core(c) for c in generator}))),flush=True)
     failures = 0
@@ -147,7 +154,8 @@ def main():
                                 value=trial(a,shim,lane,reactor,workload,interval,server,generator)
                             except (RuntimeError,subprocess.TimeoutExpired) as e:
                                 failures += 1
-                                print(json.dumps(dict(type="failure",**settings,error=str(e))),flush=True)
+                                print(json.dumps(dict(type="failure",**settings,error=str(e),
+                                    verdict={"status":"fail","code":"runner_error","reasons":[str(e)]})),flush=True)
                             else:
                                 print(json.dumps(dict(type="result",repeat=repeat,**value)),flush=True)
 

@@ -18,6 +18,8 @@ python3 cpu-scaling/run.py \
 
 The interval controls total offered reads/s as `1000 × users / interval_ms`. Sessions remain open through startup, a two-second idle window, the scheduled load and its drain. A short compiled Linux preload sets the fixture mask before its Rust runtime starts. The Python driver independently checks every thread's affinity for both processes. The requested server and generator masks must have disjoint physical cores, including SMT siblings. Affinity constrains where each benchmark process runs. Other host processes may still run on these cores.
 
+Each new WSS result includes the fixture's monotonic timing, client diagnostics, and a machine-readable `verdict`. The same `--server-read-p99-ms`, `--server-write-p99-ms`, `--server-fanout-p99-ms` and `--min-load-fraction` options apply to the local ladder, Mac runner and CPU sweep. The sweep continues through overload and underfeed so the remaining CPU and latency measurements are retained. Its exit code reflects whether all trials completed. Inspect each cell's verdict to determine which loads passed. The historical receipts in this directory predate server-window timing and establish only the measurements they contain.
+
 Every successful row contains these measurements.
 
 - `read_achieved_s`, write and delivery rates divide the verified totals by scheduled load plus drain. `result.read_scheduled_to_receive`, `scheduled_write_to_ack` and `commit_to_receive` retain the original user-visible latency histograms in microseconds. Scheduled latency includes queueing behind earlier calls.
