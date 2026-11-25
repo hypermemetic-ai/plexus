@@ -124,35 +124,43 @@ struct Session {
     org: usize,
 }
 
+#[derive(serde::Deserialize)]
+struct ReceivedRow<'a> {
+    id: usize,
+    #[serde(borrow)]
+    title: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    status: std::borrow::Cow<'a, str>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct ReceivedPage<'a> {
+    org: usize,
+    sequence: u64,
+    committed_us: u64,
+    #[serde(borrow)]
+    rows: Vec<ReceivedRow<'a>>,
+}
+
 fn verify(raw: &str, org: usize) -> Result<(u64, u64)> {
-    let page: Value = serde_json::from_str(raw)?;
-    ensure!(page["org"].as_u64() == Some(org as u64), "cross-org page");
-    let rows = page["rows"].as_array().context("missing rows")?;
-    let seq = page["sequence"].as_u64().context("missing sequence")?;
+    let page: ReceivedPage<'_> = serde_json::from_str(raw)?;
+    ensure!(page.org == org, "cross-org page");
     let prefix = format!("Organization {org} ticket ");
-    ensure!(
-        rows.len() == 50
-            && rows.iter().enumerate().all(|(i, r)| {
-                r["id"].as_u64() == Some(i as u64)
-                    && r["title"].as_str().is_some_and(|s| s.starts_with(&prefix))
-            }),
-        "wrong page rows"
-    );
-    let expected = if seq == 0 {
-        "Ready".to_string()
-    } else {
-        format!("Revision {seq}")
-    };
-    ensure!(
-        rows[0]["status"].as_str() == Some(expected.as_str()),
-        "stale ticket status"
-    );
-    Ok((
-        seq,
-        page["committed-us"]
-            .as_u64()
-            .context("missing commit time")?,
-    ))
+    ensure!(page.rows.len() == 50, "wrong page length");
+    for (i, row) in page.rows.iter().enumerate() {
+        let suffix = row.title.strip_prefix(&prefix);
+        ensure!(
+            row.id == i && suffix.and_then(|id| id.parse().ok()) == Some(i),
+            "wrong page rows"
+        );
+        if i != 0 || page.sequence == 0 {
+            ensure!(row.status == "Ready", "stale ticket status");
+        } else {
+            ensure!(row.status == format!("Revision {}", page.sequence), "stale ticket status");
+        }
+    }
+    Ok((page.sequence, page.committed_us))
 }
 
 async fn open(key: Identity, url: &str, pin: &str, org: usize) -> Result<Session> {
