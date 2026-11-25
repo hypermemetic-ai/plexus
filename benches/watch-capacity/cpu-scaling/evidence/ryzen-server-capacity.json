@@ -432,6 +432,7 @@
       "six_physical_cores_per_process_in_distinct_l3_domains": false,
       "open_loop_write_schedule": false,
       "enrollment_concurrency": 32,
+      "reader_setup_precedes_epoch_selection": false,
       "verdict": "correctness",
       "error": "Error: missing or duplicate update for 181760: 2 -> 4",
       "partial_counts": {
@@ -457,6 +458,7 @@
       "six_physical_cores_per_process_in_distinct_l3_domains": true,
       "open_loop_write_schedule": true,
       "enrollment_concurrency": 32,
+      "reader_setup_precedes_epoch_selection": false,
       "verdict": "setup_error",
       "error": "Error: initial watch timed out for user 123740",
       "binary_sha256": "7b3bc028b6363e3824c82f320ca50a964edaa7263191264bb1cf3cfac8700aa5"
@@ -468,6 +470,7 @@
       "six_physical_cores_per_process_in_distinct_l3_domains": false,
       "open_loop_write_schedule": true,
       "enrollment_concurrency": 32,
+      "reader_setup_precedes_epoch_selection": false,
       "verdict": "setup_error",
       "error": "Error: initial watch timed out for user 227144",
       "binary_sha256": "7b3bc028b6363e3824c82f320ca50a964edaa7263191264bb1cf3cfac8700aa5"
@@ -479,6 +482,7 @@
       "six_physical_cores_per_process_in_distinct_l3_domains": false,
       "open_loop_write_schedule": true,
       "enrollment_concurrency": 16,
+      "reader_setup_precedes_epoch_selection": false,
       "verdict": "correctness",
       "error": "Error: missing or duplicate update for 230845: 0 -> 2",
       "partial_counts": {
@@ -496,6 +500,78 @@
         }
       },
       "binary_sha256": "cbe1127fc192384c0e0e285eefe795574d3f084cba71c80421f2a980bdfcaef2"
+    },
+    {
+      "users": 250000,
+      "wss_workers": 6,
+      "activation_workers": 4,
+      "six_physical_cores_per_process_in_distinct_l3_domains": false,
+      "open_loop_write_schedule": true,
+      "enrollment_concurrency": 16,
+      "reader_setup_precedes_epoch_selection": true,
+      "verdict": "server_latency",
+      "operations": {
+        "read": {
+          "scheduled": 750000,
+          "ingress_in_window": 749975,
+          "flushed_in_window": 749975,
+          "total_flushed_including_drain": 750000,
+          "server_p99_us": 302847
+        },
+        "write": {
+          "scheduled": 120,
+          "ingress_in_window": 120,
+          "flushed_in_window": 120,
+          "total_flushed_including_drain": 120,
+          "server_p99_us": 119807
+        },
+        "watch_update": {
+          "scheduled": 4803501,
+          "ingress_in_window": 4803501,
+          "flushed_in_window": 4803501,
+          "total_flushed_including_drain": 4803501,
+          "server_p99_us": 308479
+        }
+      },
+      "busy_fixture_cores_including_drain": 4.0206,
+      "reader_setup_headroom_ms": 2517,
+      "binary_sha256": "7b8dd90e116174e9aa44f4125f3a3de451956260092fc3eb8e3dec9aa622cd36"
+    },
+    {
+      "users": 100000,
+      "wss_workers": 6,
+      "activation_workers": 4,
+      "six_physical_cores_per_process_in_distinct_l3_domains": false,
+      "open_loop_write_schedule": true,
+      "enrollment_concurrency": 16,
+      "reader_setup_precedes_epoch_selection": true,
+      "verdict": "pass",
+      "operations": {
+        "read": {
+          "scheduled": 300000,
+          "ingress_in_window": 299997,
+          "flushed_in_window": 299997,
+          "total_flushed_including_drain": 300000,
+          "server_p99_us": 86079
+        },
+        "write": {
+          "scheduled": 120,
+          "ingress_in_window": 120,
+          "flushed_in_window": 120,
+          "total_flushed_including_drain": 120,
+          "server_p99_us": 23519
+        },
+        "watch_update": {
+          "scheduled": 1922601,
+          "ingress_in_window": 1922601,
+          "flushed_in_window": 1922601,
+          "total_flushed_including_drain": 1922601,
+          "server_p99_us": 94143
+        }
+      },
+      "busy_fixture_cores_including_drain": 1.6861,
+      "reader_setup_headroom_ms": 1078,
+      "binary_sha256": "7b8dd90e116174e9aa44f4125f3a3de451956260092fc3eb8e3dec9aa622cd36"
     }
   ]
 }
