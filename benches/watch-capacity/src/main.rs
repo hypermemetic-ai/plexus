@@ -1,21 +1,28 @@
+#[cfg(target_os = "linux")]
 mod cpu;
+mod distributed;
 mod service;
 
 use anyhow::{Context, Result, bail, ensure};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::StreamExt;
+#[cfg(target_os = "linux")]
+use futures::{TryStreamExt, stream};
 use hdrhistogram::Histogram;
 use plexus::{
     Connection, Items,
     tls::{Dial, Identity},
 };
 use serde_json::{Value, json};
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
+#[cfg(target_os = "linux")]
 use tokio::{
     task::JoinSet,
     time::{Instant, sleep, sleep_until, timeout},
@@ -38,7 +45,9 @@ fn clock_us() -> u64 {
         .as_micros() as u64
 }
 
+#[cfg(target_os = "linux")]
 struct Fixture(Child);
+#[cfg(target_os = "linux")]
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -46,6 +55,7 @@ impl Drop for Fixture {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn fixture(keys: &[Identity], orgs: usize, rows: usize) -> Result<(Fixture, String, String)> {
     let mut child = Fixture(
         Command::new(std::env::current_exe()?)
@@ -68,6 +78,7 @@ fn fixture(keys: &[Identity], orgs: usize, rows: usize) -> Result<(Fixture, Stri
     Ok((child, url.into(), pin.into()))
 }
 
+#[cfg(target_os = "linux")]
 fn process(pid: u32) -> Result<Value> {
     let dir = format!("/proc/{pid}");
     let status = fs::read_to_string(format!("{dir}/status"))?;
@@ -159,6 +170,7 @@ async fn open(key: Identity, url: &str, pin: &str, org: usize) -> Result<Session
     })
 }
 
+#[cfg(target_os = "linux")]
 async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()> {
     ensure!(
         users > 0 && (1..=users).contains(&orgs) && rows >= 50 && seconds > 0,
@@ -413,15 +425,33 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     match args.as_slice() {
-        [mode, orgs, rows] if mode == "serve" => {
-            runtime.block_on(service::run(orgs.parse()?, rows.parse()?))
+        [mode, orgs, rows] if mode == "serve" => runtime.block_on(service::run(
+            orgs.parse()?,
+            rows.parse()?,
+            distributed::Access::loopback(),
+        )),
+        [mode, orgs, rows, bind, sources] if mode == "serve-external" => {
+            let access = distributed::Access::new(bind, sources)?;
+            runtime.block_on(service::run(orgs.parse()?, rows.parse()?, access))
         }
+        [mode, first, count, total, orgs, seconds] if mode == "generator" => {
+            runtime.block_on(distributed::generator(
+                first.parse()?,
+                count.parse()?,
+                total.parse()?,
+                orgs.parse()?,
+                seconds.parse()?,
+            ))
+        }
+        #[cfg(target_os = "linux")]
         [users, orgs, seconds, rows] => runtime.block_on(run(
             users.parse()?,
             orgs.parse()?,
             seconds.parse()?,
             rows.parse()?,
         )),
-        _ => bail!("usage: watch-capacity USERS ORGANIZATIONS LOAD_SECONDS TICKETS_PER_ORG"),
+        _ => bail!(
+            "usage: watch-capacity USERS ORGS SECONDS ROWS (Linux) | serve-external ORGS ROWS BIND_IP SOURCE_IPS | generator FIRST COUNT TOTAL ORGS SECONDS"
+        ),
     }
 }

@@ -295,7 +295,7 @@ pub mod tickets {
     }
 }
 
-pub async fn run(orgs: usize, rows: usize) -> Result<()> {
+pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -> Result<()> {
     let keys = io::stdin().lock().lines().collect::<io::Result<Vec<_>>>()?;
     ensure!(
         orgs > 0 && orgs <= keys.len() && rows >= 50,
@@ -305,6 +305,9 @@ pub async fn run(orgs: usize, rows: usize) -> Result<()> {
     let identity = Identity::generate()?;
     let mut server = plexus::Server::new();
     plexus::serve(tickets::Tickets(store.clone()), &mut server);
+    server.method_with_caller("bench.clock", |_, _| async {
+        plexus::raw(&crate::clock_us())
+    });
     let observer = keys[0].clone();
     server.method_with_caller("bench.metrics", move |_, context| {
         let authorized = context.caller().is_some_and(|c| c.principal() == observer);
@@ -342,12 +345,17 @@ pub async fn run(orgs: usize, rows: usize) -> Result<()> {
     let listener = Arc::new(Listen::new(&identity, keys.iter().map(String::as_str))?);
     let server = Arc::new(server);
     let mut urls = Vec::new();
+    let access = Arc::new(access);
     for _ in 0..keys.len().div_ceil(8000) {
-        let socket = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let socket = tokio::net::TcpListener::bind((access.bind, 0)).await?;
         urls.push(format!("wss://{}/", socket.local_addr()?));
         let (server, listener) = (server.clone(), listener.clone());
+        let access = access.clone();
         tokio::spawn(async move {
-            while let Ok((tcp, _)) = socket.accept().await {
+            while let Ok((tcp, peer)) = socket.accept().await {
+                if !access.sources.contains(&peer.ip()) {
+                    continue;
+                }
                 let (server, listener) = (server.clone(), listener.clone());
                 tokio::spawn(async move {
                     if let Ok((channel, principal)) = listener.accept(tcp).await {
