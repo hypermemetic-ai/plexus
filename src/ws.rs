@@ -230,7 +230,8 @@ impl<S: AsyncWrite + Unpin> Write for Io<S> {
 
 /// tungstenite hands every frame it makes to [`Io`] at once, which keeps it.
 fn config() -> WebSocketConfig {
-    WebSocketConfig::default().write_buffer_size(0)
+    // Reader decodes frames directly after the upgrade. Tungstenite only writes.
+    WebSocketConfig::default().read_buffer_size(1).write_buffer_size(0)
 }
 
 /// A frame larger than this is refused, as tungstenite refuses one.

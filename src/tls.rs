@@ -157,6 +157,20 @@ impl Dial {
         })
     }
 
+    /// Authenticate an established transport against the configured peer pin.
+    pub async fn connect_tls<S>(
+        &self,
+        name: ServerName<'static>,
+        stream: S,
+    ) -> io::Result<(tokio_rustls::client::TlsStream<S>, String)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let tls = TlsConnector::from(self.config.clone()).connect(name, stream).await?;
+        let principal = peer(tls.get_ref().1.peer_certificates())?;
+        Ok((tls, principal))
+    }
+
     /// A channel to the WebSocket at `url` (`wss://127.0.0.1:4455/`), and the
     /// principal the far end proved. A URL without a port uses 443.
     pub async fn connect(&self, url: &str) -> io::Result<(Channel, String)> {
@@ -181,10 +195,7 @@ impl Dial {
         tcp.set_nodelay(true)?;
         #[cfg(feature = "trace")]
         let (tcp, clock) = crate::trace::Socket::new(tcp);
-        let tls = TlsConnector::from(self.config.clone())
-            .connect(name, tcp)
-            .await?;
-        let peer = peer(tls.get_ref().1.peer_certificates())?;
+        let (tls, peer) = self.connect_tls(name, tcp).await?;
         #[cfg(feature = "trace")]
         let tls = crate::trace::TlsIo::new(tls, clock.clone());
         let channel = crate::ws::client_over(
@@ -248,14 +259,26 @@ impl Listen {
         })
     }
 
+    /// Authenticate an established transport against the configured caller pins.
+    pub async fn accept_tls<S>(
+        &self,
+        stream: S,
+    ) -> io::Result<(tokio_rustls::server::TlsStream<S>, String)>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let tls = self.acceptor.accept(stream).await?;
+        let principal = peer(tls.get_ref().1.peer_certificates())?;
+        Ok((tls, principal))
+    }
+
     /// A channel over a connection just accepted, and the principal the
     /// caller proved, which is one this end accepts.
     pub async fn accept(&self, tcp: TcpStream) -> io::Result<(Channel, String)> {
         tcp.set_nodelay(true)?;
         #[cfg(feature = "trace")]
         let (tcp, clock) = crate::trace::Socket::new(tcp);
-        let tls = self.acceptor.accept(tcp).await?;
-        let peer = peer(tls.get_ref().1.peer_certificates())?;
+        let (tls, peer) = self.accept_tls(tcp).await?;
         #[cfg(feature = "trace")]
         let tls = crate::trace::TlsIo::new(tls, clock.clone());
         let channel = crate::ws::server_over(
