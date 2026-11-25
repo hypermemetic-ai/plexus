@@ -2,6 +2,9 @@
 mod cpu;
 mod distributed;
 mod service;
+#[cfg(target_os = "linux")]
+#[path = "../cpu-scaling/projection.rs"]
+mod projection;
 
 use anyhow::{Context, Result, bail, ensure};
 use futures::StreamExt;
@@ -440,6 +443,10 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     match args.as_slice() {
+        #[cfg(target_os = "linux")]
+        [mode, lanes, seconds] if mode == "projection-ceiling" => {
+            projection::run(lanes.parse()?, seconds.parse()?)
+        }
         [mode, orgs, rows] if mode == "serve" => runtime.block_on(service::run(
             orgs.parse()?,
             rows.parse()?,
@@ -466,7 +473,7 @@ fn main() -> Result<()> {
             rows.parse()?,
         )),
         _ => bail!(
-            "usage: watch-capacity USERS ORGS SECONDS ROWS (Linux) | serve-external ORGS ROWS BIND_IP SOURCE_IPS | generator FIRST COUNT TOTAL ORGS SECONDS"
+            "usage: watch-capacity USERS ORGS SECONDS ROWS (Linux) | projection-ceiling LANES SECONDS (Linux) | serve-external ORGS ROWS BIND_IP SOURCE_IPS | generator FIRST COUNT TOTAL ORGS SECONDS"
         ),
     }
 }
