@@ -46,7 +46,7 @@ pub fn run(lanes: usize, seconds: u64) -> Result<()> {
                     let first =
                         futures::executor::block_on(subscription.next()).context("watch closed")?;
                     let first = first.into_raw();
-                    let check = activation.list(&caller).into_raw();
+                    let check = activation.list(&caller, None).into_raw();
                     ensure!(
                         verify(first.get(), org)?.0 == 0 && verify(check.get(), org)?.0 == 0,
                         "wrong initial projection"
@@ -60,7 +60,7 @@ pub fn run(lanes: usize, seconds: u64) -> Result<()> {
                     let mut latency = histogram();
                     while Instant::now() < end {
                         let sample = operations.is_multiple_of(128).then(Instant::now);
-                        let result = activation.list(&caller).into_raw();
+                        let result = activation.list(&caller, None).into_raw();
                         ensure!(
                             black_box(result.get()).len() == size,
                             "stable page length changed"

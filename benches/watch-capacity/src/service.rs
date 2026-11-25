@@ -42,8 +42,8 @@ impl StoredPage {
     }
 }
 
-// The fixture has immutable membership and one fixed projection, sort and
-// limit. An org is therefore its complete visibility and query key.
+// An organization shares its unfiltered first page. Filtered reads compute
+// their own visible rows and digest.
 struct Group {
     subscribers: Mutex<usize>,
     current: watch::Sender<Option<Arc<Evaluated>>>,
@@ -123,6 +123,7 @@ impl Store {
             }
         }
         tx.commit()?;
+        db.execute_batch("CREATE INDEX ticket_by_status ON ticket(org, status, id)")?;
         let members = keys
             .iter()
             .enumerate()
@@ -153,24 +154,22 @@ impl Store {
         })
     }
 
-    fn query(&self, org: usize) -> tickets::Page {
+    fn query(&self, org: usize, status: Option<&str>) -> tickets::Page {
         self.queries.fetch_add(1, Ordering::Relaxed);
         let db = self.db.lock().unwrap();
         let revision = *self.revisions[org].borrow();
-        let mut q = db
-            .prepare_cached("SELECT id,title,status FROM ticket WHERE org=?1 ORDER BY id LIMIT 50")
-            .unwrap();
-        let rows = q
-            .query_map([org as i64], |r| {
-                Ok(tickets::Row {
-                    id: r.get(0)?,
-                    title: r.get(1)?,
-                    status: r.get(2)?,
-                })
-            })
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
+        let sql = match status {
+            Some(_) => "SELECT id,title,status FROM ticket WHERE org=?1 AND status=?2 ORDER BY id LIMIT 50",
+            None => "SELECT id,title,status FROM ticket WHERE org=?1 ORDER BY id LIMIT 50",
+        };
+        let mut statement = db.prepare_cached(sql).unwrap();
+        let decode = |r: &rusqlite::Row<'_>| {
+            Ok(tickets::Row { id: r.get(0)?, title: r.get(1)?, status: r.get(2)? })
+        };
+        let rows = match status {
+            Some(status) => statement.query_map((org as i64, status), decode),
+            None => statement.query_map([org as i64], decode),
+        }.unwrap().collect::<rusqlite::Result<_>>().unwrap();
         tickets::Page {
             org: org as u32,
             sequence: revision.seq,
@@ -192,8 +191,8 @@ impl Store {
         ).optional().unwrap()
     }
 
-    fn evaluate(&self, org: usize) -> Evaluated {
-        let page = self.query(org);
+    fn evaluate(&self, org: usize, status: Option<&str>) -> Evaluated {
+        let page = self.query(org, status);
         let encoded = serde_json::to_vec(&page.rows).unwrap();
         self.encoded
             .fetch_add(encoded.len() as u64, Ordering::Relaxed);
@@ -209,8 +208,8 @@ impl Store {
         }
     }
 
-    fn read(&self, org: usize) -> plexus::Encoded<tickets::Page> {
-        if let Some(groups) = &self.groups {
+    fn read(&self, org: usize, status: Option<&str>) -> plexus::Encoded<tickets::Page> {
+        if let (None, Some(groups)) = (status, &self.groups) {
             let group = &groups[org];
             // The immutable page is published atomically after its transaction.
             let snapshot = group.current.borrow().clone();
@@ -219,7 +218,7 @@ impl Store {
                 return snapshot.page.answer(self).with_watch_digest(snapshot.digest);
             }
         }
-        let evaluated = self.evaluate(org);
+        let evaluated = self.evaluate(org, status);
         evaluated.page.answer(self).with_watch_digest(evaluated.digest)
     }
 
@@ -229,7 +228,7 @@ impl Store {
         if *count == 0 {
             group
                 .current
-                .send_replace(Some(Arc::new(self.evaluate(org))));
+                .send_replace(Some(Arc::new(self.evaluate(org, None))));
         } else {
             self.initial_hits.fetch_add(1, Ordering::Relaxed);
         }
@@ -266,7 +265,7 @@ impl Store {
             if *count > 0 {
                 group
                     .current
-                    .send_replace(Some(Arc::new(self.evaluate(org))));
+                    .send_replace(Some(Arc::new(self.evaluate(org, None))));
             }
         }
         seq
@@ -296,8 +295,9 @@ pub mod tickets {
 
     impl Tickets {
         #[watch(on = ["tickets"])]
-        pub fn list(&self, caller: &Caller) -> plexus::Encoded<Page> {
-            self.0.read(self.0.members[caller.principal()])
+        pub fn list(&self, caller: &Caller, status: Option<String>) -> plexus::Encoded<Page> {
+            let org = self.0.members[caller.principal()];
+            self.0.read(org, status.as_deref())
         }
         #[watch(on = ["tickets"])]
         pub fn get(&self, caller: &Caller, id: u32) -> Option<Row> {
@@ -340,7 +340,7 @@ pub mod tickets {
                                 rx.changed().await.ok()?;
                             }
                             rx.borrow_and_update();
-                            let current = store.evaluate(org);
+                            let current = store.evaluate(org, None);
                             if previous != Some(current.digest) {
                                 return Some((current.page.answer(&store), (store, rx, Some(current.digest))));
                             }
@@ -548,15 +548,50 @@ mod tests {
         let mut watch = connection.stream("tickets.list-watch", ()).unwrap();
         let item = watch.next().await.unwrap().unwrap();
         let answer = connection.call("tickets.list", ()).await.unwrap();
-        let expected = serde_json::to_string(&store.query(0)).unwrap();
+        let expected = serde_json::to_string(&store.query(0, None)).unwrap();
         assert_eq!(item.get(), expected);
         assert_eq!(answer.get(), expected);
         let page: tickets::Page = serde_json::from_str(answer.get()).unwrap();
         assert_eq!((page.org, page.rows.len()), (0, 50));
         assert_eq!(store.page_encodes.load(Ordering::Relaxed), 1);
-        let a = store.read(0);
-        let b = store.read(0);
+        let a = store.read(0, None);
+        let b = store.read(0, None);
         assert_eq!(a.as_raw().get().as_ptr(), b.as_raw().get().as_ptr());
+    }
+
+    #[tokio::test]
+    async fn status_filter_tracks_the_first_fifty_matching_rows_in_the_callers_org() {
+        for shared in [false, true] {
+            let store = store(shared);
+            let server = serving(store.clone(), "a".into(), 2.try_into().unwrap(), true);
+            let (client, transport) = plexus::pair();
+            tokio::spawn(server.serve_as(transport, plexus::Caller::new("a")));
+            let (conn, driver) = plexus::Connection::new(client, Some(tickets::HASH));
+            tokio::spawn(driver);
+            conn.ready().await.unwrap();
+            let ready = serde_json::json!({ "status": "Ready" });
+            let mut watch = conn.stream("tickets.list-watch", &ready).unwrap();
+            let initial = watch.next().await.unwrap().unwrap();
+            assert_eq!(initial.get(), conn.call("tickets.list", &ready).await.unwrap().get());
+
+            store.write(1);
+            let initial: tickets::Page = serde_json::from_str(initial.get()).unwrap();
+            assert_eq!((initial.org, initial.sequence, initial.rows[0].id), (0, 0, 0));
+            store.write(0);
+            let changed = watch.next().await.unwrap().unwrap();
+            let page: tickets::Page = serde_json::from_str(changed.get()).unwrap();
+            assert_eq!((page.org, page.sequence), (0, 1));
+            assert!(page.rows.iter().all(|r| r.status == "Ready"));
+            assert!(page.rows.iter().map(|r| r.id).eq(1..=50));
+
+            let before = store.evaluate(0, Some("Ready")).digest;
+            store.write(0); // Only the already-excluded row changes.
+            assert_eq!(store.evaluate(0, Some("Ready")).digest, before);
+            let args = serde_json::json!({ "status": "Revision 1" });
+            let empty = conn.call("tickets.list", args).await.unwrap();
+            assert!(serde_json::from_str::<tickets::Page>(empty.get()).unwrap().rows.is_empty());
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(50), watch.next()).await.is_err());
+        }
     }
 
     #[test]
@@ -565,7 +600,7 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
         let store = store(true);
-        let page = store.query(0);
+        let page = store.query(0, None);
         let shared = store.encode(&page);
         for _ in 0..3 {
             for mode in ["clone-and-encode", "encode", "shared"] {
@@ -596,7 +631,7 @@ mod tests {
         assert_eq!(page(first.next().await.unwrap()).org, 0);
         assert_eq!(page(same.next().await.unwrap()).org, 0);
         assert_eq!(page(other.next().await.unwrap()).org, 1);
-        assert_eq!(page(tickets.list(&a)).rows.len(), 50);
+        assert_eq!(page(tickets.list(&a, None)).rows.len(), 50);
         assert_eq!(store.queries.load(Ordering::Relaxed), 2);
         assert_eq!(store.initial_hits.load(Ordering::Relaxed), 1);
         assert_eq!(store.read_hits.load(Ordering::Relaxed), 1);
@@ -607,7 +642,7 @@ mod tests {
         let latest = page(same.next().await.unwrap());
         assert_eq!(latest.sequence, 2);
         assert_eq!(latest.rows[0].status, "Revision 2");
-        assert_eq!(page(tickets.list(&b)).sequence, 0);
+        assert_eq!(page(tickets.list(&b, None)).sequence, 0);
         assert_eq!(store.queries.load(Ordering::Relaxed), 4);
         drop(first);
         drop(same);
@@ -616,7 +651,7 @@ mod tests {
         assert!(groups[1].current.borrow().is_some());
         tickets.advance(&a);
         assert_eq!(store.queries.load(Ordering::Relaxed), 4);
-        assert_eq!(page(tickets.list(&a)).sequence, 3);
+        assert_eq!(page(tickets.list(&a, None)).sequence, 3);
         assert_eq!(store.queries.load(Ordering::Relaxed), 5);
         assert!(groups[0].current.borrow().is_none());
     }
@@ -655,7 +690,7 @@ mod tests {
                 seq: 1,
                 committed_us: 0,
             });
-            group.current.send_replace(Some(Arc::new(store.evaluate(0))));
+            group.current.send_replace(Some(Arc::new(store.evaluate(0, None))));
         }
         assert!(subscription.next().now_or_never().is_none());
         assert_eq!(tickets.advance(&a), 2);
@@ -672,7 +707,7 @@ mod tests {
         let mut second = Box::pin(tickets.watch(&c));
         assert_eq!(page(first.next().await.unwrap()).sequence, 0);
         assert_eq!(page(second.next().await.unwrap()).sequence, 0);
-        tickets.list(&a);
+        tickets.list(&a, None);
         tickets.advance(&a);
         assert_eq!(page(first.next().await.unwrap()).sequence, 1);
         assert_eq!(page(second.next().await.unwrap()).sequence, 1);
