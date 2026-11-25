@@ -1,3 +1,4 @@
+mod cpu;
 mod service;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -164,6 +165,11 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         "invalid rung"
     );
     let profile = std::env::var("WATCH_PROFILE").unwrap_or_else(|_| "uniform".into());
+    let workload = std::env::var("WATCH_WORKLOAD").unwrap_or_else(|_| "mixed".into());
+    ensure!(
+        matches!(workload.as_str(), "mixed" | "reads" | "updates"),
+        "unknown WATCH_WORKLOAD"
+    );
     let hot = profile == "hot";
     let mut population = vec![0; orgs];
     for i in 0..users {
@@ -177,6 +183,13 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     let pid = server.0.id();
     let baseline = process(pid)?;
     eprintln!("opening {users} WSS sessions on {} listener(s)", urls.len());
+    let mut meter = match std::env::var("WATCH_CPU").as_deref() {
+        Ok("1") => Some(cpu::Meter::attach(pid)?),
+        Err(std::env::VarError::NotPresent) | Ok("0") => None,
+        _ => bail!("WATCH_CPU must be 0 or 1"),
+    };
+    let mut sample = || meter.as_mut().map(cpu::Meter::sample).transpose();
+    let cpu_start = sample()?;
     let open_start = Instant::now();
     let mut sessions: Vec<_> = stream::iter(keys.into_iter().enumerate())
         .map(|(i, key)| {
@@ -196,9 +209,11 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         .await?;
     sessions.sort_by_key(|s| s.0);
     let open_ms = open_start.elapsed().as_millis();
+    let cpu_open = sample()?;
     let idle_start = process(pid)?;
     eprintln!("idle: {users} authenticated sockets and first pages, server={idle_start}");
     sleep(Duration::from_secs(2)).await;
+    let cpu_idle = sample()?;
     let idle_end = process(pid)?;
     let delivery = Arc::new(Mutex::new(histogram()));
     let read_latency = Arc::new(Mutex::new(histogram()));
@@ -223,7 +238,11 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         rate > 0 && interval_ms > 0 && matches!(profile.as_str(), "uniform" | "hot"),
         "invalid workload"
     );
-    let writes = usize::try_from(seconds.checked_mul(rate).context("duration overflow")?)?;
+    let writes = if workload == "reads" {
+        0
+    } else {
+        usize::try_from(seconds.checked_mul(rate).context("duration overflow")?)?
+    };
     let target_org = |w: usize| {
         if profile == "hot" && w % 5 != 4 {
             0
@@ -240,6 +259,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     // Keep consuming even after a watch's expected last change. Close it only
     // when the harness finishes, so all connections stay open throughout load.
     let (done, closed) = tokio::sync::watch::channel(false);
+    let cpu_load_start = sample()?;
     for (index, session) in sessions {
         drivers.push(session.driver);
         let mut updates = session.stream;
@@ -267,6 +287,9 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
             ensure!(previous == expected as u64, "watch {index} got {previous}, expected {expected}");
             Ok::<_, anyhow::Error>(())
         });
+        if workload == "updates" {
+            continue;
+        }
         let measured = read_latency.clone();
         readers.spawn(async move {
             let mut scheduled = start
@@ -322,6 +345,31 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         sleep(Duration::from_millis(10)).await;
     }
     let elapsed_s = start.elapsed().as_secs_f64();
+    let cpu_load_end = sample()?;
+    let cpu_phases = if let (Some(m), Some(seed), Some(open), Some(idle), Some(load), Some(end)) = (
+        &meter,
+        cpu_start,
+        cpu_open,
+        cpu_idle,
+        cpu_load_start,
+        cpu_load_end,
+    ) {
+        let mut units = vec![];
+        if workload == "reads" {
+            units.push(("read", read_latency.lock().unwrap().len()));
+        } else if workload == "updates" {
+            units.push(("committed_update_including_fanout", writes as u64));
+            units.push(("delivered_page_including_commit", expected as u64));
+        }
+        Some(json!({
+            "scope":"fixture process; retired user instructions, process CPU includes user and kernel",
+            "open":m.report(&seed,&open,&[("authenticated_watch_with_initial_page", users as u64)])?,
+            "idle":m.report(&open,&idle,&[])?,
+            "load":m.report(&load,&end,&units)?
+        }))
+    } else {
+        None
+    };
     let load_end = process(pid)?;
     let client_load_end = process(std::process::id())?;
     let baseline_fds = baseline["fds"].as_u64().context("baseline fd count")?;
@@ -348,7 +396,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     println!(
         "{}",
         json!({"users":users,"authenticated_wss":users,"initial_watches":users,"loopback_listeners":urls.len(),"largest_org_users":population.iter().max(),"server_counters":metrics,"organizations":orgs,
-        "tickets_per_org":rows,"total_tickets":orgs*rows,"scheduled_load_s":seconds,"load_and_drain_s":elapsed_s, "profile":profile,"evaluation":std::env::var("WATCH_EVALUATION").unwrap_or_else(|_|"per-watch".into()), "offered_reads_per_s":users as f64*1000.0/interval_ms as f64,"offered_writes_per_s":rate,"scheduled_write_to_ack":stats(&write_latency),
+        "tickets_per_org":rows,"total_tickets":orgs*rows,"workload":workload,"cpu_phases":cpu_phases,"scheduled_load_s":seconds,"load_and_drain_s":elapsed_s, "profile":profile,"evaluation":std::env::var("WATCH_EVALUATION").unwrap_or_else(|_|"per-watch".into()), "offered_reads_per_s":if workload == "updates" {0.0} else {users as f64*1000.0/interval_ms as f64},"offered_writes_per_s":if workload=="reads" {0} else {rate},"scheduled_write_to_ack":stats(&write_latency),
         "writes":writes,"open_ms":open_ms,"expected_deliveries":expected,
         "read_scheduled_to_receive":stats(&read_latency.lock().unwrap()),
         "commit_to_receive":stats(&delivery.lock().unwrap()),
