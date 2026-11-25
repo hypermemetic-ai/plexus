@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod browser_observer;
+#[cfg(target_os = "linux")]
 mod cpu;
 mod distributed;
 mod service;
@@ -59,7 +61,7 @@ impl Drop for Fixture {
 }
 
 #[cfg(target_os = "linux")]
-fn fixture(keys: &[Identity], orgs: usize, rows: usize, timing_dir: Option<&tempfile::TempDir>) -> Result<(Fixture, String, String)> {
+fn fixture(keys: &[Identity], orgs: usize, rows: usize, timing_dir: Option<&tempfile::TempDir>, browser: Option<&browser_observer::BrowserObserver>) -> Result<(Fixture, String, String)> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(["serve", &orgs.to_string(), &rows.to_string()])
         .stdin(Stdio::piped())
@@ -67,6 +69,11 @@ fn fixture(keys: &[Identity], orgs: usize, rows: usize, timing_dir: Option<&temp
     if let Some(dir) = timing_dir {
         cmd.env("WATCH_TIMING_WINDOW_FILE", dir.path().join("window.json"))
             .env("WATCH_TIMING_SKIP_READS", "0");
+    }
+    if let Some(browser) = browser {
+        cmd.env("WATCH_FIXTURE_BROWSER_PIN", &browser.principal);
+    } else {
+        cmd.env_remove("WATCH_FIXTURE_BROWSER_PIN");
     }
     let mut child = Fixture(cmd.spawn()?);
     let mut input = child.0.stdin.take().unwrap();
@@ -174,7 +181,7 @@ async fn open(key: Identity, url: &str, pin: &str, org: usize) -> Result<Session
         .await.context("WSS connection or authentication exceeded enrollment deadline")??;
     let (conn, drive) = Connection::new(channel, None);
     let driver = tokio::spawn(drive);
-    let mut stream = conn.stream("tickets.watch", ())?;
+    let mut stream = conn.stream("tickets.list-watch", ())?;
     let first = tokio::time::timeout_at(deadline, stream.next())
         .await.context("first watch page exceeded enrollment deadline")?
         .context("watch closed during open")??;
@@ -210,7 +217,9 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     let timing_dir = (std::env::var("WATCH_SERVER_TIMING").as_deref() == Ok("1"))
         .then(tempfile::tempdir)
         .transpose()?;
-    let (server, urls, pin) = fixture(&keys, orgs, rows, timing_dir.as_ref())?;
+    let browser = browser_observer::BrowserObserver::configured().await?;
+    ensure!(browser.is_none() || workload != "reads", "the live browser needs scheduled writes");
+    let (server, urls, pin) = fixture(&keys, orgs, rows, timing_dir.as_ref(), browser.as_ref())?;
     let urls: Vec<_> = urls.split(',').collect();
     let pid = server.0.id();
     let baseline = process(pid)?;
@@ -246,6 +255,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     sleep(Duration::from_secs(2)).await;
     let cpu_idle = sample()?;
     let idle_end = process(pid)?;
+    if let Some(browser) = &browser { browser.connect(urls[0], &pin).await?; }
     let delivery = Arc::new(Mutex::new(histogram()));
     let read_latency = Arc::new(Mutex::new(histogram()));
     let mut consumers = JoinSet::new();
@@ -420,6 +430,10 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         "sockets closed during load"
     );
     let metrics: Value = serde_json::from_str(held[0].call("bench.metrics", ()).await?.get())?;
+    let browser_result = match browser {
+        Some(browser) => Some(browser.finish(target_counts[0]).await?),
+        None => None,
+    };
     done.send_replace(true);
     while let Some(result) = consumers.join_next().await {
         result??;
@@ -437,7 +451,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     sleep(Duration::from_secs(2)).await;
     println!(
         "{}",
-        json!({"users":users,"authenticated_wss":users,"initial_watches":users,"loopback_listeners":urls.len(),"largest_org_users":population.iter().max(),"server_counters":metrics,"organizations":orgs,
+        json!({"users":users,"watch_method":"tickets.list-watch","browser_observer":browser_result,"interface_hash":service::tickets::HASH,"authenticated_wss":users,"initial_watches":users,"loopback_listeners":urls.len(),"largest_org_users":population.iter().max(),"server_counters":metrics,"organizations":orgs,
         "tickets_per_org":rows,"total_tickets":orgs*rows,"workload":workload,"cpu_phases":cpu_phases,"scheduled_load_s":seconds,"load_and_drain_s":elapsed_s, "profile":profile,"evaluation":std::env::var("WATCH_EVALUATION").unwrap_or_else(|_|"per-watch".into()), "offered_reads_per_s":if workload == "updates" {0.0} else {users as f64*1000.0/interval_ms as f64},"offered_writes_per_s":if workload=="reads" {0} else {rate},"scheduled_write_to_ack":stats(&write_latency),
         "writes":writes,"reader_release_headroom_us":startup_headroom.as_micros(),"open_ms":open_ms,"open_concurrency":open_concurrency,"expected_deliveries":expected,
         "read_scheduled_to_receive":stats(&read_latency.lock().unwrap()),
@@ -462,6 +476,8 @@ fn main() -> Result<()> {
         .enable_all()
         .build()?;
     match args.as_slice() {
+        [mode] if mode == "client-ts" => { print!("{}", service::tickets::CLIENT_TS); Ok(()) }
+        [mode] if mode == "interface" => { println!("{}", service::tickets::IR); Ok(()) }
         #[cfg(target_os = "linux")]
         [mode, lanes, seconds] if mode == "projection-ceiling" => {
             projection::run(lanes.parse()?, seconds.parse()?)

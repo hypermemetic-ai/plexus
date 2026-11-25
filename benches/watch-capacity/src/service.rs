@@ -1,4 +1,4 @@
-//! Native transport and query baseline, independent of the proposed watch IR.
+//! The benchmark and browser fixture share this watchable tickets activation.
 mod timing;
 
 use std::collections::HashMap;
@@ -10,7 +10,7 @@ use std::sync::{
 
 use anyhow::{Result, ensure};
 use plexus::tls::{Identity, Listen};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tokio::sync::watch;
 
 #[derive(Clone, Copy, Default)]
@@ -70,6 +70,7 @@ pub struct Store {
     timing: Option<Arc<timing::Timing>>,
     db: Mutex<Connection>,
     members: HashMap<String, usize>,
+    browser_principal: Option<String>,
     queries: AtomicU64,
     encoded: AtomicU64,
     revisions: Vec<watch::Sender<Revision>>,
@@ -143,6 +144,7 @@ impl Store {
             initial_hits: AtomicU64::new(0),
             db: Mutex::new(db),
             members,
+            browser_principal: None,
             queries: AtomicU64::new(0),
             encoded: AtomicU64::new(0),
             revisions: (0..orgs)
@@ -182,6 +184,14 @@ impl Store {
         plexus::Encoded::new(page).expect("ticket page is serializable")
     }
 
+    fn row(&self, org: usize, id: u32) -> Option<tickets::Row> {
+        self.db.lock().unwrap().query_row(
+            "SELECT id,title,status FROM ticket WHERE org=?1 AND id=?2",
+            rusqlite::params![org as i64, id],
+            |r| Ok(tickets::Row { id: r.get(0)?, title: r.get(1)?, status: r.get(2)? }),
+        ).optional().unwrap()
+    }
+
     fn evaluate(&self, org: usize) -> Evaluated {
         let page = self.query(org);
         let encoded = serde_json::to_vec(&page.rows).unwrap();
@@ -202,17 +212,15 @@ impl Store {
     fn read(&self, org: usize) -> plexus::Encoded<tickets::Page> {
         if let Some(groups) = &self.groups {
             let group = &groups[org];
-            // Use the same publication boundary as writes and last-watch removal.
-            let snapshot = {
-                let _count = group.subscribers.lock().unwrap();
-                group.current.borrow().clone()
-            };
+            // The immutable page is published atomically after its transaction.
+            let snapshot = group.current.borrow().clone();
             if let Some(snapshot) = snapshot {
                 self.read_hits.fetch_add(1, Ordering::Relaxed);
-                return snapshot.page.answer(self);
+                return snapshot.page.answer(self).with_watch_digest(snapshot.digest);
             }
         }
-        self.encode(&self.query(org))
+        let evaluated = self.evaluate(org);
+        evaluated.page.answer(self).with_watch_digest(evaluated.digest)
     }
 
     fn subscribe(self: &Arc<Self>, org: usize) -> Option<SharedWatch> {
@@ -287,8 +295,13 @@ pub mod tickets {
     pub struct Tickets(pub Arc<Store>);
 
     impl Tickets {
+        #[watch(on = ["tickets"])]
         pub fn list(&self, caller: &Caller) -> plexus::Encoded<Page> {
             self.0.read(self.0.members[caller.principal()])
+        }
+        #[watch(on = ["tickets"])]
+        pub fn get(&self, caller: &Caller, id: u32) -> Option<Row> {
+            self.0.row(self.0.members[caller.principal()], id)
         }
         pub fn advance(&self, caller: &Caller) -> u64 {
             self.0.write(self.0.members[caller.principal()])
@@ -340,6 +353,35 @@ pub mod tickets {
                 item
             })
         }
+    }
+}
+
+impl plexus::WatchSource for tickets::Tickets {
+    fn subscribe(&self, dependencies: &[&str], call: &plexus::CallContext, _: &plexus::Raw)
+        -> Result<plexus::Invalidations, plexus::Failure>
+    {
+        use futures::{StreamExt, stream};
+        if dependencies != ["tickets"] {
+            return Err(plexus::fail("invalid_source", "unknown ticket change source", ()));
+        }
+        let principal = call.require_caller()?.principal();
+        let org = *self.0.members.get(principal)
+            .ok_or_else(|| plexus::fail("denied", "ticket membership required", ()))?;
+        let observed = self.0.timing.as_ref()
+            .filter(|_| self.0.browser_principal.as_deref() != Some(principal))
+            .map(|meter| meter.watch(org));
+        let notifications: plexus::Invalidations = if let Some(watch) = self.0.subscribe(org) {
+            Box::pin(stream::unfold(watch, |mut watch| async move {
+                watch.current.changed().await.ok()?;
+                Some(((), watch))
+            }))
+        } else {
+            Box::pin(stream::unfold(self.0.revisions[org].subscribe(), |mut source| async move {
+                source.changed().await.ok()?;
+                Some(((), source))
+            }))
+        };
+        Ok(Box::pin(notifications.map(move |()| { let _ = &observed; })))
     }
 }
 
@@ -405,7 +447,12 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
         orgs > 0 && orgs <= keys.len() && rows >= 50,
         "invalid fixture dimensions"
     );
-    let store = Arc::new(Store::new(&keys, orgs, rows)?);
+    let mut store = Store::new(&keys, orgs, rows)?;
+    if let Ok(pin) = std::env::var("WATCH_FIXTURE_BROWSER_PIN") {
+        ensure!(store.members.insert(pin.clone(), 0).is_none(), "duplicate browser principal");
+        store.browser_principal = Some(pin);
+    }
+    let store = Arc::new(store);
     // The Linux controller can recover counters if the remote observer exits.
     // The destination is inside its private run directory.
     #[cfg(target_os = "linux")]
@@ -436,7 +483,7 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
     let servers: Arc<Vec<_>> = Arc::new((0..replicas).map(|_| serving(store.clone(), keys[0].clone(), lanes, concurrent)).collect());
     // Multiple loopback destination ports give a colocated driver enough TCP
     // four-tuples. Every listener feeds the same process, store and acceptor.
-    let listener = Arc::new(Listen::new(&identity, keys.iter().map(String::as_str))?);
+    let listener = Arc::new(Listen::new(&identity, keys.iter().chain(store.browser_principal.iter()).map(String::as_str))?);
     let listener_count = keys.len().div_ceil(8000);
     // Membership and TLS each own the principals they need after enrollment.
     drop(keys);
@@ -457,8 +504,8 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
                     if let Ok((channel, principal)) = listener.accept(tcp).await {
                         let org = store.members[&principal];
                         let channel = match &store.timing {
-                            Some(meter) => meter.wrap(channel, org),
-                            None => channel,
+                            Some(meter) if store.browser_principal.as_ref() != Some(&principal) => meter.wrap(channel, org),
+                            _ => channel,
                         };
                         let _ = servers[org % servers.len()]
                             .serve_as(channel, plexus::Caller::new(principal))
@@ -489,9 +536,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generated_read_and_watch_keep_the_previous_client_contract() {
-        // The original generated fixture's IR hash, before encoded responses.
-        assert_eq!(tickets::HASH, "70e40dfb4526da26");
+    async fn generated_watch_returns_the_same_authorized_page_as_the_unary_read() {
+        assert!(tickets::IR.contains("list-watch"));
         let store = store(true);
         let server = serving(store.clone(), "a".into(), 2.try_into().unwrap(), true);
         let (client, transport) = plexus::pair();
@@ -499,7 +545,7 @@ mod tests {
         let (connection, driver) = plexus::Connection::new(client, Some(tickets::HASH));
         tokio::spawn(driver);
         connection.ready().await.unwrap();
-        let mut watch = connection.stream("tickets.watch", ()).unwrap();
+        let mut watch = connection.stream("tickets.list-watch", ()).unwrap();
         let item = watch.next().await.unwrap().unwrap();
         let answer = connection.call("tickets.list", ()).await.unwrap();
         let expected = serde_json::to_string(&store.query(0)).unwrap();

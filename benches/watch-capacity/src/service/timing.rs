@@ -378,7 +378,7 @@ impl Timing {
                 Call::Unary(Read, at)
             } else if body.starts_with(br#"["tickets.advance""#) {
                 Call::Unary(Write, at)
-            } else if body.starts_with(br#"["tickets.watch""#) {
+            } else if body.starts_with(br#"["tickets.list-watch""#) || body.starts_with(br#"["tickets.watch""#) {
                 Call::Watch(true)
             } else {
                 return;
@@ -598,7 +598,7 @@ mod tests {
             br#"[1,1,["tickets.list"]]"#.as_slice(),
             br#"[2,1,["tickets.list"]]"#,
             br#"[3,1,["tickets.advance"]]"#,
-            br#"[4,1,["tickets.watch"]]"#,
+            br#"[4,1,["tickets.list-watch"]]"#,
         ];
         let chan = Channel::new(
             Gate(gate.clone()),
