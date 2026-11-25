@@ -2,6 +2,8 @@
 
 This Linux benchmark measures the existing native WSS fixture and its load generator on disjoint physical CPUs. Each user opens an authenticated session, subscribes to its authorized 50-row page and validates each scheduled read. The mixed profile also checks every scheduled write acknowledgement and watch delivery. The fixture shares the database and authorized views across activation lanes.
 
+The November 25 server-capacity measurements cover a 480-session rate sweep, uniform and hot populations up to 250,000 actual watches, and Mac-generated traffic. The receipt records exact in-window counts alongside full-run server percentiles, client diagnostics and failed experiments. [Open the measured results](evidence/ryzen-server-capacity.json).
+
 ## Run the WSS sweep
 
 Build the benchmark from its directory with `cargo build --release --locked --bin watch-capacity`. Inspect `lscpu -e=CPU,CORE,SOCKET` before selecting role masks. The example masks suit a 12-core machine on which CPUs 12–23 are the SMT siblings of CPUs 0–11.

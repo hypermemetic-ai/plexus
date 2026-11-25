@@ -1,0 +1,501 @@
+{
+  "machine": "AMD Ryzen 9 5900X",
+  "date_utc": "2026-11-25",
+  "transport": "authenticated native Layers-1 WSS",
+  "page_rows": 50,
+  "tickets_per_organization": 2000,
+  "writes_offered_per_second": 4,
+  "native_fixture_metric_revision": "9733e07",
+  "installed_mac_generator_uses_serial_write_acks": true,
+  "server_p99_scope": "all measured operation latencies, including drain",
+  "completion_boundary": "successful local transport sink flush",
+  "capacity_gate": {
+    "read": 100,
+    "write": 250,
+    "watch_update": 250,
+    "min_load_fraction": 0.95
+  },
+  "rate_sweep": [
+    {
+      "binary_sha256": "67f945ab6e22b94147e7577e8fd85a3fc4c7e3c06dba0262e97f5d3130bd0e2f",
+      "profile": "hot",
+      "sessions": 480,
+      "organizations": 48,
+      "seconds": 15,
+      "fixture_physical_cores": 4,
+      "generator_physical_cores": 8,
+      "read_offered_per_second": 120000.0,
+      "busy_fixture_cores_including_drain": 2.3339,
+      "operations": {
+        "read": {
+          "scheduled": 1800000,
+          "ingress_in_window": 1799890,
+          "flushed_in_window": 1799761,
+          "total_flushed_including_drain": 1800000,
+          "server_p99_us": 2959
+        },
+        "write": {
+          "scheduled": 60,
+          "ingress_in_window": 60,
+          "flushed_in_window": 60,
+          "total_flushed_including_drain": 60,
+          "server_p99_us": 2857
+        },
+        "watch_update": {
+          "scheduled": 4745,
+          "ingress_in_window": 4745,
+          "flushed_in_window": 4745,
+          "total_flushed_including_drain": 4745,
+          "server_p99_us": 3033
+        }
+      },
+      "verdict": "pass"
+    },
+    {
+      "binary_sha256": "67f945ab6e22b94147e7577e8fd85a3fc4c7e3c06dba0262e97f5d3130bd0e2f",
+      "profile": "hot",
+      "sessions": 480,
+      "organizations": 48,
+      "seconds": 15,
+      "fixture_physical_cores": 4,
+      "generator_physical_cores": 8,
+      "read_offered_per_second": 240000.0,
+      "busy_fixture_cores_including_drain": 3.1076,
+      "operations": {
+        "read": {
+          "scheduled": 3600000,
+          "ingress_in_window": 2262506,
+          "flushed_in_window": 2262157,
+          "total_flushed_including_drain": 3600000,
+          "server_p99_us": 6899
+        },
+        "write": {
+          "scheduled": 60,
+          "ingress_in_window": 60,
+          "flushed_in_window": 60,
+          "total_flushed_including_drain": 60,
+          "server_p99_us": 4639
+        },
+        "watch_update": {
+          "scheduled": 4745,
+          "ingress_in_window": 4745,
+          "flushed_in_window": 4745,
+          "total_flushed_including_drain": 4745,
+          "server_p99_us": 6143
+        }
+      },
+      "verdict": "underfed"
+    }
+  ],
+  "population_runs": [
+    {
+      "binary_sha256": "6e0037fd8665ef3c8571748edb61c489b3bca1e88e0c6222d2091f9a625ecc79",
+      "profile": "hot",
+      "organizations": 1000,
+      "largest_org_users": 19801,
+      "page_queries": 1120,
+      "page_encodes": 1120,
+      "server_io_cpu_s_including_drain": 42.762,
+      "activation_cpu_s_including_drain": 7.205,
+      "authenticated_sessions": 100000,
+      "initial_watch_pages": 100000,
+      "seconds": 30,
+      "open_ms": 29796,
+      "fixture_rss_kib_at_load_end": 1755332,
+      "generator_rss_kib_at_load_end": 2180128,
+      "operations": {
+        "read": {
+          "scheduled": 300000,
+          "ingress_in_window": 299990,
+          "flushed_in_window": 299990,
+          "total_flushed_including_drain": 300000,
+          "server_p99_us": 86591
+        },
+        "write": {
+          "scheduled": 120,
+          "ingress_in_window": 120,
+          "flushed_in_window": 120,
+          "total_flushed_including_drain": 120,
+          "server_p99_us": 20783
+        },
+        "watch_update": {
+          "scheduled": 1922601,
+          "ingress_in_window": 1922601,
+          "flushed_in_window": 1922601,
+          "total_flushed_including_drain": 1922601,
+          "server_p99_us": 100415
+        }
+      },
+      "verdict": "pass"
+    },
+    {
+      "binary_sha256": "6e0037fd8665ef3c8571748edb61c489b3bca1e88e0c6222d2091f9a625ecc79",
+      "profile": "hot",
+      "organizations": 2500,
+      "largest_org_users": 49501,
+      "page_queries": 2620,
+      "page_encodes": 2620,
+      "server_io_cpu_s_including_drain": 103.972,
+      "activation_cpu_s_including_drain": 18.957,
+      "authenticated_sessions": 250000,
+      "initial_watch_pages": 250000,
+      "seconds": 30,
+      "open_ms": 80946,
+      "fixture_rss_kib_at_load_end": 4390400,
+      "generator_rss_kib_at_load_end": 5789928,
+      "operations": {
+        "read": {
+          "scheduled": 750000,
+          "ingress_in_window": 749620,
+          "flushed_in_window": 743400,
+          "total_flushed_including_drain": 750000,
+          "server_p99_us": 429567
+        },
+        "write": {
+          "scheduled": 120,
+          "ingress_in_window": 120,
+          "flushed_in_window": 120,
+          "total_flushed_including_drain": 120,
+          "server_p99_us": 281087
+        },
+        "watch_update": {
+          "scheduled": 4803501,
+          "ingress_in_window": 4803501,
+          "flushed_in_window": 4801103,
+          "total_flushed_including_drain": 4803501,
+          "server_p99_us": 442367
+        }
+      },
+      "verdict": "server_latency"
+    },
+    {
+      "binary_sha256": "67f945ab6e22b94147e7577e8fd85a3fc4c7e3c06dba0262e97f5d3130bd0e2f",
+      "profile": "uniform",
+      "organizations": 2500,
+      "largest_org_users": 100,
+      "page_queries": 2620,
+      "page_encodes": 2620,
+      "server_io_cpu_s_including_drain": 26.591,
+      "activation_cpu_s_including_drain": 5.735,
+      "authenticated_sessions": 250000,
+      "initial_watch_pages": 250000,
+      "seconds": 30,
+      "open_ms": 75352,
+      "fixture_rss_kib_at_load_end": 4285388,
+      "generator_rss_kib_at_load_end": 5383232,
+      "operations": {
+        "read": {
+          "scheduled": 750000,
+          "ingress_in_window": 749965,
+          "flushed_in_window": 749965,
+          "total_flushed_including_drain": 750000,
+          "server_p99_us": 2663
+        },
+        "write": {
+          "scheduled": 120,
+          "ingress_in_window": 120,
+          "flushed_in_window": 120,
+          "total_flushed_including_drain": 120,
+          "server_p99_us": 4879
+        },
+        "watch_update": {
+          "scheduled": 12000,
+          "ingress_in_window": 12000,
+          "flushed_in_window": 12000,
+          "total_flushed_including_drain": 12000,
+          "server_p99_us": 3821
+        }
+      },
+      "verdict": "pass"
+    }
+  ],
+  "mac_trials": [
+    {
+      "trial": "remote",
+      "profile": "hot",
+      "users": 100,
+      "seconds": 30,
+      "verdict": "pass",
+      "connected": 100,
+      "window": {
+        "read": {
+          "flushed": 300,
+          "server_p99_us": 599
+        },
+        "write": {
+          "flushed": 120,
+          "server_p99_us": 661
+        },
+        "watch_update": {
+          "flushed": 6960,
+          "server_p99_us": 863
+        }
+      },
+      "client_read_p99_us": 154111
+    },
+    {
+      "trial": "remote",
+      "profile": "uniform",
+      "users": 100,
+      "seconds": 30,
+      "verdict": "pass",
+      "connected": 100,
+      "window": {
+        "read": {
+          "flushed": 300,
+          "server_p99_us": 327
+        },
+        "write": {
+          "flushed": 120,
+          "server_p99_us": 402
+        },
+        "watch_update": {
+          "flushed": 6000,
+          "server_p99_us": 442
+        }
+      },
+      "client_read_p99_us": 64895
+    },
+    {
+      "trial": "remote",
+      "profile": "hot",
+      "users": 1000,
+      "seconds": 30,
+      "verdict": "underfed",
+      "connected": 1000,
+      "window": {
+        "read": {
+          "flushed": 2995,
+          "server_p99_us": 111
+        },
+        "write": {
+          "flushed": 112,
+          "server_p99_us": 1163
+        },
+        "watch_update": {
+          "flushed": 20209,
+          "server_p99_us": 1323
+        }
+      },
+      "client_read_p99_us": 380415
+    },
+    {
+      "trial": "remote",
+      "profile": "uniform",
+      "users": 1000,
+      "seconds": 30,
+      "verdict": "pass",
+      "connected": 1000,
+      "window": {
+        "read": {
+          "flushed": 2995,
+          "server_p99_us": 86
+        },
+        "write": {
+          "flushed": 120,
+          "server_p99_us": 781
+        },
+        "watch_update": {
+          "flushed": 12000,
+          "server_p99_us": 769
+        }
+      },
+      "client_read_p99_us": 175231
+    },
+    {
+      "trial": "remote",
+      "profile": "uniform",
+      "users": 10000,
+      "seconds": 30,
+      "verdict": "runner_error",
+      "connected": 10000
+    },
+    {
+      "trial": "remote",
+      "profile": "hot",
+      "users": 32,
+      "seconds": 30,
+      "verdict": "pass",
+      "connected": 32,
+      "window": {
+        "read": {
+          "flushed": 96,
+          "server_p99_us": 1226
+        },
+        "write": {
+          "flushed": 120,
+          "server_p99_us": 430
+        },
+        "watch_update": {
+          "flushed": 2208,
+          "server_p99_us": 391
+        }
+      },
+      "client_read_p99_us": 135039
+    },
+    {
+      "trial": "remote",
+      "profile": "uniform",
+      "users": 32,
+      "seconds": 30,
+      "verdict": "pass",
+      "connected": 32,
+      "window": {
+        "read": {
+          "flushed": 96,
+          "server_p99_us": 293
+        },
+        "write": {
+          "flushed": 120,
+          "server_p99_us": 315
+        },
+        "watch_update": {
+          "flushed": 1920,
+          "server_p99_us": 246
+        }
+      },
+      "client_read_p99_us": 99775
+    },
+    {
+      "trial": "retry-uniform",
+      "profile": "uniform",
+      "users": 10000,
+      "seconds": 30,
+      "verdict": "runner_error",
+      "connected": 10000,
+      "partial_fixture_counts": {
+        "read": {
+          "ingress": 13847,
+          "flushed": 13838
+        },
+        "write": {
+          "ingress": 6,
+          "flushed": 6
+        },
+        "watch_update": {
+          "ingress": 600,
+          "flushed": 600
+        }
+      }
+    },
+    {
+      "trial": "retry-hot",
+      "profile": "hot",
+      "users": 1000,
+      "seconds": 30,
+      "verdict": "pass",
+      "connected": 1000,
+      "window": {
+        "read": {
+          "flushed": 2995,
+          "server_p99_us": 96
+        },
+        "write": {
+          "flushed": 120,
+          "server_p99_us": 980
+        },
+        "watch_update": {
+          "flushed": 21603,
+          "server_p99_us": 946
+        }
+      },
+      "client_read_p99_us": 336895
+    },
+    {
+      "trial": "retry-midpoint",
+      "profile": "uniform",
+      "users": 5000,
+      "seconds": 30,
+      "verdict": "runner_error",
+      "connected": 5000,
+      "partial_fixture_counts": {
+        "read": {
+          "ingress": 14973,
+          "flushed": 14973
+        },
+        "write": {
+          "ingress": 29,
+          "flushed": 29
+        },
+        "watch_update": {
+          "ingress": 2900,
+          "flushed": 2900
+        }
+      }
+    }
+  ],
+  "hot_population_experiments": [
+    {
+      "users": 250000,
+      "wss_workers": 12,
+      "activation_workers": 4,
+      "six_physical_cores_per_process_in_distinct_l3_domains": false,
+      "open_loop_write_schedule": false,
+      "enrollment_concurrency": 32,
+      "verdict": "correctness",
+      "error": "Error: missing or duplicate update for 181760: 2 -> 4",
+      "partial_counts": {
+        "read": {
+          "flushed": 749966,
+          "ingress": 749966
+        },
+        "write": {
+          "flushed": 120,
+          "ingress": 120
+        },
+        "watch_update": {
+          "flushed": 4575115,
+          "ingress": 4577619
+        }
+      },
+      "binary_sha256": "6e0037fd8665ef3c8571748edb61c489b3bca1e88e0c6222d2091f9a625ecc79"
+    },
+    {
+      "users": 250000,
+      "wss_workers": 6,
+      "activation_workers": 4,
+      "six_physical_cores_per_process_in_distinct_l3_domains": true,
+      "open_loop_write_schedule": true,
+      "enrollment_concurrency": 32,
+      "verdict": "setup_error",
+      "error": "Error: initial watch timed out for user 123740",
+      "binary_sha256": "7b3bc028b6363e3824c82f320ca50a964edaa7263191264bb1cf3cfac8700aa5"
+    },
+    {
+      "users": 250000,
+      "wss_workers": 6,
+      "activation_workers": 4,
+      "six_physical_cores_per_process_in_distinct_l3_domains": false,
+      "open_loop_write_schedule": true,
+      "enrollment_concurrency": 32,
+      "verdict": "setup_error",
+      "error": "Error: initial watch timed out for user 227144",
+      "binary_sha256": "7b3bc028b6363e3824c82f320ca50a964edaa7263191264bb1cf3cfac8700aa5"
+    },
+    {
+      "users": 250000,
+      "wss_workers": 6,
+      "activation_workers": 4,
+      "six_physical_cores_per_process_in_distinct_l3_domains": false,
+      "open_loop_write_schedule": true,
+      "enrollment_concurrency": 16,
+      "verdict": "correctness",
+      "error": "Error: missing or duplicate update for 230845: 0 -> 2",
+      "partial_counts": {
+        "read": {
+          "flushed": 749967,
+          "ingress": 749972
+        },
+        "write": {
+          "flushed": 120,
+          "ingress": 120
+        },
+        "watch_update": {
+          "flushed": 999710,
+          "ingress": 1042715
+        }
+      },
+      "binary_sha256": "cbe1127fc192384c0e0e285eefe795574d3f084cba71c80421f2a980bdfcaef2"
+    }
+  ]
+}
