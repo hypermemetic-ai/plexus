@@ -12,6 +12,7 @@ struct State {
     value: AtomicU32,
     registered: AtomicBool,
     reads: AtomicU32,
+    change_while_reading: AtomicBool,
     wake: Mutex<Option<mpsc::UnboundedSender<()>>>,
 }
 
@@ -32,7 +33,19 @@ mod board {
         }
         #[watch(on = ["membership"])]
         pub fn plain(&self) -> u32 {
-            self.0.value.load(Ordering::SeqCst)
+            let visible = self.0.value.load(Ordering::SeqCst);
+            if self.0.change_while_reading.swap(false, Ordering::SeqCst) {
+                self.0.value.store(visible + 1, Ordering::SeqCst);
+                self.0
+                    .wake
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .unbounded_send(())
+                    .unwrap();
+            }
+            visible
         }
     }
 }
@@ -107,9 +120,19 @@ async fn generated_watch_rechecks_grant_and_suppresses_equal_visible_digest() {
     );
     assert!(wake.is_closed());
     grant.store(true, Ordering::SeqCst);
+    state.change_while_reading.store(true, Ordering::SeqCst);
     let mut plain = alice.stream("board.plain-watch", ()).unwrap();
     assert_eq!(plain.next().await.unwrap().unwrap().get(), "2");
+    // No further write is needed: the source was live when the first
+    // authorized projection raced a change from 2 to 3.
+    assert_eq!(plain.next().await.unwrap().unwrap().get(), "3");
     let wake = state.wake.lock().unwrap().clone().unwrap();
+    wake.unbounded_send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), plain.next())
+            .await
+            .is_err()
+    );
     drop(plain);
     tokio::time::timeout(Duration::from_secs(2), async {
         while !wake.is_closed() {
