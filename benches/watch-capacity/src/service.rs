@@ -9,12 +9,18 @@ use std::sync::{
 use anyhow::{Result, ensure};
 use plexus::tls::{Identity, Listen};
 use rusqlite::Connection;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 #[derive(Clone, Copy, Default)]
 struct Revision {
     seq: u64,
     committed_us: u64,
+}
+
+#[derive(Debug)]
+struct Evaluated {
+    page: tickets::Page,
+    digest: u128,
 }
 
 pub struct Store {
@@ -23,6 +29,7 @@ pub struct Store {
     queries: AtomicU64,
     encoded: AtomicU64,
     revisions: Vec<watch::Sender<Revision>>,
+    groups: Option<Vec<broadcast::Sender<Arc<Evaluated>>>>,
 }
 
 impl Store {
@@ -52,7 +59,14 @@ impl Store {
             .enumerate()
             .map(|(i, k)| (k.clone(), crate::user_org(i, orgs, hot)))
             .collect();
+        let mode = std::env::var("WATCH_EVALUATION").unwrap_or_else(|_| "per-watch".into());
+        ensure!(
+            matches!(mode.as_str(), "per-watch" | "shared"),
+            "unknown evaluation mode"
+        );
         Ok(Self {
+            groups: (mode == "shared")
+                .then(|| (0..orgs).map(|_| broadcast::channel(1).0).collect()),
             db: Mutex::new(db),
             members,
             queries: AtomicU64::new(0),
@@ -89,6 +103,17 @@ impl Store {
         }
     }
 
+    fn evaluate(&self, org: usize) -> Evaluated {
+        let page = self.read(org);
+        let encoded = serde_json::to_vec(&page.rows).unwrap();
+        self.encoded
+            .fetch_add(encoded.len() as u64, Ordering::Relaxed);
+        Evaluated {
+            page,
+            digest: xxhash_rust::xxh3::xxh3_128(&encoded),
+        }
+    }
+
     fn write(&self, org: usize) -> u64 {
         // Keep commit, revision update and read under the same lock. Signaling
         // after sqlite's autocommit gives every observing reader a timestamp.
@@ -104,6 +129,14 @@ impl Store {
             seq,
             committed_us: crate::clock_us(),
         });
+        drop(db);
+        // This fixture has one projection and one visibility policy per org.
+        // A production sharing key must include every factor affecting a read.
+        if let Some(groups) = &self.groups {
+            if groups[org].receiver_count() > 0 {
+                let _ = groups[org].send(Arc::new(self.evaluate(org)));
+            }
+        }
         seq
     }
 }
@@ -111,10 +144,11 @@ impl Store {
 #[plexus::activation]
 pub mod tickets {
     use super::Store;
+    use futures::future::Either;
     use futures::{Stream, stream};
     use plexus::Caller;
     use std::sync::Arc;
-    use xxhash_rust::xxh3::xxh3_128;
+    use tokio::sync::broadcast::error::RecvError;
 
     pub struct Row {
         pub id: u32,
@@ -139,8 +173,40 @@ pub mod tickets {
         pub fn watch(&self, caller: &Caller) -> impl Stream<Item = Page> {
             let store = self.0.clone();
             let org = store.members[caller.principal()];
+            if let Some(groups) = &store.groups {
+                let rx = groups[org].subscribe();
+                let initial = store.evaluate(org);
+                return Either::Left(stream::unfold(
+                    (store, rx, Some(initial), None),
+                    move |(store, mut rx, first, mut last)| async move {
+                        let mut ready = first.map(Arc::new);
+                        loop {
+                            let current = match ready.take() {
+                                Some(snapshot) => snapshot,
+                                None => match rx.recv().await {
+                                    Ok(snapshot) => snapshot,
+                                    Err(RecvError::Closed) => return None,
+                                    Err(RecvError::Lagged(_)) => Arc::new(store.evaluate(org)),
+                                },
+                            };
+                            let sequence = current.page.sequence;
+                            if let Some((old_seq, old_digest)) = last {
+                                if sequence <= old_seq {
+                                    continue;
+                                }
+                                if current.digest == old_digest {
+                                    last = Some((sequence, old_digest));
+                                    continue;
+                                }
+                            }
+                            let state = (store, rx, None, Some((sequence, current.digest)));
+                            return Some((current.page.clone(), state));
+                        }
+                    },
+                ));
+            }
             let rx = store.revisions[org].subscribe();
-            stream::unfold(
+            Either::Right(stream::unfold(
                 (store, rx, None),
                 move |(store, mut rx, previous)| async move {
                     loop {
@@ -148,18 +214,13 @@ pub mod tickets {
                             rx.changed().await.ok()?;
                         }
                         rx.borrow_and_update();
-                        let page = store.read(org);
-                        let encoded = serde_json::to_vec(&page.rows).unwrap();
-                        store
-                            .encoded
-                            .fetch_add(encoded.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        let digest = xxh3_128(&encoded);
-                        if previous != Some(digest) {
-                            return Some((page, (store, rx, Some(digest))));
+                        let current = store.evaluate(org);
+                        if previous != Some(current.digest) {
+                            return Some((current.page, (store, rx, Some(current.digest))));
                         }
                     }
                 },
-            )
+            ))
         }
     }
 }

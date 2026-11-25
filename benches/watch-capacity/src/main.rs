@@ -348,7 +348,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     println!(
         "{}",
         json!({"users":users,"authenticated_wss":users,"initial_watches":users,"loopback_listeners":urls.len(),"largest_org_users":population.iter().max(),"server_counters":metrics,"organizations":orgs,
-        "tickets_per_org":rows,"total_tickets":orgs*rows,"scheduled_load_s":seconds,"load_and_drain_s":elapsed_s, "profile":profile, "offered_reads_per_s":users as f64*1000.0/interval_ms as f64,"offered_writes_per_s":rate,"scheduled_write_to_ack":stats(&write_latency),
+        "tickets_per_org":rows,"total_tickets":orgs*rows,"scheduled_load_s":seconds,"load_and_drain_s":elapsed_s, "profile":profile,"evaluation":std::env::var("WATCH_EVALUATION").unwrap_or_else(|_|"per-watch".into()), "offered_reads_per_s":users as f64*1000.0/interval_ms as f64,"offered_writes_per_s":rate,"scheduled_write_to_ack":stats(&write_latency),
         "writes":writes,"open_ms":open_ms,"expected_deliveries":expected,
         "read_scheduled_to_receive":stats(&read_latency.lock().unwrap()),
         "commit_to_receive":stats(&delivery.lock().unwrap()),
