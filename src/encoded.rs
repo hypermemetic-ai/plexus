@@ -12,6 +12,7 @@ use crate::{Failure, Raw};
 #[derive(Debug)]
 pub struct Encoded<T> {
     body: Raw,
+    digest: Option<u128>,
     marker: PhantomData<fn(T) -> T>,
 }
 
@@ -20,6 +21,7 @@ impl<T: serde::Serialize> Encoded<T> {
     pub fn new(value: &T) -> Result<Self, Failure> {
         Ok(Self {
             body: crate::raw(value)?.into_shared(),
+            digest: None,
             marker: PhantomData,
         })
     }
@@ -29,12 +31,26 @@ impl<T> Clone for Encoded<T> {
     fn clone(&self) -> Self {
         Self {
             body: self.body.clone(),
+            digest: self.digest,
             marker: PhantomData,
         }
     }
 }
 
 impl<T> Encoded<T> {
+    /// Use the digest of the authorized visible value for watch deduplication.
+    /// Supply the same digest only for semantically interchangeable results.
+    pub fn with_watch_digest(mut self, digest: u128) -> Self {
+        self.digest = Some(digest);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn into_watch_value(self) -> (Raw, u128) {
+        let digest = self.digest.unwrap_or_else(|| crate::watch_digest(&self.body));
+        (self.body, digest)
+    }
+
     /// Borrow the immutable JSON for inspection.
     pub fn as_raw(&self) -> &Raw {
         &self.body

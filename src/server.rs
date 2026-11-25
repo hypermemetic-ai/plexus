@@ -44,9 +44,13 @@ impl Paced for crate::Passed {
     }
 }
 
+type Subscribe = Arc<dyn Fn(Raw, CallContext) -> BoxFuture<'static, Result<crate::Invalidations, Failure>> + Send + Sync>;
+type Refresh = Arc<dyn Fn(Raw, CallContext) -> BoxFuture<'static, Result<(Raw, u128), Failure>> + Send + Sync>;
+
 #[derive(Clone)]
 enum Handler {
     One(One),
+    Watch(Subscribe, Refresh),
     Reflect(One),
     Many(Many),
     /// Paced by the credit granted to it: an activation's stream.
@@ -237,6 +241,16 @@ impl Server {
         A: Future<Output = Result<Raw, Failure>> + Send + 'static,
     {
         self.gated(name, at, keys, Handler::One(Arc::new(move |p, call| run(p, call).boxed())));
+    }
+
+    /// Register the generated watch next to its original unary read.
+    #[doc(hidden)]
+    pub fn watch_method(&mut self, unary: &str, companion: &str,
+        subscribe: impl Fn(Raw, CallContext) -> BoxFuture<'static, Result<crate::Invalidations, Failure>> + Send + Sync + 'static,
+        refresh: impl Fn(Raw, CallContext) -> BoxFuture<'static, Result<(Raw, u128), Failure>> + Send + Sync + 'static,
+    ) {
+        let gate = self.methods.get(unary).expect("register unary before watch").gate;
+        self.register(companion, Handler::Watch(Arc::new(subscribe), Arc::new(refresh)), gate);
     }
 
     /// A method with many answers. An `Err` ends the call with that failure.
@@ -619,6 +633,28 @@ async fn run(
                 }
                 Err(f) => Err(f),
             },
+            Handler::Watch(subscribe, refresh) => {
+                let caller = context.caller().cloned();
+                let mut changes = caught(subscribe(params.clone(), context)).await??;
+                let mut previous = None;
+                loop {
+                    take(&credit).await;
+                    loop {
+                        if previous.is_some() && caught(changes.next()).await?.is_none() {
+                            return Ok(());
+                        }
+                        // Repeat the route's ancestor guards and grant check on every
+                        // refresh. The generated reader also reopens its typed context.
+                        let (_, keys) = routes.find(&server, &open.method, &caller, false).await?;
+                        let (value, digest) = caught(refresh(params.clone(), CallContext::new(caller.clone(), keys))).await??;
+                        if previous != Some(digest) {
+                            previous = Some(digest);
+                            send(Kind::Item, value.get().as_bytes());
+                            break;
+                        }
+                    }
+                }
+            }
             Handler::Many(f) => {
                 let mut items = f(params, context);
                 let mut run = 0;

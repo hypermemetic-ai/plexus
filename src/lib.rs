@@ -89,6 +89,23 @@ pub use remote::Remote;
 pub use plexus_macros::{activation, Context};
 mod encoded;
 pub use encoded::Encoded;
+
+/// A stream of notifications that an authorized read may have changed.
+/// Register interest before returning. Notifications may coalesce; dropping
+/// this stream must release the subscription.
+pub type Invalidations = std::pin::Pin<Box<dyn futures::Stream<Item = ()> + Send + 'static>>;
+
+/// Supply the dependency notifications for generated watchable reads.
+/// Authenticate and scope subscriptions using the original call and params.
+pub trait WatchSource {
+    fn subscribe(&self, dependencies: &[&str], call: &CallContext, params: &Raw)
+        -> Result<Invalidations, Failure>;
+}
+
+#[doc(hidden)]
+pub fn watch_digest(value: &Raw) -> u128 {
+    xxhash_rust::xxh3::xxh3_128(value.get().as_bytes())
+}
 pub use plexus_proto::{Failure, Raw};
 pub use server::{Server, fail, raw};
 #[cfg(feature = "store")]

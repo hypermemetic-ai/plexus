@@ -300,7 +300,8 @@ impl<A: Send + 'static> Local<A> {
         self.submit(Ok(call), move |activation, call| async move { run(activation, call) })
     }
 
-    fn submit<P, F, Fut, T>(&self, args: Result<P, Failure>, run: F) -> BoxFuture<'static, Result<T, Failure>>
+    #[doc(hidden)]
+    pub fn submit<P, F, Fut, T>(&self, args: Result<P, Failure>, run: F) -> BoxFuture<'static, Result<T, Failure>>
     where
         P: Send + 'static,
         F: FnOnce(Rc<A>, P) -> Fut + Send + 'static,
