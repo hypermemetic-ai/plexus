@@ -295,20 +295,14 @@ pub mod tickets {
     }
 }
 
-pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -> Result<()> {
-    let keys = io::stdin().lock().lines().collect::<io::Result<Vec<_>>>()?;
-    ensure!(
-        orgs > 0 && orgs <= keys.len() && rows >= 50,
-        "invalid fixture dimensions"
-    );
-    let store = Arc::new(Store::new(&keys, orgs, rows)?);
-    let identity = Identity::generate()?;
+// Each native activation owns one execution thread. Replicas share the same
+// authority, database and live views. A connection stays on its tenant's lane.
+fn serving(store: Arc<Store>, observer: String, lanes: usize) -> Arc<plexus::Server> {
     let mut server = plexus::Server::new();
     plexus::serve(tickets::Tickets(store.clone()), &mut server);
     server.method_with_caller("bench.clock", |_, _| async {
         plexus::raw(&crate::clock_us())
     });
-    let observer = keys[0].clone();
     server.method_with_caller("bench.metrics", move |_, context| {
         let authorized = context.caller().is_some_and(|c| c.principal() == observer);
         let store = store.clone();
@@ -330,6 +324,7 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
                 }
             }
             plexus::raw(&serde_json::json!({
+                "activation_lanes": lanes,
                 "list_cache_hits": store.read_hits.load(Ordering::Relaxed),
                 "initial_cache_hits": store.initial_hits.load(Ordering::Relaxed),
                 "cached_views": cached_views,
@@ -340,26 +335,41 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
             }))
         }
     });
+    Arc::new(server)
+}
+
+pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -> Result<()> {
+    let keys = io::stdin().lock().lines().collect::<io::Result<Vec<_>>>()?;
+    ensure!(
+        orgs > 0 && orgs <= keys.len() && rows >= 50,
+        "invalid fixture dimensions"
+    );
+    let store = Arc::new(Store::new(&keys, orgs, rows)?);
+    let identity = Identity::generate()?;
+    let lanes: usize = std::env::var("WATCH_ACTIVATION_LANES")
+        .unwrap_or_else(|_| "1".into()).parse()?;
+    ensure!((1..=64).contains(&lanes), "expected 1..64 activation lanes");
+    let servers: Arc<Vec<_>> = Arc::new((0..lanes).map(|_| serving(store.clone(), keys[0].clone(), lanes)).collect());
     // Multiple loopback destination ports give a colocated driver enough TCP
     // four-tuples. Every listener feeds the same process, store and acceptor.
     let listener = Arc::new(Listen::new(&identity, keys.iter().map(String::as_str))?);
-    let server = Arc::new(server);
     let mut urls = Vec::new();
     let access = Arc::new(access);
     for _ in 0..keys.len().div_ceil(8000) {
         let socket = tokio::net::TcpListener::bind((access.bind, 0)).await?;
         urls.push(format!("wss://{}/", socket.local_addr()?));
-        let (server, listener) = (server.clone(), listener.clone());
+        let (servers, store, listener) = (servers.clone(), store.clone(), listener.clone());
         let access = access.clone();
         tokio::spawn(async move {
             while let Ok((tcp, peer)) = socket.accept().await {
                 if !access.sources.contains(&peer.ip()) {
                     continue;
                 }
-                let (server, listener) = (server.clone(), listener.clone());
+                let (servers, store, listener) = (servers.clone(), store.clone(), listener.clone());
                 tokio::spawn(async move {
                     if let Ok((channel, principal)) = listener.accept(tcp).await {
-                        let _ = server
+                        let org = store.members[&principal];
+                        let _ = servers[org % servers.len()]
                             .serve_as(channel, plexus::Caller::new(principal))
                             .await;
                     }
