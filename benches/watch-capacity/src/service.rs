@@ -9,7 +9,7 @@ use std::sync::{
 use anyhow::{Result, ensure};
 use plexus::tls::{Identity, Listen};
 use rusqlite::Connection;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 
 #[derive(Clone, Copy, Default)]
 struct Revision {
@@ -21,6 +21,31 @@ struct Revision {
 struct Evaluated {
     page: tickets::Page,
     digest: u128,
+    row_bytes: usize,
+}
+
+// The fixture has immutable membership and one fixed projection, sort and
+// limit. An org is therefore its complete visibility and query key.
+struct Group {
+    subscribers: Mutex<usize>,
+    current: watch::Sender<Option<Arc<Evaluated>>>,
+}
+
+struct SharedWatch {
+    store: Arc<Store>,
+    org: usize,
+    current: watch::Receiver<Option<Arc<Evaluated>>>,
+}
+
+impl Drop for SharedWatch {
+    fn drop(&mut self) {
+        let group = &self.store.groups.as_ref().unwrap()[self.org];
+        let mut count = group.subscribers.lock().unwrap();
+        *count -= 1;
+        if *count == 0 {
+            group.current.send_replace(None);
+        }
+    }
 }
 
 pub struct Store {
@@ -29,11 +54,29 @@ pub struct Store {
     queries: AtomicU64,
     encoded: AtomicU64,
     revisions: Vec<watch::Sender<Revision>>,
-    groups: Option<Vec<broadcast::Sender<Arc<Evaluated>>>>,
+    groups: Option<Vec<Group>>,
+    read_hits: AtomicU64,
+    initial_hits: AtomicU64,
 }
 
 impl Store {
     fn new(keys: &[String], orgs: usize, rows: usize) -> Result<Self> {
+        let hot = std::env::var("WATCH_PROFILE").as_deref() == Ok("hot");
+        let mode = std::env::var("WATCH_EVALUATION").unwrap_or_else(|_| "per-watch".into());
+        ensure!(
+            matches!(mode.as_str(), "per-watch" | "shared"),
+            "unknown evaluation mode"
+        );
+        Self::configured(keys, orgs, rows, hot, mode == "shared")
+    }
+
+    fn configured(
+        keys: &[String],
+        orgs: usize,
+        rows: usize,
+        hot: bool,
+        shared: bool,
+    ) -> Result<Self> {
         let mut db = Connection::open_in_memory()?;
         db.execute_batch(
             "CREATE TABLE ticket(org INTEGER, id INTEGER, title TEXT, status TEXT,
@@ -53,20 +96,22 @@ impl Store {
             }
         }
         tx.commit()?;
-        let hot = std::env::var("WATCH_PROFILE").as_deref() == Ok("hot");
         let members = keys
             .iter()
             .enumerate()
             .map(|(i, k)| (k.clone(), crate::user_org(i, orgs, hot)))
             .collect();
-        let mode = std::env::var("WATCH_EVALUATION").unwrap_or_else(|_| "per-watch".into());
-        ensure!(
-            matches!(mode.as_str(), "per-watch" | "shared"),
-            "unknown evaluation mode"
-        );
         Ok(Self {
-            groups: (mode == "shared")
-                .then(|| (0..orgs).map(|_| broadcast::channel(1).0).collect()),
+            groups: shared.then(|| {
+                (0..orgs)
+                    .map(|_| Group {
+                        subscribers: Mutex::new(0),
+                        current: watch::Sender::new(None),
+                    })
+                    .collect()
+            }),
+            read_hits: AtomicU64::new(0),
+            initial_hits: AtomicU64::new(0),
             db: Mutex::new(db),
             members,
             queries: AtomicU64::new(0),
@@ -77,7 +122,7 @@ impl Store {
         })
     }
 
-    fn read(&self, org: usize) -> tickets::Page {
+    fn query(&self, org: usize) -> tickets::Page {
         self.queries.fetch_add(1, Ordering::Relaxed);
         let db = self.db.lock().unwrap();
         let revision = *self.revisions[org].borrow();
@@ -104,19 +149,56 @@ impl Store {
     }
 
     fn evaluate(&self, org: usize) -> Evaluated {
-        let page = self.read(org);
+        let page = self.query(org);
         let encoded = serde_json::to_vec(&page.rows).unwrap();
         self.encoded
             .fetch_add(encoded.len() as u64, Ordering::Relaxed);
         Evaluated {
             page,
             digest: xxhash_rust::xxh3::xxh3_128(&encoded),
+            row_bytes: encoded.len(),
         }
     }
 
+    fn read(&self, org: usize) -> tickets::Page {
+        if let Some(groups) = &self.groups {
+            let group = &groups[org];
+            // Use the same publication boundary as writes and last-watch removal.
+            let snapshot = {
+                let _count = group.subscribers.lock().unwrap();
+                group.current.borrow().clone()
+            };
+            if let Some(snapshot) = snapshot {
+                self.read_hits.fetch_add(1, Ordering::Relaxed);
+                return snapshot.page.clone();
+            }
+        }
+        self.query(org)
+    }
+
+    fn subscribe(self: &Arc<Self>, org: usize) -> Option<SharedWatch> {
+        let group = &self.groups.as_ref()?[org];
+        let mut count = group.subscribers.lock().unwrap();
+        if *count == 0 {
+            group
+                .current
+                .send_replace(Some(Arc::new(self.evaluate(org))));
+        } else {
+            self.initial_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        *count += 1;
+        Some(SharedWatch {
+            store: self.clone(),
+            org,
+            current: group.current.subscribe(),
+        })
+    }
+
     fn write(&self, org: usize) -> u64 {
-        // Keep commit, revision update and read under the same lock. Signaling
-        // after sqlite's autocommit gives every observing reader a timestamp.
+        // Serialize commit + publication for this view. Readers never see
+        // revision metadata from a different transaction than their rows.
+        let group = self.groups.as_ref().map(|groups| &groups[org]);
+        let subscribers = group.map(|g| g.subscribers.lock().unwrap());
         let db = self.db.lock().unwrap();
         let source = &self.revisions[org];
         let seq = source.borrow().seq + 1;
@@ -130,11 +212,11 @@ impl Store {
             committed_us: crate::clock_us(),
         });
         drop(db);
-        // This fixture has one projection and one visibility policy per org.
-        // A production sharing key must include every factor affecting a read.
-        if let Some(groups) = &self.groups {
-            if groups[org].receiver_count() > 0 {
-                let _ = groups[org].send(Arc::new(self.evaluate(org)));
+        if let (Some(group), Some(count)) = (group, subscribers.as_deref()) {
+            if *count > 0 {
+                group
+                    .current
+                    .send_replace(Some(Arc::new(self.evaluate(org))));
             }
         }
         seq
@@ -148,7 +230,6 @@ pub mod tickets {
     use futures::{Stream, stream};
     use plexus::Caller;
     use std::sync::Arc;
-    use tokio::sync::broadcast::error::RecvError;
 
     pub struct Row {
         pub id: u32,
@@ -173,34 +254,23 @@ pub mod tickets {
         pub fn watch(&self, caller: &Caller) -> impl Stream<Item = Page> {
             let store = self.0.clone();
             let org = store.members[caller.principal()];
-            if let Some(groups) = &store.groups {
-                let rx = groups[org].subscribe();
-                let initial = store.evaluate(org);
+            if let Some(subscription) = store.subscribe(org) {
                 return Either::Left(stream::unfold(
-                    (store, rx, Some(initial), None),
-                    move |(store, mut rx, first, mut last)| async move {
-                        let mut ready = first.map(Arc::new);
+                    (subscription, None),
+                    |(mut subscription, mut last)| async move {
                         loop {
-                            let current = match ready.take() {
-                                Some(snapshot) => snapshot,
-                                None => match rx.recv().await {
-                                    Ok(snapshot) => snapshot,
-                                    Err(RecvError::Closed) => return None,
-                                    Err(RecvError::Lagged(_)) => Arc::new(store.evaluate(org)),
-                                },
-                            };
-                            let sequence = current.page.sequence;
+                            if last.is_some() {
+                                subscription.current.changed().await.ok()?;
+                            }
+                            let current = subscription.current.borrow_and_update().clone()?;
+                            let version = (current.page.sequence, current.digest);
                             if let Some((old_seq, old_digest)) = last {
-                                if sequence <= old_seq {
-                                    continue;
-                                }
-                                if current.digest == old_digest {
-                                    last = Some((sequence, old_digest));
+                                if version.0 <= old_seq || version.1 == old_digest {
+                                    last = Some(version);
                                     continue;
                                 }
                             }
-                            let state = (store, rx, None, Some((sequence, current.digest)));
-                            return Some((current.page.clone(), state));
+                            return Some((current.page.clone(), (subscription, Some(version))));
                         }
                     },
                 ));
@@ -243,7 +313,25 @@ pub async fn run(orgs: usize, rows: usize) -> Result<()> {
             if !authorized {
                 return Err(plexus::fail("denied", "benchmark observer required", ()));
             }
+            let mut cached_views = 0;
+            let mut cached_row_bytes = 0;
+            let mut shared_subscriptions = 0;
+            if let Some(groups) = &store.groups {
+                for group in groups {
+                    let count = group.subscribers.lock().unwrap();
+                    shared_subscriptions += *count;
+                    if let Some(snapshot) = group.current.borrow().as_ref() {
+                        cached_views += 1;
+                        cached_row_bytes += snapshot.row_bytes;
+                    }
+                }
+            }
             plexus::raw(&serde_json::json!({
+                "list_cache_hits": store.read_hits.load(Ordering::Relaxed),
+                "initial_cache_hits": store.initial_hits.load(Ordering::Relaxed),
+                "cached_views": cached_views,
+                "cached_row_json_bytes": cached_row_bytes,
+                "shared_subscriptions": shared_subscriptions,
                 "page_queries":store.queries.load(Ordering::Relaxed),
                 "watch_bytes_hashed":store.encoded.load(Ordering::Relaxed)
             }))
@@ -274,4 +362,115 @@ pub async fn run(orgs: usize, rows: usize) -> Result<()> {
     println!("{} {}", urls.join(","), identity.principal());
     io::stdout().flush()?;
     std::future::pending().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::{FutureExt, StreamExt};
+
+    fn store(shared: bool) -> Arc<Store> {
+        Arc::new(
+            Store::configured(&["a".into(), "b".into(), "c".into()], 2, 51, false, shared).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn shared_views_follow_membership_and_release_the_last_subscription() {
+        let store = store(true);
+        let tickets = tickets::Tickets(store.clone());
+        let a = plexus::Caller::new("a");
+        let b = plexus::Caller::new("b");
+        let c = plexus::Caller::new("c");
+        let mut first = Box::pin(tickets.watch(&a));
+        let mut other = Box::pin(tickets.watch(&b));
+        let mut same = Box::pin(tickets.watch(&c));
+        assert_eq!(first.next().await.unwrap().org, 0);
+        assert_eq!(same.next().await.unwrap().org, 0);
+        assert_eq!(other.next().await.unwrap().org, 1);
+        assert_eq!(tickets.list(&a).rows.len(), 50);
+        assert_eq!(store.queries.load(Ordering::Relaxed), 2);
+        assert_eq!(store.initial_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(store.read_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(tickets.advance(&c), 1);
+        assert_eq!(first.next().await.unwrap().sequence, 1);
+        assert!(other.next().now_or_never().is_none());
+        assert_eq!(tickets.advance(&a), 2);
+        let latest = same.next().await.unwrap();
+        assert_eq!(latest.sequence, 2);
+        assert_eq!(latest.rows[0].status, "Revision 2");
+        assert_eq!(tickets.list(&b).sequence, 0);
+        assert_eq!(store.queries.load(Ordering::Relaxed), 4);
+        drop(first);
+        drop(same);
+        let groups = store.groups.as_ref().unwrap();
+        assert!(groups[0].current.borrow().is_none());
+        assert!(groups[1].current.borrow().is_some());
+        tickets.advance(&a);
+        assert_eq!(store.queries.load(Ordering::Relaxed), 4);
+        assert_eq!(tickets.list(&a).sequence, 3);
+        assert_eq!(store.queries.load(Ordering::Relaxed), 5);
+        assert!(groups[0].current.borrow().is_none());
+    }
+
+    #[test]
+    fn concurrent_commits_publish_a_consistent_latest_snapshot() {
+        let store = store(true);
+        let subscription = store.subscribe(0).unwrap();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..12 {
+                        store.write(0);
+                    }
+                });
+            }
+        });
+        let current = subscription.current.borrow();
+        let snapshot = current.as_ref().unwrap();
+        assert_eq!(snapshot.page.sequence, 48);
+        assert_eq!(snapshot.page.rows[0].status, "Revision 48");
+        assert_eq!(store.queries.load(Ordering::Relaxed), 49);
+    }
+
+    #[tokio::test]
+    async fn same_rows_do_not_wake_consumers_with_a_duplicate_page() {
+        let store = store(true);
+        let tickets = tickets::Tickets(store.clone());
+        let a = plexus::Caller::new("a");
+        let mut subscription = Box::pin(tickets.watch(&a));
+        assert_eq!(subscription.next().await.unwrap().sequence, 0);
+        let group = &store.groups.as_ref().unwrap()[0];
+        {
+            let _count = group.subscribers.lock().unwrap();
+            let mut same = store.evaluate(0);
+            same.page.sequence = 1;
+            store.revisions[0].send_replace(Revision {
+                seq: 1,
+                committed_us: 0,
+            });
+            group.current.send_replace(Some(Arc::new(same)));
+        }
+        assert!(subscription.next().now_or_never().is_none());
+        assert_eq!(tickets.advance(&a), 2);
+        assert_eq!(subscription.next().await.unwrap().sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn reference_mode_queries_for_each_read_and_subscription() {
+        let store = store(false);
+        let tickets = tickets::Tickets(store.clone());
+        let a = plexus::Caller::new("a");
+        let c = plexus::Caller::new("c");
+        let mut first = Box::pin(tickets.watch(&a));
+        let mut second = Box::pin(tickets.watch(&c));
+        assert_eq!(first.next().await.unwrap().sequence, 0);
+        assert_eq!(second.next().await.unwrap().sequence, 0);
+        tickets.list(&a);
+        tickets.advance(&a);
+        assert_eq!(first.next().await.unwrap().sequence, 1);
+        assert_eq!(second.next().await.unwrap().sequence, 1);
+        assert_eq!(store.queries.load(Ordering::Relaxed), 5);
+        assert_eq!(store.read_hits.load(Ordering::Relaxed), 0);
+    }
 }
