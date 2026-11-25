@@ -312,6 +312,7 @@ pub async fn generator(
             Ok::<_, anyhow::Error>(())
         });
     }
+    ensure!(Instant::now() < start, "generator reader setup overran the scheduled start");
     let schedule = (0..writes)
         .map(|n| (n, target(n)))
         .filter(|(_, org)| writers.contains_key(org));

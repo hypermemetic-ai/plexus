@@ -150,7 +150,7 @@ def main():
                tcp=tcp_sample(sockets[0].port, sample_count))
         clock = min((clock_sample() for _ in range(5)), key=lambda m:m["uncertainty_us"])
         record("clock_before", **clock)
-        local_start_unix_us = time.time_ns()//1000 + max(2_000_000, clock["uncertainty_us"]*10)
+        local_start_unix_us = time.time_ns()//1000 + max(2_000_000 + 10 * args.users, clock["uncertainty_us"]*10)
         window = {"start_unix_us":local_start_unix_us, "duration_us":args.seconds*1_000_000}
         staged = window_path.with_suffix(".tmp")
         staged.write_text(json.dumps(window))

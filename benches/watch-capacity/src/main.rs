@@ -257,18 +257,8 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         .take(orgs)
         .map(|(_, s)| s.conn.clone())
         .collect();
-    let lead = Duration::from_millis(100);
-    let start = Instant::now() + lead;
     let length = Duration::from_secs(seconds);
-    if let Some(dir) = timing_dir.as_ref() {
-        let window = json!({
-            "start_unix_us": clock_us() + lead.as_micros() as u64,
-            "duration_us": seconds.checked_mul(1_000_000).context("duration overflow")?,
-        });
-        let pending = dir.path().join("window.tmp");
-        fs::write(&pending, serde_json::to_vec(&window)?)?;
-        fs::rename(pending, dir.path().join("window.json"))?;
-    }
+    let (reader_start, _) = tokio::sync::watch::channel(None::<Instant>);
     let rate: u64 = std::env::var("WATCH_WRITES_PER_SECOND")
         .unwrap_or_else(|_| "4".into())
         .parse()?;
@@ -300,7 +290,6 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
     // Keep consuming even after a watch's expected last change. Close it only
     // when the harness finishes, so all connections stay open throughout load.
     let (done, closed) = tokio::sync::watch::channel(false);
-    let cpu_load_start = sample()?;
     for (index, session) in sessions {
         drivers.push(session.driver);
         let mut updates = session.stream;
@@ -332,7 +321,10 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
             continue;
         }
         let measured = read_latency.clone();
+        let mut epoch = reader_start.subscribe();
         readers.spawn(async move {
+            let start = (*epoch.wait_for(Option::is_some).await?).expect("published start");
+            drop(epoch);
             let mut scheduled = start
                 + Duration::from_secs_f64(
                     interval_ms as f64 / 1000.0 * index as f64 / users as f64,
@@ -356,10 +348,28 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
             Ok::<_, anyhow::Error>(())
         });
     }
-    eprintln!("load: {users} watches; starting scheduled reads and writes");
     let expected: u64 = target_counts.iter().zip(&population)
         .map(|(writes, users)| writes * *users as u64)
         .sum();
+    // Release prepared readers before the epoch. A large group takes time to
+    // wake, arm its staggered timers and let the generator's writer run.
+    let lead = Duration::from_millis(100 + (users as u64 / 100).min(10_000));
+    let start = Instant::now() + lead;
+    if let Some(dir) = timing_dir.as_ref() {
+        let window = json!({
+            "start_unix_us": clock_us() + lead.as_micros() as u64,
+            "duration_us": seconds.checked_mul(1_000_000).context("duration overflow")?,
+        });
+        let pending = dir.path().join("window.tmp");
+        fs::write(&pending, serde_json::to_vec(&window)?)?;
+        fs::rename(pending, dir.path().join("window.json"))?;
+    }
+    reader_start.send_replace(Some(start));
+    let startup_headroom = start.checked_duration_since(Instant::now())
+        .context("reader release overran the epoch before load")?;
+    eprintln!("load: {users} watches; tasks prepared {} ms before start", startup_headroom.as_millis());
+    sleep_until(start).await;
+    let cpu_load_start = sample()?;
     let schedule = (0..writes).map(|index| (index, target_org(index)));
     let write_latency = distributed::scheduled_writes(start, rate, schedule, &target_counts, |org| {
         let response = writers[org].call("tickets.advance", ());
@@ -429,7 +439,7 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
         "{}",
         json!({"users":users,"authenticated_wss":users,"initial_watches":users,"loopback_listeners":urls.len(),"largest_org_users":population.iter().max(),"server_counters":metrics,"organizations":orgs,
         "tickets_per_org":rows,"total_tickets":orgs*rows,"workload":workload,"cpu_phases":cpu_phases,"scheduled_load_s":seconds,"load_and_drain_s":elapsed_s, "profile":profile,"evaluation":std::env::var("WATCH_EVALUATION").unwrap_or_else(|_|"per-watch".into()), "offered_reads_per_s":if workload == "updates" {0.0} else {users as f64*1000.0/interval_ms as f64},"offered_writes_per_s":if workload=="reads" {0} else {rate},"scheduled_write_to_ack":stats(&write_latency),
-        "writes":writes,"open_ms":open_ms,"open_concurrency":open_concurrency,"expected_deliveries":expected,
+        "writes":writes,"reader_release_headroom_us":startup_headroom.as_micros(),"open_ms":open_ms,"open_concurrency":open_concurrency,"expected_deliveries":expected,
         "read_scheduled_to_receive":stats(&read_latency.lock().unwrap()),
         "commit_to_receive":stats(&delivery.lock().unwrap()),
         "server":{"seeded":baseline,"idle_start":idle_start,"idle_end":idle_end,"load_end":load_end,"after_close":process(pid)?},
