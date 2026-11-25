@@ -9,6 +9,8 @@ import resource
 import signal
 import subprocess
 
+RUNGS = (1, 10, 100, 1_000, 10_000, 100_000, 250_000, 500_000, 750_000, 1_000_000)
+
 def memory_available():
     for line in Path("/proc/meminfo").read_text().splitlines():
         if line.startswith("MemAvailable:"):
@@ -19,7 +21,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--max-users", type=int, choices=[10**i for i in range(7)], default=1_000_000)
+    parser.add_argument("--max-users", type=int, choices=RUNGS, default=1_000_000)
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--tickets-per-org", type=int, default=2000)
     parser.add_argument("--profile", choices=["uniform","hot"], default="uniform")
@@ -43,8 +45,7 @@ def main():
                source_ports=port_range, fd_limit=fd_limit, load_average=os.getloadavg(),
                profile=args.profile, read_p99_ms=args.read_p99_ms, update_p99_ms=args.update_p99_ms)
         previous = None
-        for exponent in range(7):
-            users=10**exponent
+        for users in RUNGS:
             if users>args.max_users:
                 break
             orgs=min(users, max(2,(users+99)//100),10000)
@@ -77,7 +78,7 @@ def main():
             result=json.loads(stdout)
             record("rung",**result)
             for metric,limit in [("read_scheduled_to_receive",args.read_p99_ms),("commit_to_receive",args.update_p99_ms)]:
-                if result[metric]["p99_us"]>1000*limit:
+                if result[metric]["n"] and result[metric]["p99_us"]>1000*limit:
                     record("stop",users=users,reason=f"{metric} exceeded {limit} ms")
                     return 2
             previous=result

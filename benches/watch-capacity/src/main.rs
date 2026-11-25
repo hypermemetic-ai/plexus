@@ -420,8 +420,15 @@ async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()>
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let variable = if args.first().is_some_and(|mode| mode.starts_with("serve")) {
+        "WATCH_SERVER_THREADS"
+    } else {
+        "WATCH_GENERATOR_THREADS"
+    };
+    let threads: usize = std::env::var(variable).unwrap_or_else(|_| "4".into()).parse()?;
+    ensure!((1..=256).contains(&threads), "{variable} must be in 1..=256");
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(threads)
         .enable_all()
         .build()?;
     match args.as_slice() {
