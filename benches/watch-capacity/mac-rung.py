@@ -6,6 +6,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import resource
 import select
 import subprocess
@@ -25,11 +26,28 @@ def process_memory(pid):
     return {**fields, "units": "KiB", "fds": len(list(Path(f"/proc/{pid}/fd").iterdir()))}
 
 
+def tcp_sample(port, expected):
+    # A listener serves at most 8,000 users. TCP_INFO counts include TLS and WS
+    # but exclude TCP/IP headers and the outer tailnet tunnel.
+    command = ["ss", "-Htin", "state", "established", f"sport = :{port}"]
+    output = subprocess.run(command, capture_output=True, text=True, check=True).stdout
+    sockets = [line for line in output.splitlines() if line and not line[0].isspace()]
+    if len(sockets) != expected:
+        raise ValueError(f"sample listener has {len(sockets)} connections, expected {expected}")
+    counters = {}
+    for field in ("bytes_sent", "bytes_acked", "bytes_received", "bytes_retrans"):
+        counters[field] = sum(map(int, re.findall(rf"\b{field}:(\d+)", output)))
+    if not counters["bytes_acked"]:
+        raise ValueError("kernel did not report acknowledged TCP bytes")
+    return {"port": port, "sessions": len(sockets), **counters}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--bin-dir", type=Path, required=True)
     p.add_argument("--key-file", type=Path, required=True)
     p.add_argument("--mac", type=ipaddress.IPv4Address, required=True)
+    p.add_argument("--control-host", type=ipaddress.IPv4Address, help="local endpoint of an operator-provided control tunnel")
     p.add_argument("--control-port", type=int, default=47671)
     p.add_argument("--mac-pin", required=True)
     p.add_argument("--ryzen", type=ipaddress.IPv4Address, required=True)
@@ -45,12 +63,14 @@ def main():
         p.error("invalid workload dimensions")
     if resource.getrlimit(resource.RLIMIT_NOFILE)[0] < args.users + 256:
         p.error("insufficient local descriptor budget")
-    url = f"wss://{args.mac}:{args.control_port}/"
+    url = f"wss://{args.control_host or args.mac}:{args.control_port}/"
 
     def call(method, **params):
         raw = subprocess.run([str(args.bin_dir / "load-agent"), "call", str(args.key_file), url,
                               args.mac_pin, "worker." + method, json.dumps(params)],
-                             check=True, capture_output=True, text=True, timeout=45)
+                             capture_output=True, text=True, timeout=45)
+        if raw.returncode:
+            raise RuntimeError(f"worker.{method} failed: {raw.stderr.strip()}")
         return json.loads(raw.stdout)
 
     def wait_phase(phase, timeout):
@@ -112,13 +132,16 @@ def main():
         ready = wait_phase("ready", 120 + args.users/30)
         if ready["sessions"] != args.users:
             raise ValueError("worker did not hold every requested session")
-        record("connected", sessions=ready["sessions"], server=process_memory(fixture.pid))
+        sample_count = (args.users + len(sockets) - 1)//len(sockets)
+        record("connected", sessions=ready["sessions"], server=process_memory(fixture.pid),
+               tcp=tcp_sample(sockets[0].port, sample_count))
         clock = min((clock_sample() for _ in range(5)), key=lambda m:m["uncertainty_us"])
         record("clock_before", **clock)
         start = time.time_ns()//1000 + clock["offset_us"] + max(2_000_000, clock["uncertainty_us"]*10)
         call("start", run=run, **{"unix-us":start})
         end = wait_phase("result", args.seconds+180)
-        record("result", worker=json.loads(end["result"]), server=process_memory(fixture.pid))
+        record("result", worker=json.loads(end["result"]), server=process_memory(fixture.pid),
+               tcp=tcp_sample(sockets[0].port, sample_count))
         call("drop", run=run)
         wait_phase("closed", 60 + args.users/4000)
         record("closed", server=process_memory(fixture.pid))
