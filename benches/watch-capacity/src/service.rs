@@ -240,6 +240,30 @@ impl Store {
         })
     }
 
+    fn ticket_change(self: &Arc<Self>, caller: &plexus::Caller)
+        -> Result<impl futures::Stream<Item = ()> + Send + use<>, plexus::Failure>
+    {
+        use futures::{StreamExt, future::Either, stream};
+        let principal = caller.principal();
+        let org = *self.members.get(principal)
+            .ok_or_else(|| plexus::fail("denied", "ticket membership required", ()))?;
+        let observed = self.timing.as_ref()
+            .filter(|_| self.browser_principal.as_deref() != Some(principal))
+            .map(|meter| meter.watch(org));
+        let notifications = if let Some(watch) = self.subscribe(org) {
+            Either::Left(stream::unfold(watch, |mut watch| async move {
+                watch.current.changed().await.ok()?;
+                Some(((), watch))
+            }))
+        } else {
+            Either::Right(stream::unfold(self.revisions[org].subscribe(), |mut source| async move {
+                source.changed().await.ok()?;
+                Some(((), source))
+            }))
+        };
+        Ok(notifications.map(move |()| { let _ = &observed; }))
+    }
+
     fn write(&self, org: usize) -> u64 {
         // Serialize commit + publication for this view. Readers never see
         // revision metadata from a different transaction than their rows.
@@ -291,23 +315,25 @@ pub mod tickets {
         pub committed_us: u64,
         pub rows: Vec<Row>,
     }
-    pub struct Tickets(pub Arc<Store>);
+    pub struct Tickets {
+        pub(crate) store: Arc<Store>,
+    }
 
     impl Tickets {
-        #[watch(on = ["tickets"])]
+        #[watch(on = [store.ticket_change(caller)?])]
         pub fn list(&self, caller: &Caller, status: Option<String>) -> plexus::Encoded<Page> {
-            let org = self.0.members[caller.principal()];
-            self.0.read(org, status.as_deref())
+            let org = self.store.members[caller.principal()];
+            self.store.read(org, status.as_deref())
         }
-        #[watch(on = ["tickets"])]
+        #[watch(on = [store.ticket_change(caller)?])]
         pub fn get(&self, caller: &Caller, id: u32) -> Option<Row> {
-            self.0.row(self.0.members[caller.principal()], id)
+            self.store.row(self.store.members[caller.principal()], id)
         }
         pub fn advance(&self, caller: &Caller) -> u64 {
-            self.0.write(self.0.members[caller.principal()])
+            self.store.write(self.store.members[caller.principal()])
         }
         pub fn watch(&self, caller: &Caller) -> impl Stream<Item = plexus::Encoded<Page>> {
-            let store = self.0.clone();
+            let store = self.store.clone();
             let org = store.members[caller.principal()];
             let observed = store.timing.as_ref().map(|m| m.watch(org));
             let items = if let Some(subscription) = store.subscribe(org) {
@@ -356,43 +382,14 @@ pub mod tickets {
     }
 }
 
-impl plexus::WatchSource for tickets::Tickets {
-    fn subscribe(&self, dependencies: &[&str], call: &plexus::CallContext, _: &plexus::Raw)
-        -> Result<plexus::Invalidations, plexus::Failure>
-    {
-        use futures::{StreamExt, stream};
-        if dependencies != ["tickets"] {
-            return Err(plexus::fail("invalid_source", "unknown ticket change source", ()));
-        }
-        let principal = call.require_caller()?.principal();
-        let org = *self.0.members.get(principal)
-            .ok_or_else(|| plexus::fail("denied", "ticket membership required", ()))?;
-        let observed = self.0.timing.as_ref()
-            .filter(|_| self.0.browser_principal.as_deref() != Some(principal))
-            .map(|meter| meter.watch(org));
-        let notifications: plexus::Invalidations = if let Some(watch) = self.0.subscribe(org) {
-            Box::pin(stream::unfold(watch, |mut watch| async move {
-                watch.current.changed().await.ok()?;
-                Some(((), watch))
-            }))
-        } else {
-            Box::pin(stream::unfold(self.0.revisions[org].subscribe(), |mut source| async move {
-                source.changed().await.ok()?;
-                Some(((), source))
-            }))
-        };
-        Ok(Box::pin(notifications.map(move |()| { let _ = &observed; })))
-    }
-}
-
 // Tenant dispatch pins a connection to a replica. Concurrent dispatch serves
 // a single activation on a worker pool. Both share the same store and authority.
 fn serving(store: Arc<Store>, observer: String, lanes: std::num::NonZeroUsize, concurrent: bool) -> Arc<plexus::Server> {
     let mut server = plexus::Server::new();
     if concurrent {
-        plexus::serve_concurrent(tickets::Tickets(store.clone()), lanes, &mut server);
+        plexus::serve_concurrent(tickets::Tickets { store: store.clone() }, lanes, &mut server);
     } else {
-        plexus::serve(tickets::Tickets(store.clone()), &mut server);
+        plexus::serve(tickets::Tickets { store: store.clone() }, &mut server);
     }
     server.method_with_caller("bench.clock", |_, _| async {
         plexus::raw(&crate::clock_us())
@@ -621,7 +618,7 @@ mod tests {
     #[tokio::test]
     async fn shared_views_follow_membership_and_release_the_last_subscription() {
         let store = store(true);
-        let tickets = tickets::Tickets(store.clone());
+        let tickets = tickets::Tickets { store: store.clone() };
         let a = plexus::Caller::new("a");
         let b = plexus::Caller::new("b");
         let c = plexus::Caller::new("c");
@@ -679,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn same_rows_do_not_wake_consumers_with_a_duplicate_page() {
         let store = store(true);
-        let tickets = tickets::Tickets(store.clone());
+        let tickets = tickets::Tickets { store: store.clone() };
         let a = plexus::Caller::new("a");
         let mut subscription = Box::pin(tickets.watch(&a));
         assert_eq!(page(subscription.next().await.unwrap()).sequence, 0);
@@ -700,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn reference_mode_queries_for_each_read_and_subscription() {
         let store = store(false);
-        let tickets = tickets::Tickets(store.clone());
+        let tickets = tickets::Tickets { store: store.clone() };
         let a = plexus::Caller::new("a");
         let c = plexus::Caller::new("c");
         let mut first = Box::pin(tickets.watch(&a));

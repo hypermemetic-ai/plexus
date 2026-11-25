@@ -40,7 +40,7 @@ pub fn run(lanes: usize, seconds: u64) -> Result<()> {
             thread::Builder::new()
                 .name(format!("projection-{org}"))
                 .spawn(move || -> Result<()> {
-                    let activation = Tickets(store);
+                    let activation = Tickets { store };
                     let caller = Caller::new(principal);
                     let mut subscription = Box::pin(activation.watch(&caller));
                     let first =
