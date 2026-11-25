@@ -1,0 +1,374 @@
+mod service;
+
+use anyhow::{Context, Result, bail, ensure};
+use futures::{StreamExt, TryStreamExt, stream};
+use hdrhistogram::Histogram;
+use plexus::{
+    Connection, Items,
+    tls::{Dial, Identity},
+};
+use serde_json::{Value, json};
+use std::{
+    fs,
+    io::{BufRead, BufReader, Write},
+    process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::{
+    task::JoinSet,
+    time::{Instant, sleep, sleep_until, timeout},
+};
+
+// First give each organization a member. In the skew scenario one fifth of
+// subsequent users also belong to the target of four out of five writes.
+fn user_org(i: usize, orgs: usize, hot: bool) -> usize {
+    if hot && i >= orgs && i % 5 == 0 {
+        0
+    } else {
+        i % orgs
+    }
+}
+
+fn clock_us() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as u64
+}
+
+struct Fixture(Child);
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn fixture(keys: &[Identity], orgs: usize, rows: usize) -> Result<(Fixture, String, String)> {
+    let mut child = Fixture(
+        Command::new(std::env::current_exe()?)
+            .args(["serve", &orgs.to_string(), &rows.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?,
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    for key in keys {
+        writeln!(input, "{}", key.principal())?;
+    }
+    drop(input);
+    let mut line = String::new();
+    BufReader::new(child.0.stdout.take().unwrap()).read_line(&mut line)?;
+    let (url, pin) = line
+        .trim()
+        .split_once(' ')
+        .context("fixture exited before listening")?;
+    Ok((child, url.into(), pin.into()))
+}
+
+fn process(pid: u32) -> Result<Value> {
+    let dir = format!("/proc/{pid}");
+    let status = fs::read_to_string(format!("{dir}/status"))?;
+    let kib = |name: &str| -> Result<u64> {
+        Ok(status
+            .lines()
+            .find(|l| l.starts_with(name))
+            .context("missing /proc field")?
+            .split_whitespace()
+            .nth(1)
+            .context("missing value")?
+            .parse()?)
+    };
+    let stat = fs::read_to_string(format!("{dir}/stat"))?;
+    let fields: Vec<_> = stat
+        .rsplit_once(") ")
+        .context("stat")?
+        .1
+        .split_whitespace()
+        .collect();
+    Ok(
+        json!({"rss_kib":kib("VmRSS:")?, "peak_rss_kib":kib("VmHWM:")?,
+       "cpu_ticks":fields[11].parse::<u64>()?+fields[12].parse::<u64>()?,
+       "fds":fs::read_dir(format!("{dir}/fd"))?.count()}),
+    )
+}
+
+fn histogram() -> Histogram<u64> {
+    Histogram::new(3).unwrap()
+}
+fn stats(h: &Histogram<u64>) -> Value {
+    if h.is_empty() {
+        return json!({"n":0});
+    }
+    json!({"n":h.len(),"p50_us":h.value_at_quantile(0.50),"p95_us":h.value_at_quantile(0.95),
+        "p99_us":h.value_at_quantile(0.99),"max_us":h.max()})
+}
+
+struct Session {
+    conn: Connection,
+    driver: tokio::task::JoinHandle<std::io::Result<()>>,
+    stream: Items,
+    org: usize,
+}
+
+fn verify(raw: &str, org: usize) -> Result<(u64, u64)> {
+    let page: Value = serde_json::from_str(raw)?;
+    ensure!(page["org"].as_u64() == Some(org as u64), "cross-org page");
+    let rows = page["rows"].as_array().context("missing rows")?;
+    let seq = page["sequence"].as_u64().context("missing sequence")?;
+    let prefix = format!("Organization {org} ticket ");
+    ensure!(
+        rows.len() == 50
+            && rows.iter().enumerate().all(|(i, r)| {
+                r["id"].as_u64() == Some(i as u64)
+                    && r["title"].as_str().is_some_and(|s| s.starts_with(&prefix))
+            }),
+        "wrong page rows"
+    );
+    let expected = if seq == 0 {
+        "Ready".to_string()
+    } else {
+        format!("Revision {seq}")
+    };
+    ensure!(
+        rows[0]["status"].as_str() == Some(expected.as_str()),
+        "stale ticket status"
+    );
+    Ok((
+        seq,
+        page["committed-us"]
+            .as_u64()
+            .context("missing commit time")?,
+    ))
+}
+
+async fn open(key: Identity, url: &str, pin: &str, org: usize) -> Result<Session> {
+    let (channel, _) = Dial::new(&key, pin)?.connect(url).await?;
+    let (conn, drive) = Connection::new(channel, None);
+    let driver = tokio::spawn(drive);
+    let mut stream = conn.stream("tickets.watch", ())?;
+    let first = stream.next().await.context("watch closed during open")??;
+    ensure!(verify(first.get(), org)?.0 == 0, "unexpected initial state");
+    Ok(Session {
+        conn,
+        driver,
+        stream,
+        org,
+    })
+}
+
+async fn run(users: usize, orgs: usize, seconds: u64, rows: usize) -> Result<()> {
+    ensure!(
+        users > 0 && (1..=users).contains(&orgs) && rows >= 50 && seconds > 0,
+        "invalid rung"
+    );
+    let profile = std::env::var("WATCH_PROFILE").unwrap_or_else(|_| "uniform".into());
+    let hot = profile == "hot";
+    let mut population = vec![0; orgs];
+    for i in 0..users {
+        population[user_org(i, orgs, hot)] += 1;
+    }
+    let keys = (0..users)
+        .map(|_| Identity::generate())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let (server, urls, pin) = fixture(&keys, orgs, rows)?;
+    let urls: Vec<_> = urls.split(',').collect();
+    let pid = server.0.id();
+    let baseline = process(pid)?;
+    let open_start = Instant::now();
+    let mut sessions: Vec<_> = stream::iter(keys.into_iter().enumerate())
+        .map(|(i, key)| {
+            let (url, pin) = (urls[i % urls.len()], &pin);
+            async move {
+                let session = timeout(
+                    Duration::from_secs(20),
+                    open(key, url, pin, user_org(i, orgs, hot)),
+                )
+                .await??;
+                Ok::<_, anyhow::Error>((i, session))
+            }
+        })
+        .buffer_unordered(32)
+        .try_collect()
+        .await?;
+    sessions.sort_by_key(|s| s.0);
+    let open_ms = open_start.elapsed().as_millis();
+    let idle_start = process(pid)?;
+    sleep(Duration::from_secs(2)).await;
+    let idle_end = process(pid)?;
+    let delivery = Arc::new(Mutex::new(histogram()));
+    let read_latency = Arc::new(Mutex::new(histogram()));
+    let mut consumers = JoinSet::new();
+    let mut readers = JoinSet::new();
+    let mut drivers = Vec::new();
+    let held: Vec<_> = sessions.iter().map(|(_, s)| s.conn.clone()).collect();
+    let writers: Vec<_> = sessions
+        .iter()
+        .take(orgs)
+        .map(|(_, s)| s.conn.clone())
+        .collect();
+    let start = Instant::now() + Duration::from_millis(100);
+    let length = Duration::from_secs(seconds);
+    let rate: u64 = std::env::var("WATCH_WRITES_PER_SECOND")
+        .unwrap_or_else(|_| "4".into())
+        .parse()?;
+    let interval_ms: u64 = std::env::var("WATCH_READ_INTERVAL_MS")
+        .unwrap_or_else(|_| "10000".into())
+        .parse()?;
+    ensure!(
+        rate > 0 && interval_ms > 0 && matches!(profile.as_str(), "uniform" | "hot"),
+        "invalid workload"
+    );
+    let writes = usize::try_from(seconds.checked_mul(rate).context("duration overflow")?)?;
+    let target_org = |w: usize| {
+        if profile == "hot" && w % 5 != 4 {
+            0
+        } else if profile == "hot" {
+            (w / 5) % orgs
+        } else {
+            w % orgs
+        }
+    };
+    let mut target_counts = vec![0; orgs];
+    for w in 0..writes {
+        target_counts[target_org(w)] += 1;
+    }
+    // Keep consuming even after a watch's expected last change. Close it only
+    // when the harness finishes, so all connections stay open throughout load.
+    let (done, closed) = tokio::sync::watch::channel(false);
+    for (index, session) in sessions {
+        drivers.push(session.driver);
+        let mut updates = session.stream;
+        let org = session.org;
+        let delivered = delivery.clone();
+        let mut stop = closed.clone();
+        let expected_for_watch = target_counts[org];
+        consumers.spawn(async move {
+            let mut previous=0;
+            loop {
+                tokio::select! {
+                    biased;
+                    item=updates.next()=> {
+                        let item=item.context("watch closed during load")??;
+                        let arrived=clock_us();
+                        let (seq,stamp)=verify(item.get(),org)?;
+                        ensure!(seq==previous+1,"missing or duplicate update for {index}: {previous} -> {seq}");
+                        previous=seq;
+                        delivered.lock().unwrap().record(arrived.checked_sub(stamp).context("system clock stepped")?)?;
+                    },
+                    _=stop.changed()=>break,
+                }
+            }
+            let expected = expected_for_watch;
+            ensure!(previous==expected as u64,"watch {index} got {previous}, expected {expected}");
+            Ok::<_,anyhow::Error>(())
+        });
+        let measured = read_latency.clone();
+        readers.spawn(async move {
+            let mut scheduled = start
+                + Duration::from_secs_f64(
+                    interval_ms as f64 / 1000.0 * index as f64 / users as f64,
+                );
+            while scheduled < start + length {
+                sleep_until(scheduled).await;
+                let result = timeout(
+                    Duration::from_secs(10),
+                    session.conn.call("tickets.list", ()),
+                )
+                .await??;
+                let elapsed = scheduled.elapsed();
+                verify(result.get(), org)?;
+                measured
+                    .lock()
+                    .unwrap()
+                    .record(elapsed.as_micros() as u64)?;
+                scheduled += Duration::from_millis(interval_ms);
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+    }
+    let mut expected = 0;
+    let mut written = vec![0; orgs];
+    let mut write_latency = histogram();
+    for w in 0..writes {
+        let due = start + Duration::from_secs_f64(w as f64 / rate as f64);
+        sleep_until(due).await;
+        let org = target_org(w);
+        written[org] += 1;
+        let reply = timeout(
+            Duration::from_secs(10),
+            writers[org].call("tickets.advance", ()),
+        )
+        .await??;
+        ensure!(
+            reply.get().parse::<usize>()? == written[org],
+            "write failed"
+        );
+        write_latency.record(due.elapsed().as_micros() as u64)?;
+        expected += population[org];
+    }
+    sleep_until(start + length).await;
+    while let Some(result) = readers.join_next().await {
+        result??;
+    }
+    let grace = Instant::now() + Duration::from_secs(5);
+    while delivery.lock().unwrap().len() < expected as u64 && Instant::now() < grace {
+        sleep(Duration::from_millis(10)).await;
+    }
+    let elapsed_s = start.elapsed().as_secs_f64();
+    let load_end = process(pid)?;
+    let client_load_end = process(std::process::id())?;
+    let baseline_fds = baseline["fds"].as_u64().context("baseline fd count")?;
+    ensure!(
+        load_end["fds"].as_u64().context("load fd count")? >= baseline_fds + users as u64,
+        "sockets closed during load"
+    );
+    let metrics: Value = serde_json::from_str(held[0].call("bench.metrics", ()).await?.get())?;
+    done.send_replace(true);
+    while let Some(result) = consumers.join_next().await {
+        result??;
+    }
+    ensure!(
+        delivery.lock().unwrap().len() == expected as u64,
+        "incomplete fan-out"
+    );
+    drop(held);
+    drop(writers);
+    for task in drivers {
+        task.abort();
+        let _ = task.await;
+    }
+    sleep(Duration::from_secs(2)).await;
+    println!(
+        "{}",
+        json!({"users":users,"authenticated_wss":users,"initial_watches":users,"loopback_listeners":urls.len(),"largest_org_users":population.iter().max(),"server_counters":metrics,"organizations":orgs,
+        "tickets_per_org":rows,"total_tickets":orgs*rows,"scheduled_load_s":seconds,"load_and_drain_s":elapsed_s, "profile":profile, "offered_reads_per_s":users as f64*1000.0/interval_ms as f64,"offered_writes_per_s":rate,"scheduled_write_to_ack":stats(&write_latency),
+        "writes":writes,"open_ms":open_ms,"expected_deliveries":expected,
+        "read_scheduled_to_receive":stats(&read_latency.lock().unwrap()),
+        "commit_to_receive":stats(&delivery.lock().unwrap()),
+        "server":{"seeded":baseline,"idle_start":idle_start,"idle_end":idle_end,"load_end":load_end,"after_close":process(pid)?},
+        "generator_load_end":client_load_end})
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+    match args.as_slice() {
+        [mode, orgs, rows] if mode == "serve" => {
+            runtime.block_on(service::run(orgs.parse()?, rows.parse()?))
+        }
+        [users, orgs, seconds, rows] => runtime.block_on(run(
+            users.parse()?,
+            orgs.parse()?,
+            seconds.parse()?,
+            rows.parse()?,
+        )),
+        _ => bail!("usage: watch-capacity USERS ORGANIZATIONS LOAD_SECONDS TICKETS_PER_ORG"),
+    }
+}

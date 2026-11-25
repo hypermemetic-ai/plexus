@@ -1,0 +1,19 @@
+# LWATCH single-server capacity ladder
+
+Run from this directory on Linux with the Layers sibling repositories checked out. Build a release binary. Each rung launches a separate server process on ephemeral loopback WSS listeners. The load generator creates one random signing key and one mutually authenticated connection per user. No existing database, hostname or credential is used.
+
+```sh
+cargo build --release --locked
+python3 ladder.py --bin target/release/watch-capacity --out uniform.jsonl
+python3 ladder.py --bin target/release/watch-capacity --out hot.jsonl --profile hot
+```
+
+The default ladder tries 1, 10, 100, 1k, 10k, 100k, and 1M. Use `--max-users 100 --seconds 10` for a quick run. The target is 1M users, 10k organizations and 2,000 real SQLite rows per organization (20M at the largest rung). Lower rungs use fewer organizations. A steady-state result includes simultaneous open subscriptions, scheduled reads and writes. Each user holds one live 50-row board, issues one read every ten seconds, and sees only their organization's tickets. The writer commits four changes per second. Override these rates with `WATCH_READ_INTERVAL_MS` and `WATCH_WRITES_PER_SECOND`. The hot profile places extra readers in the first organization and sends four out of five writes there.
+
+The fixture runs an explicit native watch method. It filters invalidations by organization, reruns the SQLite read, and retains a 128-bit digest per watch to suppress equal results. Test data and queries are deterministic. The database is in memory, the first page is warm, and every write updates a projected row. Real application grants, revocation, unchanged-result traffic, the generated watchable-read contract, browser rendering and reconnect storms need separate runs. No benchmark result here proves those scenarios.
+
+Each rung opens connections, receives and validates every first page, holds them idle for two seconds, runs the scheduled load, drains outstanding work and samples again two seconds after teardown. A fresh fixture per rung accommodates changing membership and corpus size. This measures the post-close floor within a rung; a long-lived process soak is separate. Read and write latencies include generator scheduling delay. Update latency runs from database commit to receipt of the decoded native item, using the shared host clock. An omitted, duplicate, stale or cross-organization result fails the rung. The load scenario expects every update to arrive, including on a hot organization. A replay/reset-aware slow-reader profile belongs with the production contract.
+
+JSONL records the workload, effective population, real sockets, watches, read/write/delivery latency samples, expected deliveries, query and byte counts, server memory, CPU ticks and file descriptors by phase, and separate generator resources. The provisional stop margins are p99 read ≤100 ms and p99 update ≤250 ms, adjustable on the command line. Exit 2 records a resource or latency stop. Exit 1 records a failed rung. A partial run establishes its completed rungs only.
+
+Loopback listeners share one server and TLS acceptor; each destination serves at most 8,000 test connections to avoid exhausting the generator's ephemeral ports. The driver checks its per-process descriptor limit and projects the combined server and generator peak RSS before each larger rung, retaining host headroom. Kernel networking buffers cost additional memory. The reference server has 12 cores/24 threads and about 31 GiB of RAM. External generators are needed to isolate its ultimate capacity.
