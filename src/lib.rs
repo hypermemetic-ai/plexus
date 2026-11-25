@@ -95,6 +95,24 @@ pub use encoded::Encoded;
 /// this stream must release the subscription.
 pub type Invalidations = std::pin::Pin<Box<dyn futures::Stream<Item = ()> + Send + 'static>>;
 
+/// Poll the owned subscriptions together. Simultaneously ready dependencies
+/// invalidate one read. Closing a source ends the watch and releases its peers.
+#[doc(hidden)]
+pub fn merge_invalidations(mut sources: Vec<Invalidations>) -> Invalidations {
+    use std::task::Poll;
+    Box::pin(futures::stream::poll_fn(move |cx| {
+        let mut changed = false;
+        for source in &mut sources {
+            match source.as_mut().poll_next(cx) {
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(())) => changed = true,
+                Poll::Pending => {}
+            }
+        }
+        if changed { Poll::Ready(Some(())) } else { Poll::Pending }
+    }))
+}
+
 /// Supply the dependency notifications for generated watchable reads.
 /// Authenticate and scope subscriptions using the original call and params.
 pub trait WatchSource {
