@@ -213,3 +213,33 @@ async fn a_close_is_answered_with_its_code() {
     assert!(channel.receive.next().await.is_none());
     assert_eq!(tokio::task::spawn_blocking(move || told.recv().unwrap()).await.unwrap(), 3000);
 }
+
+/// A partial frame survives a pending read. A blocked large write resumes at
+/// the right offset, and the next batch can use a fresh output buffer.
+#[tokio::test]
+async fn partial_frames_survive_backpressure_between_batches() {
+    use futures::{FutureExt, SinkExt, StreamExt};
+    use plexus::bytes::Bytes;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (socket, mut peer) = tokio::io::duplex(128);
+    let mut channel = plexus::ws::handshaken(socket, true);
+    let data = vec![b'x'; 5000];
+    let mut frame = vec![0x81, 0x80 | 126, 0x13, 0x88, 1, 2, 3, 4];
+    frame.extend(data.iter().enumerate().map(|(i, byte)| byte ^ [1, 2, 3, 4][i % 4]));
+    peer.write_all(&frame[..113]).await.unwrap();
+    assert!(channel.receive.next().now_or_never().is_none());
+    let (received, written) = tokio::join!(channel.receive.next(), peer.write_all(&frame[113..]));
+    written.unwrap();
+    assert_eq!(received.unwrap().unwrap(), data.as_slice());
+
+    for payload in [Bytes::from(data), Bytes::from_static(b"ok")] {
+        let header = if payload.len() > 125 { vec![0x81, 126, 0x13, 0x88] } else { vec![0x81, 2] };
+        let mut wire = vec![0; header.len() + payload.len()];
+        let (sent, read) = tokio::join!(channel.send.send(payload.clone()), peer.read_exact(&mut wire));
+        sent.unwrap();
+        read.unwrap();
+        assert_eq!(&wire[..header.len()], &header);
+        assert_eq!(&wire[header.len()..], &payload[..]);
+    }
+}

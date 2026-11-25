@@ -56,6 +56,8 @@ pub(crate) struct Out(Arc<Mutex<Queue>>);
 #[derive(Default)]
 struct Queue {
     buf: Vec<u8>,
+    /// Size hint for the next push. An idle queue holds no batch allocation.
+    next_capacity: usize,
     /// Where each frame in `buf` ends.
     ends: Vec<usize>,
     senders: usize,
@@ -96,6 +98,8 @@ impl Out {
         if queue.closed {
             return false;
         }
+        let capacity = std::mem::take(&mut queue.next_capacity);
+        queue.buf.reserve(capacity);
         let Queue { buf, ends, .. } = &mut *queue;
         frames(&mut Frames { buf, ends });
         let pump = queue.pump.take();
@@ -145,10 +149,8 @@ impl Taken {
         }
         ends.clear();
         std::mem::swap(ends, &mut queue.ends);
-        // The next batch's buffer is made as large as this one was, up to a
-        // bound, so it is not grown frame by frame.
-        let room = queue.buf.len().min(1 << 16);
-        Poll::Ready(Some(std::mem::replace(&mut queue.buf, Vec::with_capacity(room))))
+        queue.next_capacity = queue.buf.len().min(1 << 16);
+        Poll::Ready(Some(std::mem::take(&mut queue.buf)))
     }
 }
 

@@ -222,7 +222,11 @@ impl<S: AsyncWrite + Unpin> Write for Io<S> {
                 Poll::Pending => return Err(io::ErrorKind::WouldBlock.into()),
             }
         }
-        self.out.clear();
+        if self.out.capacity() > IDLE_BUFFER {
+            self.out = Vec::new();
+        } else {
+            self.out.clear();
+        }
         self.sent = 0;
         self.poll(|stream, cx| stream.poll_flush(cx))
     }
@@ -240,6 +244,8 @@ const MOST_FRAME: usize = 16 << 20;
 const MOST_MESSAGE: usize = 64 << 20;
 /// How much a read asks the socket for.
 const READ: usize = 64 << 10;
+/// Maximum retained socket scratch space in each direction between batches.
+const IDLE_BUFFER: usize = 1024;
 /// How many messages, and how many bytes of them, a reader takes in one
 /// turn at most: the socket is not read further ahead than that of what
 /// has been handed on.
@@ -391,12 +397,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Reader<S> {
     /// Read more from the socket: `false` if it has nothing now.
     fn fill(&mut self, socket: &mut Socket<S>) -> io::Result<bool> {
         if self.buf.capacity() - self.buf.len() < READ / 16 {
-            self.buf.reserve(READ);
+            // Read the first frame into a small buffer. Bursts and partial frames
+            // use the larger reads, and frame() reserves for a known payload.
+            let room = if self.buf.is_empty() && self.read.is_empty() { IDLE_BUFFER } else { READ };
+            self.buf.reserve(room);
         }
         let io = socket.io();
         let waker = waker_ref(&io.wakers);
         match tokio_util::io::poll_read_buf(Pin::new(&mut io.stream), &mut Context::from_waker(&waker), &mut self.buf) {
-            Poll::Pending => Ok(false),
+            Poll::Pending => {
+                if self.buf.is_empty() && self.buf.capacity() > IDLE_BUFFER {
+                    self.buf = BytesMut::new();
+                }
+                Ok(false)
+            }
             Poll::Ready(Ok(0)) if socket.closed => {
                 self.ended = true;
                 Ok(false)

@@ -275,6 +275,11 @@ impl Listen {
     /// A channel over a connection just accepted, and the principal the
     /// caller proved, which is one this end accepts.
     pub async fn accept(&self, tcp: TcpStream) -> io::Result<(Channel, String)> {
+        // Serving tasks outlive the handshake. Keep its temporary state off their frames.
+        Box::pin(self.upgrade(tcp)).await
+    }
+
+    async fn upgrade(&self, tcp: TcpStream) -> io::Result<(Channel, String)> {
         tcp.set_nodelay(true)?;
         #[cfg(feature = "trace")]
         let (tcp, clock) = crate::trace::Socket::new(tcp);
