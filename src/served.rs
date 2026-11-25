@@ -20,6 +20,7 @@ use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use futures::channel::{mpsc, oneshot};
@@ -176,12 +177,40 @@ pub fn fail_stream(asks: Asks, failure: Failure) {
 /// An activation on a thread of its own. Clones send to the same one; the
 /// thread ends when every clone is gone.
 pub struct Local<A> {
-    jobs: mpsc::UnboundedSender<Job<A>>,
+    jobs: Jobs<A>,
+}
+
+enum Jobs<A> {
+    One(mpsc::UnboundedSender<Job<A>>),
+    Shared(Arc<Workers<A>>),
+}
+
+struct Workers<A> {
+    next: AtomicUsize,
+    senders: Vec<mpsc::UnboundedSender<Job<A>>>,
+}
+
+impl<A> Jobs<A> {
+    fn send(&self, job: Job<A>) -> Result<(), mpsc::TrySendError<Job<A>>> {
+        let sender = match self {
+            Self::One(sender) => sender,
+            Self::Shared(workers) => {
+                let index = workers.next.fetch_add(1, Ordering::Relaxed) % workers.senders.len();
+                &workers.senders[index]
+            }
+        };
+        sender.unbounded_send(job)
+    }
 }
 
 impl<A> Clone for Local<A> {
     fn clone(&self) -> Self {
-        Local { jobs: self.jobs.clone() }
+        Local {
+            jobs: match &self.jobs {
+                Jobs::One(sender) => Jobs::One(sender.clone()),
+                Jobs::Shared(workers) => Jobs::Shared(workers.clone()),
+            },
+        }
     }
 }
 
@@ -217,6 +246,22 @@ impl<A: Send + 'static> Later<A> {
     }
 }
 
+impl<A: Send + Sync + 'static> Local<Arc<A>> {
+    /// Every method sees the same activation. Only the jobs and their
+    /// thread-local futures are distributed over the executors.
+    pub(crate) fn shared(activation: &Arc<A>, count: std::num::NonZeroUsize) -> Self {
+        if count.get() == 1 {
+            return Self::start(activation.clone());
+        }
+        let senders = (0..count.get()).map(|_| {
+            let (sender, taken) = mpsc::unbounded();
+            Later { taken }.start(activation.clone());
+            sender
+        }).collect();
+        Self { jobs: Jobs::Shared(Arc::new(Workers { next: AtomicUsize::new(0), senders })) }
+    }
+}
+
 impl<A: Send + 'static> Local<A> {
     /// Move `activation` to a thread of its own ([`Later::start`]).
     pub fn start(activation: A) -> Local<A> {
@@ -230,7 +275,7 @@ impl<A: Send + 'static> Local<A> {
     /// children are found on it before it moves.
     pub fn later() -> (Local<A>, Later<A>) {
         let (jobs, taken) = mpsc::unbounded::<Job<A>>();
-        (Local { jobs }, Later { taken })
+        (Local { jobs: Jobs::One(jobs) }, Later { taken })
     }
 
     /// One answer: `run` is called on the activation's thread with what
@@ -286,7 +331,7 @@ impl<A: Send + 'static> Local<A> {
         });
         stamp!(within job);
         stamp!(crate::trace::current(), JobBoxed);
-        let sent = self.jobs.unbounded_send(job);
+        let sent = self.jobs.send(job);
         stamp!(crate::trace::current(), JobSent);
         async move {
             sent.map_err(|_| stopped())?;
@@ -316,7 +361,7 @@ impl<A: Send + 'static> Local<A> {
             caught(run(a.clone(), args, asks)).map(move |r| ending.end(r.err())).boxed_local()
         });
         stamp!(within job);
-        if self.jobs.unbounded_send(job).is_err() {
+        if self.jobs.send(job).is_err() {
             return Served::failed(stopped());
         }
         Served { hop, taken: VecDeque::new() }

@@ -23,6 +23,16 @@ pub fn namespace<A: Serve>(name: impl Into<String>, activation: A) -> Registrati
     }
 }
 
+/// Register an activation under its declared name with the same shared
+/// executors as [`crate::serve_concurrent`]. Suitable for `main([…])` or
+/// inserting/replacing an activation in a running [`Activations`] registry.
+pub fn concurrent<A: Serve + Sync>(activation: A, workers: std::num::NonZeroUsize) -> Registration {
+    Registration {
+        name: A::NAME.to_owned(),
+        install: Box::new(move |server, at| crate::serve_concurrent_at(activation, workers, server, at)),
+    }
+}
+
 impl<A: Serve> From<A> for Registration {
     fn from(activation: A) -> Self {
         namespace(A::NAME, activation)

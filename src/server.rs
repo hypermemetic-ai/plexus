@@ -187,6 +187,18 @@ impl Server {
         self.interface = Some(interface.to_owned());
     }
 
+    /// A concurrent registration uses the same root hash as its generated
+    /// serving function. The held activation has already registered its IR.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn hello_described(&mut self, at: &str) {
+        if let Some(hash) = self.places.iter().rev().find_map(|entry| match entry {
+            Entry::Described(place) if place.place == at => place.hash.as_ref(),
+            _ => None,
+        }) {
+            self.interface = Some(hash.clone());
+        }
+    }
+
     /// Declare that a registered method requires a caller input stream.
     #[doc(hidden)]
     pub fn accepts_input(&mut self, name: &str) {

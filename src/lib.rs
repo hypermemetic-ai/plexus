@@ -53,7 +53,7 @@ pub use application::{Application, MainInput, main};
 #[cfg(not(target_arch = "wasm32"))]
 mod registry;
 #[cfg(not(target_arch = "wasm32"))]
-pub use registry::{Activations, Registration, namespace};
+pub use registry::{Activations, Registration, concurrent, namespace};
 mod channel;
 mod input;
 pub use input::{Input, RawInput};
@@ -138,6 +138,25 @@ pub trait Serve: Send + Sized + 'static {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn serve<A: Serve>(activation: A, server: &mut Server) {
     activation.serve(server, A::NAME);
+}
+
+/// Serve one shared native activation on a bounded number of executor threads.
+/// Jobs are assigned round-robin. Each method future or stream runs to
+/// completion or cancellation on one worker. The activation and its children,
+/// including their authorization state, are shared across all workers.
+/// Separate calls may execute concurrently, including calls from one caller.
+/// Choose this when the activation supports concurrent access to its state.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn serve_concurrent<A: Serve + Sync>(activation: A, workers: std::num::NonZeroUsize, server: &mut Server) {
+    serve_concurrent_at(activation, workers, server, A::NAME);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn serve_concurrent_at<A: Serve + Sync>(activation: A, workers: std::num::NonZeroUsize, server: &mut Server, at: &str) {
+    let activation = std::sync::Arc::new(activation);
+    let local = served::Local::shared(&activation, workers);
+    activation.held(&local, std::sync::Arc::as_ref, server, at);
+    server.hello_described(at);
 }
 
 /// Serve an activation with the standard listeners and application-specific
