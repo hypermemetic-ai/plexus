@@ -406,6 +406,24 @@ pub async fn run(orgs: usize, rows: usize, access: super::distributed::Access) -
         "invalid fixture dimensions"
     );
     let store = Arc::new(Store::new(&keys, orgs, rows)?);
+    // The Linux controller can recover counters if the remote observer exits.
+    // The destination is inside its private run directory.
+    #[cfg(target_os = "linux")]
+    if let Some(output) = std::env::var_os("WATCH_TIMING_DIAGNOSTIC_FILE") {
+        let meter = store.timing.clone().ok_or_else(|| anyhow::anyhow!("timing is required for a diagnostic snapshot"))?;
+        let path = std::path::PathBuf::from(output);
+        let mut signal = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+        tokio::spawn(async move {
+            if signal.recv().await.is_some() {
+                let staged = path.with_extension("tmp");
+                let result = std::fs::write(&staged, meter.snapshot().to_string())
+                    .and_then(|()| std::fs::rename(staged, path));
+                if let Err(error) = result {
+                    eprintln!("fixture timing snapshot: {error}");
+                }
+            }
+        });
+    }
     let identity = Identity::generate()?;
     let lanes: usize = std::env::var("WATCH_ACTIVATION_LANES")
         .unwrap_or_else(|_| "1".into()).parse()?;

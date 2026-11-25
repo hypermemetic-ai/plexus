@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import resource
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -106,6 +107,7 @@ def main():
            profile=args.profile, read_interval_ms=args.read_interval_ms, server_budgets=budgets(args), offered_reads_s=args.users*1000/args.read_interval_ms, offered_writes_s=args.writes_per_second)
     with contextlib.ExitStack() as cleanup:
         window_path = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="watch-fixture-"))) / "window.json"
+        diagnostic_path = window_path.with_name("diagnostic.json")
         expected_ports = (args.users + 7999)//8000
         def stop():
             try:
@@ -119,6 +121,7 @@ def main():
              str(args.ryzen), str(args.mac)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             env={**os.environ, "WATCH_PROFILE":args.profile, "WATCH_EVALUATION":"shared",
                  "WATCH_SERVER_TIMING":"1", "WATCH_TIMING_WINDOW_FILE":str(window_path),
+                 "WATCH_TIMING_DIAGNOSTIC_FILE":str(diagnostic_path),
                  "WATCH_TIMING_SKIP_READS":str(expected_ports)}))
         cleanup.callback(fixture.kill)
         with fixture.stdin as keys:
@@ -153,9 +156,22 @@ def main():
         staged.write_text(json.dumps(window))
         staged.replace(window_path)
         record("schedule", **window, expected_port_probes=expected_ports)
-        with CpuWindow(fixture.pid, local_start_unix_us, args.seconds) as cpu:
-            call("start", run=run, **{"unix-us":local_start_unix_us + clock["offset_us"]})
-            end = wait_phase("result", args.seconds+180)
+        cpu = CpuWindow(fixture.pid, local_start_unix_us, args.seconds)
+        try:
+            with cpu:
+                call("start", run=run, **{"unix-us":local_start_unix_us + clock["offset_us"]})
+                end = wait_phase("result", args.seconds+180)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+            try:
+                fixture.send_signal(signal.SIGUSR1)
+                deadline = time.monotonic() + 5
+                while not diagnostic_path.exists() and fixture.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.025)
+                record("fixture_diagnostic", server_timing=json.loads(diagnostic_path.read_text()),
+                       server_cpu=cpu.report(), server=process_memory(fixture.pid))
+            except (OSError, ValueError) as error:
+                record("fixture_diagnostic_unavailable", reason=str(error))
+            raise
         worker = json.loads(end["result"])
         schedule = Schedule(args.users, args.orgs, args.seconds, args.read_interval_ms,
                             args.writes_per_second, args.profile, port_probes=expected_ports)
