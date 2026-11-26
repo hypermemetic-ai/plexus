@@ -77,6 +77,91 @@ pub use connection::{Connection, Error, Items, Passed, TOP_UP, WINDOW};
 pub use context::{CallContext, Context, ContextKeys, FromCaller, require_caller};
 pub use remote::Remote;
 pub use plexus_macros::{activation, Context};
+mod encoded;
+pub use encoded::Encoded;
+
+/// A stream of notifications that an authorized read may have changed.
+/// Register interest before returning. Notifications may coalesce; dropping
+/// this stream must release the subscription.
+pub type Invalidations = std::pin::Pin<Box<dyn futures::Stream<Item = ()> + Send + 'static>>;
+
+/// Poll the owned subscriptions together. Simultaneously ready dependencies
+/// invalidate one read. Closing a source ends the watch and releases its peers.
+#[doc(hidden)]
+pub fn merge_invalidations(mut sources: Vec<Invalidations>) -> Invalidations {
+    use std::task::Poll;
+    Box::pin(futures::stream::poll_fn(move |cx| {
+        let mut changed = false;
+        for source in &mut sources {
+            match source.as_mut().poll_next(cx) {
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(())) => changed = true,
+                Poll::Pending => {}
+            }
+        }
+        if changed { Poll::Ready(Some(())) } else { Poll::Pending }
+    }))
+}
+
+/// Supply the dependency notifications for generated watchable reads.
+/// Authenticate and scope subscriptions using the original call and params.
+pub trait WatchSource {
+    fn subscribe(&self, dependencies: &[&str], call: &CallContext, params: &Raw)
+        -> Result<Invalidations, Failure>;
+}
+
+#[doc(hidden)]
+pub fn watch_digest(value: &Raw) -> u128 {
+    use serde_json::value::RawValue;
+    use std::collections::BTreeMap;
+    use xxhash_rust::xxh3::Xxh3;
+
+    // Keep number tokens exact, including integers outside u64. Sorted object
+    // keys and ordered array items give equivalent projections the same digest.
+    fn visit(text: &str, hash: &mut Xxh3) {
+        match text.as_bytes().first() {
+            Some(b'{') => {
+                if let Ok(fields) = serde_json::from_str::<BTreeMap<String, &RawValue>>(text) {
+                    hash.update(b"{");
+                    for (key, value) in fields {
+                        hash.update(b"k");
+                        hash.update(&(key.len() as u64).to_le_bytes());
+                        hash.update(key.as_bytes());
+                        visit(value.get(), hash);
+                    }
+                    hash.update(b"}");
+                    return;
+                }
+            }
+            Some(b'[') => {
+                if let Ok(items) = serde_json::from_str::<Vec<&RawValue>>(text) {
+                    hash.update(b"[");
+                    for item in items {
+                        visit(item.get(), hash);
+                    }
+                    hash.update(b"]");
+                    return;
+                }
+            }
+            Some(b'"') => {
+                if let Ok(string) = serde_json::from_str::<String>(text) {
+                    hash.update(b"s");
+                    hash.update(&(string.len() as u64).to_le_bytes());
+                    hash.update(string.as_bytes());
+                    return;
+                }
+            }
+            _ => {}
+        }
+        hash.update(b"v");
+        hash.update(&(text.len() as u64).to_le_bytes());
+        hash.update(text.as_bytes());
+    }
+
+    let mut hash = Xxh3::new();
+    visit(value.get(), &mut hash);
+    hash.digest128()
+}
 pub use plexus_proto::{Failure, Raw};
 pub use server::{Server, fail, raw};
 #[cfg(feature = "store")]

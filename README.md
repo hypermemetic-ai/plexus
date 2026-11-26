@@ -37,6 +37,27 @@ let readings = connection.stream("studio.kiln.heat", params)?;
 
 On the server, `Listen::new(&server_identity, allowed_callers)?.accept(tcp).await?` returns the channel and the verified caller principal. To retain that identity for the application, pass the channel and its authenticated caller to `Server::serve_as`. `Listen::spawn` does this automatically.
 
+## Watch an authorized read
+
+Declare the store change stream beside the method that returns the caller's current view. This excerpt is from the [ticket board](examples/watch-tickets.rs).
+
+```rust
+#[watch(on = [store.ticket_change(caller)])]
+pub fn get(&self, caller: &Caller, id: u32) -> Option<Row> {
+    self.store.board(caller).borrow().rows.get(id as usize).cloned()
+}
+```
+
+Rust callers can use the original method, and generated TypeScript clients can call `await Tickets.get(id)` or iterate `Tickets.get(id).watch()`. A Svelte component can use `live(() => Tickets.get(id))` with the wire capability `tickets.get-watch`. The companion registers its sources before its first authorized read. It then repeats the route admission and the original read with the same caller and parameters on invalidation. A plain result uses a 128-bit digest of the full visible reply. Equal results stay quiet, and canceling a subscription releases its sources. A large shared read can optionally return `Encoded<T>` to reuse immutable JSON or supply a digest for its visible fields.
+
+A store should signal after a transaction commits. For revocation while a store is idle, include a policy stream alongside the data stream, as the [typed-source test](tests/watch_sources.rs) does. A disconnected client can open a fresh watch for the current state. Recovery of missed revisions and automatic resumption across remounts remain open. See the [admission and digest tests](tests/watchable.rs) and the [Chromium integration](https://github.com/hypermemetic-ai/plexus-ui/blob/main/tests/native_watch_browser.mjs). The [100,000-session capacity measurements](https://github.com/hypermemetic-ai/plexus/blob/660d0fb6d954f8518a125c745ee52a3efb1a1492/benches/watch-capacity/cpu-scaling/evidence/ryzen-generated-ui.json) used the earlier optimized, unfiltered performance fixture on the testing branch.
+
+```sh
+cargo test --locked --test watchable --test watch_sources
+cargo test --locked --features tls --example watch-tickets
+cargo build --locked --features tls --example watch-tickets
+```
+
 ## Holding a child over pinned TLS
 
 A native activation built with the `tls` feature can listen through its ordinary `plexus::main` entry point:

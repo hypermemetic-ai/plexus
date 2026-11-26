@@ -24,6 +24,7 @@ tls = ["tokio", "dep:base64", "dep:rcgen", "dep:rustls", "dep:tokio-rustls", "de
 plexus-macros = { path = "../plexus-macros" }
 plexus-proto = { path = "../plexus-proto" }
 bytes = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await", "executor"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -93,3 +94,7 @@ required-features = ["store"]
 [[example]]
 name = "autobahn"
 required-features = ["tokio"]
+
+[[example]]
+name = "watch-tickets"
+required-features = ["tls"]
